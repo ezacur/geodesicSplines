@@ -1,8 +1,11 @@
 # Geodesic Spline Editor — Python dependencies
 #
-# Tested Python: 3.10 - 3.12 (Windows / Linux).
+# Required Python: >= 3.10 (tested on 3.10 - 3.12, Windows / Linux).
 # All versions below are the ones the codebase is known to run on
 # (not strict minimums — newer patch releases should be fine).
+#
+# For a fully reproducible install pin via pip-tools or uv:
+#   pip install pip-tools && pip-compile pyproject.toml --output-file requirements.lock
 #
 # potpourri3d is the trickiest dep: it's a wrapper around
 # geometry-central (C++) and requires pybind11 + a C++17 compiler

@@ -1,288 +1,48 @@
 """
-geo_splines.py — Geodesic Spline Editor.
+geo_splines.py — Geodesic Spline Editor (interactive UI).
 
-Interactive multi-spline editor on 3D meshes.  Extends ``MidpointShooterApp``
-(geo_shoot.py) with multi-node spline chains, closed loops, and hybrid
-geodesic Bézier curve rendering.
+This module hosts ``GeodesicSplineApp``, the multi-spline editor that
+sits on top of ``MidpointShooterApp`` (geo_shoot.py) and adds:
 
-Architecture
-------------
-``GeodesicSplineApp`` inherits all infrastructure from the parent — plotter,
-surface cursor, picking, hover detection, debounce — and overrides:
+  - Multi-node spline chains and closed loops.
+  - Three parallel curve layers (interp / blue Bezier / orange fully
+    geodesic) computed at increasing accuracy and cost.
+  - Background workers (``_SpanWorkManager``) for the orange layer.
+  - Snapshot-based undo/redo with differential restoration.
+  - JSON save / load and CLI entry point.
 
-  - ``_on_press`` / ``_on_move`` — multi-node click/drag.
-  - ``_finalize_release`` — span recomputation after drag ends.
-  - ``_try_hit_marker`` — extends the parent's hover-cache hit-testing with
-    spline-index switching (selects the spline that owns the hit marker).
-  - ``_fire_debounce`` — adds span recomputation on top of the parent's
-    exact geodesic recalculation.
-  - ``_print_help`` / ``_setup_interaction`` — additional key bindings.
+For the user-facing description (interaction model, three curve layers,
+geodesic algorithms, performance notes, save/load format, dependencies)
+see README.md — that is the canonical reference and this module avoids
+duplicating it to prevent rot.
 
-Each spline node reuses the ``GeodesicSegment`` widget from gizmo.py.
-Between consecutive nodes, a **span** is drawn — a cubic Bézier curve
-evaluated with the hybrid de Casteljau algorithm.
-
-Spline model
-------------
-Each span is a cubic Bézier through four control points:
-
-    [node_i.origin,  node_i.p_b,  node_{i+1}.p_a,  node_{i+1}.origin]
-
-The handles ``p_a`` / ``p_b`` are geodesic endpoints computed by shooting
-from the node origin — so they lie exactly on the surface with known
-geodesic paths connecting them to their node.
-
-The de Casteljau evaluation (``GeodesicMesh.hybrid_de_casteljau_curve``)
-is **hybrid**: level-1 lerps use geodesic interpolation along precomputed
-paths; levels 2–3 use Euclidean lerp with surface re-projection.  This is
-not a fully geodesic de Casteljau (that would require recursive geodesic
-interpolation at every level), but it produces curves that hug the surface
-well and is fast enough for interactive editing.
-
-All span points are batch-projected onto the surface via
-``project_smooth_batch`` to guarantee visibility (no z-fighting with the
-mesh) and correctness even during fast drag (when ``fast=True`` skips
-per-point projection inside de Casteljau).
-
-Secant chord subdivision
-~~~~~~~~~~~~~~~~~~~~~~~~
-Even after projection, consecutive polyline points that sit on opposite
-sides of a mesh ridge (small dihedral angle) produce a straight chord
-that passes *through* the mesh interior — visually, the line disappears
-behind the surface.  ``GeodesicMesh.subdivide_secant_chords`` detects
-these segments by projecting the chord midpoint onto the surface: if the
-projected midpoint deviates from the Euclidean midpoint by more than a
-tolerance (~10% of mean edge length), the segment is split at the
-projected point and both halves are checked recursively (up to 6 levels,
-i.e. 64× local refinement).  This runs as a post-processing step on
-every displayed polyline (blue consolidated, orange) but is
-skipped during drag for performance.
-
-Shared infrastructure from parent
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-This module deliberately avoids duplicating utilities already provided by
-``MidpointShooterApp`` and ``gizmo.py``:
-
-  - **Hover detection** reuses the parent's ``_hover_pts_3d`` cache and
-    ``_try_hit_marker`` (squared-distance, vectorized screen projection).
-  - **Line updates** use the module-level ``update_line_inplace`` from
-    gizmo.py — the single canonical implementation shared with
-    ``GeodesicSegment.update_visuals``.
-  - **Surface pick** passes the pick result to the parent via the
-    ``pick_override`` keyword argument on ``_on_move``, avoiding double
-    ray-casts: geo_splines picks once per frame and the parent reuses it.
-
-Stitch preview
---------------
-When hovering over the surface with an active (non-closed) spline, a
-**stitch preview** shows the prospective span from the last node to the
-cursor position.  It computes an exact geodesic path from the last node to the cursor
-using a topologically-inserted origin (``prepare_origin`` cache) for
-~0.01 ms per-frame responsiveness.
-
-LOD and visual feedback during drag
-------------------------------------
-During drag of a node, affected spans are recomputed at lower resolution
-(``DRAG_*`` constants) and with ``fast=True`` (skip per-point projection
-in de Casteljau — batch projection still applies).  They are also drawn
-with the drag style: lighter color (``SPAN_DRAG_COLOR``), thinner line
-width, and reduced opacity — signalling "approximate".
-
-On debounce (mouse pauses 150 ms) the exact solution is computed and the
-affected spans revert to full color/width/opacity, even if the mouse is
-still held down.  On release, all spans are recomputed at full quality.
-
-Fully geodesic de Casteljau (background)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-A second curve layer (orange, thick — ``GEO_COLOR``, ``GEO_LINE_WIDTH``)
-evaluates the de Casteljau algorithm with geodesic interpolation at
-**every** level, not just level 1.  This is computationally expensive
-(~4 ``compute_endpoint`` calls per sample point, ~1.4 s/point) so it
-runs in background ``ProcessPoolExecutor`` workers (max 4).
-
-Three curve layers
-~~~~~~~~~~~~~~~~~~~
-Three parallel curve layers with increasing accuracy and cost:
-
-  - ``_interp_cache`` — **black / interpolation** B-spline (z-depth -6).
-    Scipy ``splprep``/``splev`` through node origins, projected onto the
-    surface.  No handles, no de Casteljau — purely node-defined.  The
-    philosophy is **fast and rough**: a quick-and-dirty curve that gives
-    immediate visual feedback of the overall spline shape.  Recomputed
-    synchronously on every drag frame (~1-5 ms), no background worker.
-    Uses dedicated secant subdivision params (``INTERP_SECANT_*``) that
-    are 5× tighter than the Bézier layers, with 200+ initial samples,
-    because the 3D B-spline has no geodesic awareness and can deviate
-    further from the surface.  Keyed by spline index (one curve per
-    spline, not per span).
-  - ``_span_cache`` — **blue / Bézier** (z-depth -8).  Dual-mode:
-      * During drag: fast hybrid — geodesic lerp on outer paths,
-        Euclidean lerp + projection on H_out→H_in (~3 ms per span).
-      * On consolidation (debounce fires): semi-geodesic —
-        ``compute_endpoint_local`` provides an exact geodesic ``path_12``
-        between H_out and H_in, so level-1 is fully geodesic (~25 ms
-        per span).  Level-2/3 remain Euclidean+projection.
-    This dual-mode strategy keeps interactive drag fluid while giving
-    accurate geometry the moment the user stops moving.
-  - ``_geo_span_cache`` — **orange / fully geodesic** de Casteljau
-    (z-depth -20).  Computed in background (~4-7s per span, ~6× faster
-    thanks to ``compute_endpoint_local`` used for all 4 endpoint calls
-    per sample point).  Geodesic interpolation at every de Casteljau
-    level.  Grows progressively.
-
-The Bézier caches are keyed by ``(spline_id, span_index)``.
-The interpolation cache is keyed by ``spline_id`` alone.
-
-Worker architecture
-~~~~~~~~~~~~~~~~~~~~
-
-  - ``_geodesic_decasteljau_worker`` — computes fully geodesic
-    de Casteljau (orange layer).  Sends points progressively.
-  - Runs in ``ProcessPoolExecutor`` child processes (no VTK, no GIL
-    contention).  Communication via ``mp.Pipe`` per span.
-  - Cancellation: closing the read end → ``BrokenPipeError`` → exit.
-  - ``_SpanWorkManager`` — coordinates the process pool, per-span
-    pipes, and accumulated points.
-  - ``_on_poll_timer`` — drains orange pipes (progressive update).
-    Blue is computed synchronously in the main thread inside
-    ``_recompute_spans`` — fast enough thanks to
-    ``compute_endpoint_local``.
-
-One-frame span lag during drag
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-During drag, the parent's ``_on_move`` renders the frame with updated
-handle positions.  The child then recomputes hybrid spans — these appear
-one frame later (~16 ms at 60 Hz, imperceptible).  This avoids a
-double-render per frame that would halve the frame rate.
-
-Visual refresh optimization
-~~~~~~~~~~~~~~~~~~~~~~~~~~~
-``_refresh_visuals`` tracks ``_prev_active_spline_idx`` to avoid iterating
-all nodes across all splines on every visual refresh.  Only nodes in the
-previously active and currently active splines are visited; span visibility
-is toggled only for relevant cache entries.  Falls back to a full sweep
-when the previous index is out of range (after spline deletion).
-
-Arrow scale on camera change
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Handle arrows use camera distance for fixed-screen-size scaling
-(``ARROW_FIXED_SCREEN_SIZE``).  Since ``update_visuals`` only runs on
-hover/drag, arrows would go stale during camera rotation or zoom.  The
-poll timer (``_on_poll_timer``, every 50 ms) compares ``camera.position``
-with a cached value and calls ``refresh_arrows`` on all nodes when it
-changes — a lightweight method that only recomputes cone scale and
-transform, skipping line and sphere handle updates.
-
-Undo/Redo (Ctrl+Z / Ctrl+Y)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Snapshot-based with **differential restoration** for speed.  Every
-mutation (add/delete/insert/drag/close/load) snapshots the minimal state
-(origin + tangent per node, plus closed flags — ~48 bytes/node) to the
-undo stack.
-
-On Ctrl+Z / Ctrl+Y, ``_restore_snapshot`` compares the target snapshot
-with the current state:
-
-  - **Structure match** (same spline count, same node count per spline,
-    same closed flags): only nodes whose origin or tangent *actually
-    differ* are rebuilt in place via ``_rebuild_node_inplace`` (no actor
-    destruction, no full `_load_from_data`).  On a 50-node spline where
-    a single node moved, this is ~50× faster than full rebuild.
-  - **Structure changed**: falls back to ``_load_from_data`` (clears
-    everything, rebuilds from scratch).
-
-This keeps undo/redo responsive on large splines where the full rebuild
-(~10 ms × 2 shoots × N nodes) would cause a visible freeze.
-
-Orange progress HUD
-~~~~~~~~~~~~~~~~~~~~
-When orange workers are active, ``_on_poll_timer`` shows
-``COMPUTING ORANGE k/N`` in the HUD where *N* is the batch total and
-*k* is the number completed.  Clears automatically when all spans
-finish.  The counter is reset between batches (each consolidation or
-load is a new batch).
-
-Curve hover and node insertion
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-When the cursor moves over a visible spline curve, a colored marker
-appears at the closest point on the polyline.  The marker color matches
-the curve layer (blue, orange, or interp), respecting visual z-priority
-(orange > blue > interp when curves overlap).  Double-clicking while the
-marker is visible inserts a new C1 node at that point using the de
-Casteljau splitting property — the tangent direction comes from the
-Bézier derivative at the insertion parameter.
-
-Interaction
------------
-Spline-specific bindings:
-
-  Double-click Left  : Add node / insert at curve hover
-  Double-click Right : Start new spline (only if current has nodes)
-  Drag Red marker    : Translate node on surface
-  Drag Handle        : Adjust tangent direction / length
-  Shift + Drag       : Snap drag target to nearest mesh vertex
-  C                  : Toggle close/open spline loop (3+ nodes)
-  Backspace          : Undo last node / break
-  Ctrl+Z             : Undo (full state snapshot)
-  Ctrl+Y             : Redo
-
-Layer visibility (keyboard + checkboxes):
-
-  Key 'b'            : Toggle blue (hybrid) curve
-  Key 'o'            : Toggle orange (fully geodesic) curve
-  Key 'k'            : Toggle black (interpolation) curve
-
-Session:
-
-  Key 's'            : Save splines to timestamped JSON
-  Key 'l'            : Load splines from JSON (file dialog)
-  Key 't'            : Cycle gizmo opacity (0.2 / 0.4 / 0.7 / 1.0)
-
-Inherited from parent (``MidpointShooterApp``):
-
-  Key 'e'            : Export paths to TXT
-  Key 'w'            : Toggle wireframe overlay
-  Key 'a'            : Cycle surface transparency
-
-CLI export
-----------
-``spline_export.py`` reads a saved JSON and outputs curve points to stdout::
-
-    python spline_export.py <file.json> <b|g|o|k> [--samples N]
-
-See ``spline_export.py`` module docstring for format details.
-
-Curvature-aware adaptive sampling
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-When ``SplineConfig.ADAPTIVE_SAMPLING`` is True (the default), sample
-points are distributed non-uniformly in parameter space, concentrating
-near high-curvature regions of the Bézier control polygon.
-
-  - **Phase 1** (a priori, ~O(1) overhead): the two interior angles of the
-    control polygon predict curvature peaks at ~t=1/3 and ~t=2/3.  A
-    density ``ρ(t) = 1 + k₁·G(t,1/3,σ) + k₂·G(t,2/3,σ)`` is built and
-    its CDF inverted to produce non-uniform ``t_vals``.
-    See ``GeodesicMesh.curvature_adaptive_t_vals``.
-  - **Phase 2** (post-evaluation refinement): after the initial curve
-    evaluation, turning angles between consecutive chords are measured;
-    parametric midpoints are inserted where the angle exceeds a threshold.
-    See ``GeodesicMesh.refine_t_vals_by_curvature``.  Phase 2 runs only
-    on consolidated (non-drag) evaluations and background workers.
-
-Set ``ADAPTIVE_SAMPLING = False`` to revert to uniform ``linspace``.
+Quick map of the main classes
+-----------------------------
+``SplineConfig``       Centralised numeric / visual constants.
+``_SpanWorkManager``   ProcessPoolExecutor + per-span ``mp.Pipe``.
+``GeodesicSplineApp``  Subclass of ``MidpointShooterApp`` — overrides
+                       ``_on_press``, ``_on_move``, ``_finalize_release``,
+                       ``_try_hit_marker``, ``_fire_debounce``,
+                       ``_setup_interaction``, ``_on_poll_timer``,
+                       ``_print_help``.
 """
 
 from __future__ import annotations
 
-import atexit
 import glob
 import json
+import logging
 import multiprocessing as mp
 import multiprocessing.shared_memory as _shm
+import os
+import sys
+import tempfile
+import weakref
 from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from multiprocessing.connection import Connection
+from pathlib import Path
 
 import numpy as np
 import pyvista as pv
@@ -300,6 +60,22 @@ from gizmo import (
 
 
 # ---------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------
+# Every module-level / class-level diagnostic goes through this logger
+# instead of bare ``print``.  Default level is WARNING so the console
+# stays quiet for end users; set ``GEO_SPLINES_DEBUG=1`` to flip to
+# DEBUG for development.
+log = logging.getLogger("geo_splines")
+if not log.handlers:
+    _handler = logging.StreamHandler(sys.stderr)
+    _handler.setFormatter(logging.Formatter("[%(levelname)s] %(name)s: %(message)s"))
+    log.addHandler(_handler)
+    log.propagate = False
+log.setLevel(logging.DEBUG if os.environ.get("GEO_SPLINES_DEBUG") else logging.INFO)
+
+
+# ---------------------------------------------------------------
 # Global rendering flags (experimental)
 # ---------------------------------------------------------------
 # SSAO (Screen Space Ambient Occlusion) darkens crevices under the
@@ -310,10 +86,175 @@ from gizmo import (
 SSAO_ENABLED: bool = False
 
 
+# ---------------------------------------------------------------
+# Built-in mesh sentinel
+# ---------------------------------------------------------------
+# A reserved string used as ``mesh_file`` in JSON sessions to indicate
+# the in-memory icosahedron demo mesh.  The prefix ``__builtin__:``
+# makes accidental collisions with real filenames impossible (the
+# legacy plain ``"ICOSAHEDRON"`` value is still accepted on load for
+# backwards compatibility; new saves always use the prefixed form).
+BUILTIN_ICOSAHEDRON: str = "__builtin__:icosahedron"
+_LEGACY_ICOSAHEDRON: str = "ICOSAHEDRON"  # accepted on load only
+
+# Default mesh used by the CLI when no argument is given.  Falls back
+# to the in-memory icosahedron if the file is not present.
+DEFAULT_MESH_FILENAME: str = "fandisk.obj"
+
+
+# ---------------------------------------------------------------
+# i18n / HUD strings
+# ---------------------------------------------------------------
+# All HUD messages and CLI prints route through ``_t(key, **kw)``.
+# Selecting a different locale is a single dict swap; the current
+# language is read from ``GEO_SPLINES_LANG`` (defaults to ``es``).
+_HUD_TEXTS_ES: dict[str, str] = {
+    "ready": "LISTO",
+    "dragging": "ARRASTRANDO {marker}",
+    "snap_vertex": "AJUSTE -> vertice {idx}",
+    "snap_edge": "AJUSTE -> arista {va}-{vb} t={t:.2f}",
+    "refined_exact": "REFINADO (EXACTO)",
+    "node_inserted": "NODO INSERTADO",
+    "node_inserted_interp": "NODO INSERTADO (INTERP)",
+    "loop_closed_break": "BUCLE CERRADO + CORTE",
+    "loop_opened": "BUCLE ABIERTO",
+    "break_removed": "CORTE ELIMINADO",
+    "new_spline_started": "NUEVA SPLINE INICIADA",
+    "nothing_to_undo": "NADA QUE DESHACER",
+    "nothing_to_redo": "NADA QUE REHACER",
+    "undo": "DESHACER",
+    "redo": "REHACER",
+    "saved": "GUARDADO {n} nodos -> {fname}",
+    "save_failed": "ERROR AL GUARDAR: {err}",
+    "loaded": "CARGADO {n} nodos desde {fname}",
+    "load_failed": "ERROR AL CARGAR",
+    "load_failed_version": "ERROR AL CARGAR: version desconocida",
+    "load_failed_format": "ERROR AL CARGAR: formato invalido",
+    "computing_orange": "CALCULANDO NARANJA {done}/{total}",
+    "orange_done": "NARANJA LISTO",
+    "orange_rebuilt": "NARANJA RECALCULADO",
+    "geodesic_fallback": "GEODESICA APROXIMADA span {sid}:{i}",
+    "gizmo_opacity": "OPACIDAD GIZMO {pct}",
+}
+
+_HUD_TEXTS_EN: dict[str, str] = {
+    "ready": "READY",
+    "dragging": "DRAGGING {marker}",
+    "snap_vertex": "SNAP -> vertex {idx}",
+    "snap_edge": "SNAP -> edge {va}-{vb} t={t:.2f}",
+    "refined_exact": "REFINED (EXACT)",
+    "node_inserted": "NODE INSERTED",
+    "node_inserted_interp": "NODE INSERTED (INTERP)",
+    "loop_closed_break": "LOOP CLOSED + BREAK",
+    "loop_opened": "LOOP OPENED",
+    "break_removed": "BREAK REMOVED",
+    "new_spline_started": "NEW SPLINE STARTED",
+    "nothing_to_undo": "NOTHING TO UNDO",
+    "nothing_to_redo": "NOTHING TO REDO",
+    "undo": "UNDO",
+    "redo": "REDO",
+    "saved": "SAVED {n} nodes -> {fname}",
+    "save_failed": "SAVE FAILED: {err}",
+    "loaded": "LOADED {n} nodes from {fname}",
+    "load_failed": "LOAD FAILED",
+    "load_failed_version": "LOAD FAILED: unknown version",
+    "load_failed_format": "LOAD FAILED: invalid format",
+    "computing_orange": "COMPUTING ORANGE {done}/{total}",
+    "orange_done": "ORANGE DONE",
+    "orange_rebuilt": "ORANGE REBUILT",
+    "geodesic_fallback": "GEODESIC FALLBACK on span {sid}:{i}",
+    "gizmo_opacity": "GIZMO OPACITY {pct}",
+}
+
+_LANG = os.environ.get("GEO_SPLINES_LANG", "es").lower()
+_HUD_TEXTS = _HUD_TEXTS_ES if _LANG.startswith("es") else _HUD_TEXTS_EN
+
+
+def _t(key: str, **kwargs) -> str:
+    """Resolves a HUD string by key with optional ``str.format`` kwargs."""
+    template = _HUD_TEXTS.get(key) or _HUD_TEXTS_EN.get(key) or key
+    if not kwargs:
+        return template
+    try:
+        return template.format(**kwargs)
+    except (KeyError, IndexError):
+        return template
+
+
+def _validate_session_dict(data: dict) -> None:
+    """Schema check for a deserialized spline session.
+
+    Raises ``ValueError`` with a precise location when the structure or
+    a node's ``origin`` / ``tangent`` does not match the expected shape.
+    Done before any state mutation so a malformed file never leaves the
+    editor in a half-loaded state.
+    """
+    if not isinstance(data, dict):
+        raise ValueError("top-level value is not an object")
+    splines = data.get('splines')
+    if not isinstance(splines, list):
+        raise ValueError("'splines' missing or not a list")
+    for si, sd in enumerate(splines):
+        if not isinstance(sd, dict):
+            raise ValueError(f"splines[{si}] is not an object")
+        if 'closed' in sd and not isinstance(sd['closed'], (bool, int)):
+            raise ValueError(f"splines[{si}].closed must be bool")
+        nodes = sd.get('nodes')
+        if not isinstance(nodes, list):
+            raise ValueError(f"splines[{si}].nodes missing or not a list")
+        for ni, nd in enumerate(nodes):
+            if not isinstance(nd, dict):
+                raise ValueError(f"splines[{si}].nodes[{ni}] is not an object")
+            for field_ in ('origin', 'tangent'):
+                v = nd.get(field_)
+                if not isinstance(v, (list, tuple)) or len(v) != 3:
+                    raise ValueError(
+                        f"splines[{si}].nodes[{ni}].{field_} "
+                        f"must be a 3-element list")
+                for j, x in enumerate(v):
+                    if not isinstance(x, (int, float)) or x != x:  # x!=x catches NaN
+                        raise ValueError(
+                            f"splines[{si}].nodes[{ni}].{field_}[{j}] "
+                            f"must be a finite number")
+
+
+# ---------------------------------------------------------------
+# Curve layer identification
+# ---------------------------------------------------------------
+# A small enum-like namespace.  Kept as plain strings (not ``Enum``)
+# because the values are also dict keys in ``self._layer_visible``
+# and the JSON-style ``curve_hover_info`` payload — switching them to
+# ``Enum`` would force string conversions at every read site.
+class LayerKind:
+    BLUE: str = 'blue'
+    ORANGE: str = 'orange'
+    INTERP: str = 'interp'
+
+
+@dataclass
+class _CurveHoverItem:
+    """One visible polyline indexed by curve-hover detection.
+
+    Replaces the historical 6-element tuple plus ``i = -1`` sentinel for
+    the interpolation layer.  ``span_idx`` is ``None`` for the interp
+    layer (one polyline per spline) and an integer for the blue/orange
+    layers (one polyline per span).
+    """
+    layer: str
+    sid: int
+    span_idx: int | None
+    start: int            # offset into the batched 2-D screen buffer
+    n_pts: int
+    pts_3d: np.ndarray    # shared reference, not a copy
+
+
 # --- Process-local GeodesicMesh for background workers ---
-# Each worker process builds its own GeodesicMesh from (V, F) arrays
-# passed via the pool initializer.  No VTK objects — workers only need
-# compute_endpoint and geodesic_lerp which use KDTree + numpy buffers.
+# A bound on this module-level state: child processes spawn with a
+# fresh interpreter so this attribute is set exactly once per worker
+# (in ``_process_initializer``).  The parent process never reads it.
+# It lives at module scope because ``ProcessPoolExecutor`` only
+# accepts top-level callables for the initializer / worker functions
+# (they must be importable by name on the child side).
 _process_geo: GeodesicMesh | None = None
 
 
@@ -323,22 +264,29 @@ def _process_initializer(v_shm_name: str, v_shape: tuple, v_dtype: str,
 
     Called once per worker process by ``ProcessPoolExecutor``.  Maps V and
     F from ``multiprocessing.shared_memory.SharedMemory`` blocks created
-    by ``_SpanWorkManager`` — zero-copy, no per-process duplication of
-    the mesh arrays.  The mesh is built without PyVista, so no VTK
-    locator is created.
+    by ``_SpanWorkManager``.  The mesh is built without PyVista, so no
+    VTK locator is created.
 
-    Also redirects the child process's stderr to ``os.devnull`` so that
-    ``BrokenPipeError`` tracebacks during executor teardown never reach
-    the parent's console.
+    The previous implementation hard-redirected the worker's stderr to
+    /dev/null to silence ``BrokenPipeError`` tracebacks during shutdown.
+    That also swallowed legitimate import / runtime errors and made
+    debugging painful.  We now install a logger-only handler at WARNING
+    level: workers stay quiet on normal operation, but real failures
+    surface to stderr with module + level prefixes that the parent can
+    distinguish from the line noise.
     """
-    import sys, os
-    # Redirect at the OS file-descriptor level so that even C-level
-    # writes (e.g. from multiprocessing internals) go to devnull.
-    # This also avoids leaking an open Python file object.
-    devnull_fd = os.open(os.devnull, os.O_WRONLY)
-    os.dup2(devnull_fd, 2)  # 2 = stderr fd
-    os.close(devnull_fd)
-    sys.stderr = open(os.devnull, 'w')  # sync Python wrapper
+    # Install a stderr logger at WARNING level on the worker side.
+    # Child sees its own copy of `log` after spawn; reset handlers so
+    # the parent's stderr handler does not leak in via fork on POSIX.
+    worker_log = logging.getLogger("geo_splines.worker")
+    worker_log.handlers.clear()
+    h = logging.StreamHandler(sys.stderr)
+    h.setFormatter(logging.Formatter(
+        "[%(levelname)s] geo_splines.worker[%(process)d]: %(message)s"))
+    worker_log.addHandler(h)
+    worker_log.propagate = False
+    worker_log.setLevel(
+        logging.DEBUG if os.environ.get("GEO_SPLINES_DEBUG") else logging.WARNING)
 
     global _process_geo
     shm_v = _shm.SharedMemory(name=v_shm_name)
@@ -347,6 +295,8 @@ def _process_initializer(v_shm_name: str, v_shape: tuple, v_dtype: str,
     F = np.ndarray(f_shape, dtype=np.dtype(f_dtype), buffer=shm_f.buf)
     # GeodesicMesh copies V and F internally (np.asarray), so the shm
     # mapping can be closed after init without invalidating the mesh.
+    # ``copy()`` defends against premature shm.close() on platforms
+    # where the slice would otherwise stay attached to the buffer.
     _process_geo = GeodesicMesh(V.copy(), F.copy())
     shm_v.close()
     shm_f.close()
@@ -415,8 +365,9 @@ class SplineConfig:
     INTERP_LINE_WIDTH: int = 2
     INTERP_OPACITY: float = 1.0
     INTERP_MIN_SAMPLES: int = 200      # high base count (short chords)
-    INTERP_SECANT_TOL_FACTOR: float = 0.002  # 5× tighter than Bézier layers
-    INTERP_SECANT_MAX_DEPTH: int = 8         # 256× local refinement
+    INTERP_DRAG_SAMPLES: int = 50      # downsampled count during drag
+    INTERP_SECANT_TOL_FACTOR: float = 0.002  # 5x tighter than Bezier layers
+    INTERP_SECANT_MAX_DEPTH: int = 8         # 256x local refinement
 
     # Z-depth priority (polygon offset) per visual layer.
     # Lower = closer to camera = drawn on top.  Layering from back to front:
@@ -559,7 +510,9 @@ def _geodesic_decasteljau_worker(
                 path_c0 = geo.compute_endpoint_local(b01, b12)
                 if geo._last_was_fallback:
                     degraded_any = True
-            except Exception:
+            except Exception as exc:  # noqa: BLE001 — solver C++ wrapper
+                logging.getLogger("geo_splines.worker").debug(
+                    "compute_endpoint_local(b01, b12) failed: %s", exc)
                 path_c0 = np.array([b01, b12])
                 degraded_any = True
             if path_c0 is None or len(path_c0) < 2:
@@ -570,7 +523,9 @@ def _geodesic_decasteljau_worker(
                 path_c1 = geo.compute_endpoint_local(b12, b23)
                 if geo._last_was_fallback:
                     degraded_any = True
-            except Exception:
+            except Exception as exc:  # noqa: BLE001 — solver C++ wrapper
+                logging.getLogger("geo_splines.worker").debug(
+                    "compute_endpoint_local(b12, b23) failed: %s", exc)
                 path_c1 = np.array([b12, b23])
                 degraded_any = True
             if path_c1 is None or len(path_c1) < 2:
@@ -586,7 +541,9 @@ def _geodesic_decasteljau_worker(
                 path_final = geo.compute_endpoint_local(c0, c1)
                 if geo._last_was_fallback:
                     degraded_any = True
-            except Exception:
+            except Exception as exc:  # noqa: BLE001 — solver C++ wrapper
+                logging.getLogger("geo_splines.worker").debug(
+                    "compute_endpoint_local(c0, c1) failed: %s", exc)
                 path_final = np.array([c0, c1])
                 degraded_any = True
             if path_final is None or len(path_final) < 2:
@@ -640,7 +597,13 @@ class _SpanWorkManager:
         # atexit still fires during interpreter teardown and releases the
         # /dev/shm blocks (on POSIX) so they don't leak across sessions.
         # ``shutdown()`` is idempotent so calling it twice is harmless.
-        atexit.register(self.shutdown)
+        # We register via ``weakref.finalize`` so a per-instance handle
+        # is recorded — multiple managers in one interpreter (rare, but
+        # possible in tests) do not share a single ``atexit`` slot, and
+        # a manager that is garbage-collected before interpreter exit
+        # releases its handler eagerly.
+        self._finalizer = weakref.finalize(self, _SpanWorkManager._cleanup_at_exit,
+                                           weakref.ref(self))
 
         # --- Orange (fully geodesic) tracking ---
         self._readers: dict[tuple, Connection] = {}
@@ -661,9 +624,28 @@ class _SpanWorkManager:
         # done/cancelled/dead).  Used by the UI to show a progress HUD.
         self.active_spans: set[tuple] = set()
 
+        # Batch progress counters.  ``_batch_submitted`` reflects the
+        # current outstanding work plus completed-since-idle; cancelling
+        # a span decrements it (so the HUD does not lie when the user
+        # rapid-fires submit/cancel cycles).  ``_batch_done`` only grows
+        # via real ``'done'`` messages.  Both reset to 0 the moment
+        # ``active_spans`` becomes empty (see ``maybe_reset_progress``).
+        self._batch_submitted: int = 0
+        self._batch_done: int = 0
+
         # Warm up: force all worker processes to start now
         self._warmup_futures = [
             self._executor.submit(int, 0) for _ in range(max_workers)]
+
+    @staticmethod
+    def _cleanup_at_exit(weak_self) -> None:
+        """``weakref.finalize`` callback — calls ``shutdown`` if alive."""
+        target = weak_self()
+        if target is not None:
+            try:
+                target.shutdown()
+            except Exception as exc:  # noqa: BLE001 — interpreter teardown is best-effort
+                log.debug("worker manager finalize: %s", exc)
 
     # --- Fully geodesic (orange) ---
 
@@ -682,6 +664,10 @@ class _SpanWorkManager:
         The visible curve therefore refines from coarse to fine instead
         of growing from one end.
         """
+        # Re-submitting an already-active span replaces it.  We let
+        # ``cancel_span`` decrement ``_batch_submitted`` so that the
+        # increment below is balanced (otherwise rapid resubmits inflate
+        # the HUD numerator forever).
         self.cancel_span(span_key)
         reader, writer = mp.Pipe(duplex=False)
         self._readers[span_key] = reader
@@ -707,16 +693,28 @@ class _SpanWorkManager:
             t_grid, inner_order, writer, None)
         self._futures[span_key] = future
         self.active_spans.add(span_key)
+        self._batch_submitted += 1
 
     def cancel_span(self, span_key: tuple) -> None:
-        """Closes the pipe for the fully geodesic worker on *span_key*."""
+        """Closes the pipe for the fully geodesic worker on *span_key*.
+
+        If the span was actively counted in the current batch, the
+        ``_batch_submitted`` counter is decremented so the progress HUD
+        stays accurate across submit/cancel/submit cycles.
+        """
+        was_active = span_key in self.active_spans
         reader = self._readers.pop(span_key, None)
         if reader is not None:
-            reader.close()
+            try:
+                reader.close()
+            except OSError as exc:
+                log.debug("cancel_span: reader close failed (%s)", exc)
         self._futures.pop(span_key, None)
         self._points.pop(span_key, None)
         self.done_spans.discard(span_key)
         self.active_spans.discard(span_key)
+        if was_active and self._batch_submitted > 0:
+            self._batch_submitted -= 1
 
     # --- Shared ---
 
@@ -725,13 +723,34 @@ class _SpanWorkManager:
         self.cancel_span(span_key)
 
     def cancel_all(self) -> None:
-        """Cancels all active orange workers."""
+        """Cancels all active orange workers and resets batch counters."""
         for r in self._readers.values():
-            r.close()
+            try:
+                r.close()
+            except OSError as exc:
+                log.debug("cancel_all: reader close failed (%s)", exc)
         self._readers.clear()
         self._futures.clear()
         self._points.clear()
         self.active_spans.clear()
+        self._batch_submitted = 0
+        self._batch_done = 0
+
+    def progress(self) -> tuple[int, int]:
+        """Returns ``(done, total)`` for the orange progress HUD.
+
+        ``total`` is the number of spans submitted in the current batch
+        (decremented on cancellation), ``done`` is the number that
+        actually emitted a ``'done'`` message.  Both reset to zero the
+        moment no spans are active anymore.
+        """
+        return self._batch_done, self._batch_submitted
+
+    def maybe_reset_progress(self) -> None:
+        """Resets batch counters when no work is outstanding."""
+        if not self.active_spans:
+            self._batch_submitted = 0
+            self._batch_done = 0
 
     def drain_queue(self) -> bool:
         """Polls all active orange pipes.  Returns True if any results."""
@@ -767,19 +786,29 @@ class _SpanWorkManager:
                             self.degraded_spans.discard(span_key)
                         self.dirty_spans.add(span_key)
                         self.done_spans.add(span_key)
-                        self.active_spans.discard(span_key)
+                        if span_key in self.active_spans:
+                            self.active_spans.discard(span_key)
+                            self._batch_done += 1
                         had_results = True
                         # Worker exits after done — close reader now
                         # to prevent the normal EOF from being mistaken
                         # for a worker death on the next poll() cycle.
-                        reader.close()
+                        try:
+                            reader.close()
+                        except OSError as exc:
+                            log.debug("drain: reader close failed (%s)", exc)
                         self._readers.pop(span_key, None)
                         break
-            except (EOFError, OSError):
+            except (EOFError, OSError) as exc:
                 # Worker died or pipe broken — mark for actor cleanup
+                log.warning("orange worker pipe broken on span %s: %s",
+                            span_key, exc)
                 self._readers.pop(span_key, None)
                 self.dead_spans.add(span_key)
-                self.active_spans.discard(span_key)
+                if span_key in self.active_spans:
+                    self.active_spans.discard(span_key)
+                    if self._batch_submitted > 0:
+                        self._batch_submitted -= 1
                 had_results = True
         return had_results
 
@@ -807,33 +836,34 @@ class _SpanWorkManager:
         """Cancels all workers, shuts down the process pool, and releases
         shared memory blocks for V and F.  Safe to call multiple times.
 
-        Worker processes have their stderr redirected to ``os.devnull``
-        (see ``_process_initializer``), so they cannot print tracebacks.
-        The parent-side stderr is also temporarily suppressed during
-        ``executor.shutdown()`` to silence internal management threads.
+        ``executor.shutdown(cancel_futures=True)`` (Python >= 3.9) sends
+        SIGTERM equivalents to live workers — they can occasionally emit
+        ``BrokenPipeError`` tracebacks during this teardown.  Those are
+        downgraded to DEBUG level via the worker's logger (set up in
+        ``_process_initializer``); we no longer hard-redirect stderr at
+        the OS level so legitimate failures still surface.
         """
         if getattr(self, '_shutdown_done', False):
             return
         self._shutdown_done = True
         self.cancel_all()
-        import sys, os
-        devnull = open(os.devnull, 'w')
-        old_stderr = sys.stderr
         try:
-            sys.stderr = devnull
             self._executor.shutdown(wait=False, cancel_futures=True)
         except TypeError:
-            # Python < 3.9: cancel_futures not supported
+            # Python < 3.9: cancel_futures not supported (defensive — pyproject pins >=3.10)
             self._executor.shutdown(wait=False)
-        finally:
-            sys.stderr = old_stderr
-            devnull.close()
         for shm_block in (self._shm_V, self._shm_F):
             try:
                 shm_block.close()
                 shm_block.unlink()
-            except Exception:
-                pass  # already cleaned up or platform quirk
+            except FileNotFoundError:
+                pass  # already unlinked by another process
+            except Exception as exc:  # noqa: BLE001 — release is best-effort
+                log.debug("shm cleanup (%s): %s", shm_block.name, exc)
+        # Detach the finalizer so atexit will not retry this work.
+        finalizer = getattr(self, '_finalizer', None)
+        if finalizer is not None:
+            finalizer.detach()
 
 
 class GeodesicSplineApp(MidpointShooterApp):
@@ -882,7 +912,7 @@ class GeodesicSplineApp(MidpointShooterApp):
             try:
                 self.plotter.enable_ssao()
             except Exception as exc:
-                print(f"[!] SSAO unavailable: {exc}")
+                log.warning("SSAO unavailable: %s", exc)
 
         # Resolve z-fighting: lines/points always render on top of solid surfaces
         vtk.vtkMapper.SetResolveCoincidentTopologyToPolygonOffset()
@@ -897,9 +927,10 @@ class GeodesicSplineApp(MidpointShooterApp):
 
         self._stitch_actor.SetVisibility(False)
 
-        # Orange computation HUD tracking: total submitted in current batch.
-        # Reset to 0 when all orange spans complete.
-        self._orange_batch_total = 0
+        # Orange computation HUD: tracks whether we are in the middle of
+        # showing a "computing" message so we can flip to "ORANGE DONE"
+        # exactly once per batch.  The numeric progress lives in
+        # ``_work_mgr`` (``progress()`` returns ``(done, total)``).
         self._orange_hud_active = False
 
         # Curve-layer visibility toggles (horizontal row above opacity slider)
@@ -956,6 +987,20 @@ class GeodesicSplineApp(MidpointShooterApp):
         # Curve hover state — stored for future node insertion
         self.curve_hover_info: dict | None = None
 
+        # Snap indicator — appears on drag while Shift (vertex) or Ctrl
+        # (edge) is held, marking the exact target the drag will land on.
+        # Smaller and brighter than the curve-hover marker so it doesn't
+        # compete visually but is impossible to miss.
+        self._snap_indicator_pd = pv.PolyData(np.zeros((1, 3)))
+        self._snap_indicator_actor = self.plotter.add_mesh(
+            self._snap_indicator_pd, color='gold', point_size=14,
+            render_points_as_spheres=True, lighting=False, pickable=False,
+            name="snap_indicator")
+        self._set_depth_priority(self._snap_indicator_actor,
+                                 self.scfg.DEPTH_CURVE_HOVER - 1)
+        self._snap_indicator_actor.SetVisibility(False)
+        self._snap_indicator_buf = np.empty((1, 3), dtype=float)
+
     # Visual z-priority penalty for curve hover.  When multiple curves
     # overlap on screen, the one rendered on top should win the hover.
     # A small penalty (in squared pixels) is added to lower-priority
@@ -965,32 +1010,40 @@ class GeodesicSplineApp(MidpointShooterApp):
     def _detect_curve_hover(self, x: int, y: int) -> bool:
         """Tests proximity of cursor to all visible spline curves.
 
-        Collects all visible curve points into a single pre-allocated
-        buffer, projects them to screen in one ``_to_screen_batch`` call,
-        then finds the closest segment per polyline via
-        ``_closest_seg_on_polyline_2d``.
+        Orchestrator: delegates point collection, batched screen
+        projection, and closest-segment search to dedicated helpers.
+        Returns True when the hover marker's visibility or position
+        changed (the caller renders accordingly).
 
         When curves overlap on screen (nearly equal distance), the
-        layer with higher visual z-priority wins — matching what the
-        user sees.  This is achieved by adding a small penalty to
-        lower-priority layers' squared distances.
-
-        Returns True if the marker visibility changed (needs render).
+        layer with higher visual z-priority wins — see
+        ``_LAYER_HOVER_PENALTY``.
         """
-        best_sq = self.cfg.PICK_TOLERANCE_SQ
-        best_info = None
-        best_pt_3d = None
-        mx, my = float(x), float(y)
+        items = self._collect_visible_curves()
+        if not items:
+            return self._update_hover_marker(None, None)
+
+        all_2d = self._to_screen_batch(self._curve_hover_3d_buf[:items[-1].start + items[-1].n_pts])
+        best_info, best_pt_3d = self._pick_closest_curve(items, all_2d, float(x), float(y))
+        return self._update_hover_marker(best_info, best_pt_3d)
+
+    def _collect_visible_curves(self) -> list[_CurveHoverItem]:
+        """Concatenates every visible curve's 3-D points into one buffer.
+
+        Grows ``self._curve_hover_3d_buf`` if the running total exceeds
+        capacity (rare — initial 2048 fits ~10 medium splines).
+        Returns one ``_CurveHoverItem`` per visible polyline; an empty
+        list short-circuits the caller.
+        """
+        items: list[_CurveHoverItem] = []
+        total_n = 0
 
         layer_caches = []
-        if self._layer_visible['blue']:
-            layer_caches.append(('blue', self._span_cache))
-        if self._layer_visible['orange']:
-            layer_caches.append(('orange', self._geo_span_cache))
+        if self._layer_visible[LayerKind.BLUE]:
+            layer_caches.append((LayerKind.BLUE, self._span_cache))
+        if self._layer_visible[LayerKind.ORANGE]:
+            layer_caches.append((LayerKind.ORANGE, self._geo_span_cache))
 
-        # --- Phase 1: collect all visible curve points into one buffer ---
-        meta = []  # (layer, sid, i, start, n_pts, pts_3d_ref)
-        total_n = 0
         for layer, cache in layer_caches:
             for (sid, i), (pd, actor) in cache.items():
                 if not actor.GetVisibility():
@@ -1000,13 +1053,16 @@ class GeodesicSplineApp(MidpointShooterApp):
                     continue
                 n = len(pts_3d)
                 if total_n + n > self._curve_hover_3d_buf.shape[0]:
-                    new_cap = (total_n + n) * 2
-                    self._curve_hover_3d_buf = np.empty((new_cap, 3), dtype=float)
+                    self._curve_hover_3d_buf = np.empty(
+                        ((total_n + n) * 2, 3), dtype=float)
                 self._curve_hover_3d_buf[total_n:total_n + n] = pts_3d
-                meta.append((layer, sid, i, total_n, n, pts_3d))
+                items.append(_CurveHoverItem(layer, sid, i, total_n, n, pts_3d))
                 total_n += n
-        # Interp cache: keyed by sid (not (sid, span_idx)), uses i=-1 sentinel
-        if self._layer_visible['interp']:
+
+        # Interp layer: keyed by sid only (one polyline per spline, not
+        # per span).  ``span_idx=None`` records the absence of a span
+        # index — downstream code switches behaviour on that None.
+        if self._layer_visible[LayerKind.INTERP]:
             for sid, (pd, actor) in self._interp_cache.items():
                 if not actor.GetVisibility():
                     continue
@@ -1015,59 +1071,80 @@ class GeodesicSplineApp(MidpointShooterApp):
                     continue
                 n = len(pts_3d)
                 if total_n + n > self._curve_hover_3d_buf.shape[0]:
-                    new_cap = (total_n + n) * 2
-                    self._curve_hover_3d_buf = np.empty((new_cap, 3), dtype=float)
+                    self._curve_hover_3d_buf = np.empty(
+                        ((total_n + n) * 2, 3), dtype=float)
                 self._curve_hover_3d_buf[total_n:total_n + n] = pts_3d
-                meta.append(('interp', sid, -1, total_n, n, pts_3d))
+                items.append(_CurveHoverItem(
+                    LayerKind.INTERP, sid, None, total_n, n, pts_3d))
                 total_n += n
+        return items
 
-        # --- Phase 2: single batched projection ---
-        if total_n > 0:
-            all_2d = self._to_screen_batch(self._curve_hover_3d_buf[:total_n])
+    def _pick_closest_curve(self, items: list[_CurveHoverItem],
+                            all_2d: np.ndarray, mx: float, my: float
+                            ) -> tuple[dict | None, np.ndarray | None]:
+        """Finds the closest curve segment under the cursor.
 
-            # --- Phase 3: find closest segment per polyline ---
-            for layer, sid, i, start, n, pts_3d in meta:
-                penalty = self._LAYER_HOVER_PENALTY[layer]
-                sq, seg, frac = _closest_seg_on_polyline_2d(
-                    all_2d[start:start + n], n, mx, my)
-                effective_sq = sq + penalty
-                if effective_sq < best_sq and seg + 1 < n:
-                    # Potential hit, but check occlusion
-                    p0 = pts_3d[seg]
-                    p1 = pts_3d[seg + 1]
-                    pt_3d = p0 * (1.0 - frac) + p1 * frac
-                    if not self._is_marker_occluded(pt_3d):
-                        best_sq = effective_sq
-                        best_pt_3d = pt_3d
-                        best_info = {
-                            'spline_idx': sid, 'span_idx': i,
-                            'layer': layer, 'seg': seg, 'frac': frac,
-                            'point': best_pt_3d,
-                        }
+        Returns ``(info_dict, pt_3d)`` ready to feed
+        ``_update_hover_marker``, or ``(None, None)`` if no curve is
+        within the pick tolerance after applying z-priority penalties
+        and the occlusion check.
+        """
+        best_sq = self.cfg.PICK_TOLERANCE_SQ
+        best_info: dict | None = None
+        best_pt_3d: np.ndarray | None = None
+        for item in items:
+            penalty = self._LAYER_HOVER_PENALTY[item.layer]
+            sq, seg, frac = _closest_seg_on_polyline_2d(
+                all_2d[item.start:item.start + item.n_pts], item.n_pts, mx, my)
+            effective_sq = sq + penalty
+            if effective_sq < best_sq and seg + 1 < item.n_pts:
+                p0 = item.pts_3d[seg]
+                p1 = item.pts_3d[seg + 1]
+                pt_3d = p0 * (1.0 - frac) + p1 * frac
+                if not self._is_marker_occluded(pt_3d):
+                    best_sq = effective_sq
+                    best_pt_3d = pt_3d
+                    # ``span_idx`` is ``-1`` for interp to keep historical
+                    # ``info['span_idx']`` semantics for callers that
+                    # compare with integers.  The dataclass uses ``None``
+                    # internally; the public dict translation is here.
+                    span_idx = item.span_idx if item.span_idx is not None else -1
+                    best_info = {
+                        'spline_idx': item.sid,
+                        'span_idx': span_idx,
+                        'layer': item.layer,
+                        'seg': seg,
+                        'frac': frac,
+                        'point': best_pt_3d,
+                    }
+        return best_info, best_pt_3d
 
-        changed = False
-        if best_info is not None:
-            self.curve_hover_info = best_info
-            # Position and color the marker
+    def _update_hover_marker(self, info: dict | None,
+                             pt_3d: np.ndarray | None) -> bool:
+        """Repositions / shows / hides the hover marker actor.
+
+        Returns True when the visibility or position changed and the
+        caller should issue a render.
+        """
+        if info is not None:
+            self.curve_hover_info = info
             buf = self._curve_hover_pt_buf
-            buf[0] = best_pt_3d
+            buf[0] = pt_3d
             self._curve_hover_pd.points = buf
             self._curve_hover_pd.Modified()
             color_map = {
-                'blue': self.scfg.SPAN_COLOR,
-                'orange': self.scfg.GEO_COLOR,
-                'interp': self.scfg.INTERP_COLOR,
+                LayerKind.BLUE: self.scfg.SPAN_COLOR,
+                LayerKind.ORANGE: self.scfg.GEO_COLOR,
+                LayerKind.INTERP: self.scfg.INTERP_COLOR,
             }
-            self._curve_hover_actor.GetProperty().SetColor(
-                color_map[best_info['layer']])
+            self._curve_hover_actor.GetProperty().SetColor(color_map[info['layer']])
             self._curve_hover_actor.SetVisibility(True)
-            changed = True  # always render — position moved
-        else:
-            self.curve_hover_info = None
-            if self._curve_hover_actor.GetVisibility():
-                self._curve_hover_actor.SetVisibility(False)
-                changed = True
-        return changed
+            return True  # always render — position moved
+        self.curve_hover_info = None
+        if self._curve_hover_actor.GetVisibility():
+            self._curve_hover_actor.SetVisibility(False)
+            return True
+        return False
 
     def _cycle_gizmo_opacity(self) -> None:
         """Cycles the opacity of all auxiliary visuals (nodes, tangent lines,
@@ -1087,7 +1164,7 @@ class GeodesicSplineApp(MidpointShooterApp):
         # Update stitch preview if visible
         if self._stitch_actor.GetVisibility():
             self._stitch_actor.GetProperty().SetOpacity(nxt)
-        self._set_hud(f"GIZMO OPACITY {nxt:.0%}", 'white')
+        self._set_hud(_t("gizmo_opacity", pct=f"{nxt:.0%}"), 'white')
         self.plotter.render()
 
     def _toggle_layer_key(self, layer: str) -> None:
@@ -1157,7 +1234,7 @@ class GeodesicSplineApp(MidpointShooterApp):
             # Origin may have moved — stitch cache uses same id() but stale solver
             if id(seg) == self._stitch_origin_node_id:
                 self._invalidate_stitch_cache()
-            self._set_hud("REFINED (EXACT)", 'cyan')
+            self._set_hud(_t("refined_exact"), 'cyan')
 
     def _finalize_release(self, seg: GeodesicSegment) -> None:
         """Post-drag: keep node active, recompute spans, restore active spline.
@@ -1193,6 +1270,7 @@ class GeodesicSplineApp(MidpointShooterApp):
         self.plotter.add_key_event('s', self._on_save)
         self.plotter.add_key_event('l', self._on_load)
         self.plotter.add_key_event('t', self._cycle_gizmo_opacity)
+        self.plotter.add_key_event('r', self._rebuild_all_orange)
         self.plotter.iren.interactor.AddObserver(
             vtk.vtkCommand.RightButtonPressEvent, self._on_right_press, 1.0)
         # Ctrl+Z / Ctrl+Y — raw VTK observer (PyVista add_key_event
@@ -1201,15 +1279,17 @@ class GeodesicSplineApp(MidpointShooterApp):
             'KeyPressEvent', self._on_key_press_ctrl, 1.0)
 
     def _print_help(self) -> None:
+        # Console help -- ASCII only (Windows codepage 850 / cp1252 friendly).
         print("\n" + "=" * 48)
         print("  GEODESIC SPLINE EDITOR")
         print("  Dbl-click L : Add node    Dbl-click R : New spline")
         print("  Drag Red    : Translate   Drag Handle : Tangents")
         print("  Shift+Drag  : Snap to mesh vertex")
         print("  C           : Close/open loop  Backspace : Undo")
-        # Delete key removed — node deletion requires spline-aware reconnection
+        # Delete key removed -- node deletion requires spline-aware reconnection
         print("  b/o/k       : Toggle blue/orange/interp curves")
         print("  t           : Cycle gizmo opacity (20/40/70/100%)")
+        print("  r           : Rebuild orange (all splines)")
         print("  s           : Save splines to JSON")
         print("  l           : Load splines from JSON")
         print("  Ctrl+Z      : Undo     Ctrl+Y      : Redo")
@@ -1226,6 +1306,7 @@ class GeodesicSplineApp(MidpointShooterApp):
         "  Ctrl+Z / Y  : Undo / Redo\n"
         "  b/o/k       : Toggle curves\n"
         "  t           : Gizmo opacity\n"
+        "  r           : Rebuild orange\n"
         "  s           : Save JSON\n"
         "  l           : Load JSON\n"
         "  e           : Export paths\n"
@@ -1314,8 +1395,22 @@ class GeodesicSplineApp(MidpointShooterApp):
                 yield s_idx, n_idx, node
 
     def _spline_for_node(self, seg: GeodesicSegment) -> int:
-        """Returns the spline index that owns *seg*.  O(1) via ``_node_to_spline`` cache."""
-        return self._node_to_spline.get(id(seg), self.active_spline_idx)
+        """Returns the spline index that owns *seg*.
+
+        O(1) via the ``_node_to_spline`` cache.  Falls back to the
+        currently-active spline when the cache is stale (logs a debug
+        message — visible only when ``GEO_SPLINES_DEBUG=1`` so the user
+        is not spammed during normal use).  A stale entry is repaired on
+        the next ``_rebuild_node_index`` call, which every mutation
+        already triggers.
+        """
+        sid = self._node_to_spline.get(id(seg))
+        if sid is not None:
+            return sid
+        log.debug("_spline_for_node: id(%d) missing from cache, "
+                  "falling back to active spline %d",
+                  id(seg), self.active_spline_idx)
+        return self.active_spline_idx
 
     def _rebuild_node_index(self) -> None:
         """Rebuilds the ``id(segment) → spline_index`` lookup dict.
@@ -1383,26 +1478,45 @@ class GeodesicSplineApp(MidpointShooterApp):
     def _on_undo_ctrl_z(self) -> None:
         """Ctrl+Z: restores the previous spline state from the undo stack."""
         if not self._undo_stack:
-            self._set_hud("NOTHING TO UNDO", 'grey')
+            self._set_hud(_t("nothing_to_undo"), 'grey')
             self.plotter.render()
             return
         self._redo_stack.append(self._snapshot())
         data = self._undo_stack.pop()
         self._restore_snapshot(data)
-        self._set_hud("UNDO", 'yellow')
+        self._set_hud(_t("undo"), 'yellow')
         self.plotter.render()
 
     def _on_redo(self) -> None:
         """Ctrl+Y: re-applies the last undone operation from the redo stack."""
         if not self._redo_stack:
-            self._set_hud("NOTHING TO REDO", 'grey')
+            self._set_hud(_t("nothing_to_redo"), 'grey')
             self.plotter.render()
             return
         self._undo_stack.append(self._snapshot())
         data = self._redo_stack.pop()
         self._restore_snapshot(data)
-        self._set_hud("REDO", 'cyan')
+        self._set_hud(_t("redo"), 'cyan')
         self.plotter.render()
+
+    def _can_use_diff_restore(self, data: dict) -> bool:
+        """True when *data* and the current splines share the same shape.
+
+        The differential restore path only handles geometry changes
+        (origin / tangent edits) — any structural change (different
+        spline count, node count, closed flag) forces a full rebuild.
+        Centralising the predicate keeps ``_restore_snapshot`` readable.
+        """
+        target = data.get('splines')
+        if not isinstance(target, list) or len(target) != len(self.splines):
+            return False
+        for i, sd in enumerate(target):
+            nodes = sd.get('nodes', [])
+            if len(nodes) != len(self.splines[i]):
+                return False
+            if bool(sd.get('closed', False)) != self.splines_closed[i]:
+                return False
+        return True
 
     def _restore_snapshot(self, data: dict) -> None:
         """Restores a snapshot, using differential reconstruction when possible.
@@ -1420,19 +1534,10 @@ class GeodesicSplineApp(MidpointShooterApp):
         """
         active = data.pop('active_spline_idx', 0)
 
-        # Structure comparison: if any of these differ, we need a full rebuild.
-        structure_match = (len(data['splines']) == len(self.splines))
-        if structure_match:
-            for i, sd in enumerate(data['splines']):
-                if (len(sd['nodes']) != len(self.splines[i])
-                        or bool(sd.get('closed', False)) != self.splines_closed[i]):
-                    structure_match = False
-                    break
-
-        if not structure_match:
+        if not self._can_use_diff_restore(data):
             # Full rebuild path
             self._load_from_data(data)
-            self.active_spline_idx = min(active, len(self.splines) - 1)
+            self.active_spline_idx = self._clamp_spline_idx(active)
             self._prev_active_spline_idx = self.active_spline_idx
             self._refresh_visuals()
             return
@@ -1456,7 +1561,6 @@ class GeodesicSplineApp(MidpointShooterApp):
 
         # Recompute spans only for splines with changed nodes
         if changed_splines:
-            # Cancel any running orange workers for affected splines
             saved_sid = self.active_spline_idx
             for sid in changed_splines:
                 self.active_spline_idx = sid
@@ -1464,9 +1568,66 @@ class GeodesicSplineApp(MidpointShooterApp):
                 self._submit_geodesic_spans()
             self.active_spline_idx = saved_sid
 
-        self.active_spline_idx = min(active, len(self.splines) - 1)
+        self.active_spline_idx = self._clamp_spline_idx(active)
         self._prev_active_spline_idx = self.active_spline_idx
         self._refresh_visuals()
+
+    def _clamp_spline_idx(self, idx: int) -> int:
+        """Clamps *idx* into the valid range of ``self.splines``.
+
+        Returns 0 when the splines list is empty (instead of -1, which the
+        naive ``min(idx, len(self.splines) - 1)`` would yield).  The
+        downstream logic always expects at least one (possibly empty)
+        spline; ``_load_from_data`` guarantees that invariant.
+        """
+        n = len(self.splines)
+        if n == 0:
+            return 0
+        return max(0, min(int(idx), n - 1))
+
+    @staticmethod
+    def _decompose_tangent(tangent_full: np.ndarray) -> tuple[np.ndarray, float]:
+        """Splits a 3-D tangent vector into ``(unit_direction, h_length)``.
+
+        Falls back to ``(+x, 0.01)`` for a near-zero tangent so the node
+        still renders something sensible after a degenerate save.
+        """
+        h_length = float(np.linalg.norm(tangent_full))
+        if h_length > 1e-15:
+            return tangent_full / h_length, h_length
+        return np.array([1.0, 0.0, 0.0]), 0.01
+
+    def _apply_record_to_node(self, seg: GeodesicSegment,
+                              origin: np.ndarray,
+                              tangent_full: np.ndarray) -> None:
+        """Repopulates *seg*'s geometry from the canonical (origin, tangent)
+        record.  Shared by ``_node_from_record`` (creation) and
+        ``_rebuild_node_inplace`` (in-place restore for undo/redo).
+        """
+        tangent_dir, h_length = self._decompose_tangent(tangent_full)
+        face_idx = self.geo.find_face(origin)
+        normal, u, v = self._build_local_frame(origin, face_idx)
+        seg.origin = origin
+        seg.face_idx = face_idx
+        seg.normal = normal
+        seg.u = u
+        seg.v = v
+        seg.h_length = h_length
+        seg.path_b = self.geo.compute_shoot(origin, tangent_dir, h_length, face_idx)
+        seg.path_a = self.geo.compute_shoot(origin, -tangent_dir, h_length, face_idx)
+        seg.p_b = seg.path_b[-1] if seg.path_b is not None else None
+        seg.p_a = seg.path_a[-1] if seg.path_a is not None else None
+        seg.update_local_v(self.geo)
+
+    def _node_from_record(self, origin: np.ndarray,
+                          tangent_full: np.ndarray) -> GeodesicSegment:
+        """Creates a new ``GeodesicSegment`` from a saved (origin, tangent) record."""
+        face_idx = self.geo.find_face(origin)
+        normal, u, v = self._build_local_frame(origin, face_idx)
+        seg = GeodesicSegment(origin, face_idx, normal, u, v)
+        seg.is_active = True
+        self._apply_record_to_node(seg, origin, tangent_full)
+        return seg
 
     def _rebuild_node_inplace(self, seg: GeodesicSegment,
                               origin: np.ndarray,
@@ -1477,27 +1638,7 @@ class GeodesicSplineApp(MidpointShooterApp):
         Used by the differential undo/redo path to avoid destroying/recreating
         VTK actors for unchanged nodes.
         """
-        h_length = float(np.linalg.norm(tangent_full))
-        if h_length > 1e-15:
-            tangent_dir = tangent_full / h_length
-        else:
-            tangent_dir = np.array([1.0, 0.0, 0.0])
-            h_length = 0.01
-
-        face_idx = self.geo.find_face(origin)
-        normal, u, v = self._build_local_frame(origin, face_idx)
-        seg.origin = origin
-        seg.face_idx = face_idx
-        seg.normal = normal
-        seg.u = u
-        seg.v = v
-        seg.h_length = h_length
-
-        seg.path_b = self.geo.compute_shoot(origin, tangent_dir, h_length, face_idx)
-        seg.path_a = self.geo.compute_shoot(origin, -tangent_dir, h_length, face_idx)
-        seg.p_b = seg.path_b[-1] if seg.path_b is not None else None
-        seg.p_a = seg.path_a[-1] if seg.path_a is not None else None
-        seg.update_local_v(self.geo)
+        self._apply_record_to_node(seg, origin, tangent_full)
         seg.update_visuals(self.plotter)
 
     def _init_tangents(self, node: GeodesicSegment, direction: np.ndarray, length: float):
@@ -1556,7 +1697,7 @@ class GeodesicSplineApp(MidpointShooterApp):
         seg.is_active = True
         seg.is_dragging = True
         self._lock_camera()
-        self._set_hud(f"DRAGGING {tag.upper()}", 'gold')
+        self._set_hud(_t("dragging", marker=tag.upper()), 'gold')
         # Cancel background workers and hide orange immediately
         # — in the same render frame as the drag initiation, not on the
         # first _on_move (which would leave them visible for 1+ frame).
@@ -1586,19 +1727,27 @@ class GeodesicSplineApp(MidpointShooterApp):
                                 nodes: list, closed: bool) -> None:
         """Inserts a node from a hover on the interpolation (black) curve.
 
-        Unlike the Bézier layers, the interp curve has no span structure
-        — it is a single polyline per spline.  The insertion index is
-        determined by **arc-length fraction** along the interp polyline:
+        Unlike the Bezier layers, the interp curve has no span structure
+        -- it is a single polyline per spline.  The insertion index is
+        determined by the **arc-length fraction** along the interp
+        polyline:
 
           1. Compute the cumulative arc-length along the displayed
              polyline up to the hover point.
           2. For each node origin, find its closest vertex on the
              polyline and its arc-length fraction.
           3. The hover fraction falls between two consecutive node
-             fractions → insert between those two nodes.
+             fractions -> insert between those two nodes.
 
-        This is robust against self-intersecting splines (where
-        Euclidean nearest-origin would pick the wrong segment).
+        This is more reliable than picking the nearest origin in
+        Euclidean space, but it is **not bullet-proof on splines that
+        self-intersect within roughly one inter-node distance**: when
+        two distant arc-length neighbours are closer in 3-D than the
+        node spacing, the closest-vertex step in (2) can attribute a
+        node to the wrong arm of the loop.  Falling back to nearest
+        origin in that case (the path under ``insert_pos is None``
+        below) keeps the insertion functional even when the heuristic
+        loses the right gap.
 
         The tangent direction comes from the polyline segment at the
         hover point, projected onto the surface tangent plane at the
@@ -1630,12 +1779,15 @@ class GeodesicSplineApp(MidpointShooterApp):
                 hover_s = cum[seg] + seg_lens[seg] * frac if seg < len(seg_lens) else cum[-1]
                 hover_frac = hover_s / total
 
-                # Fraction of each node origin along the polyline
-                # (find closest polyline vertex to each origin)
-                node_fracs = np.empty(n_nodes, dtype=float)
-                for k in range(n_nodes):
-                    d = np.linalg.norm(pts_3d - origins[k], axis=1)
-                    node_fracs[k] = cum[int(np.argmin(d))] / total
+                # Fraction of each node origin along the polyline.
+                # Vectorised: compute the (n_nodes, n_polyline)
+                # distance matrix in one BLAS call instead of looping
+                # in Python.  ``argmin`` along axis=1 gives the closest
+                # polyline vertex to each origin in one pass.
+                diff = pts_3d[None, :, :] - origins[:, None, :]
+                d2 = np.einsum('ijk,ijk->ij', diff, diff)
+                nearest = np.argmin(d2, axis=1)
+                node_fracs = cum[nearest] / total
 
                 # Find which node-gap the hover_frac falls in.
                 # Non-closed: gaps are [frac[0], frac[1]], ..., [frac[n-2], frac[n-1]].
@@ -1727,7 +1879,7 @@ class GeodesicSplineApp(MidpointShooterApp):
         self._refresh_visuals()
         self._recompute_spans()
         self._submit_geodesic_spans()
-        self._set_hud("NODE INSERTED (INTERP)", 'lime')
+        self._set_hud(_t("node_inserted_interp"), 'lime')
         self.plotter.render()
 
     # --- Bézier split at curve hover — helper methods ---
@@ -2001,7 +2153,7 @@ class GeodesicSplineApp(MidpointShooterApp):
         self._refresh_visuals()
         self._recompute_spans()
         self._submit_geodesic_spans()
-        self._set_hud("NODE INSERTED", 'lime')
+        self._set_hud(_t("node_inserted"), 'lime')
         self.plotter.render()
 
     def _on_press(self, obj, event) -> None:
@@ -2079,7 +2231,7 @@ class GeodesicSplineApp(MidpointShooterApp):
             self.splines_closed.append(False)
             self.active_spline_idx = len(self.splines) - 1
             self._refresh_visuals()
-            self._set_hud("NEW SPLINE STARTED", 'lime')
+            self._set_hud(_t("new_spline_started"), 'lime')
             self.plotter.render()
 
     def _snap_point_to_edge(self, p: np.ndarray, face_idx: int | None
@@ -2155,17 +2307,19 @@ class GeodesicSplineApp(MidpointShooterApp):
             super()._on_move(obj, event)
         else:
             pick_result = self._pick()
+            snap_indicator_pt: np.ndarray | None = None
             if dragged:
                 iren = self.plotter.iren.interactor
                 if pick_result[0] is not None:
-                    # Shift wins over Ctrl when both are held — vertex snap
-                    # is a strict subset of edge snap (edge endpoints are
-                    # vertices), so no disambiguation is needed.
+                    # Shift wins over Ctrl when both are held -- vertex
+                    # snap is a strict subset of edge snap (edge endpoints
+                    # are vertices), so no disambiguation is needed.
                     if iren.GetShiftKey():
                         _, vi = self.geo._kdtree.query(pick_result[0])
                         snapped = self.geo.V[int(vi)].copy()
                         pick_result = (snapped, self.geo.find_face(snapped))
-                        self._set_hud(f"SNAP → vertex {int(vi)}", 'gold')
+                        self._set_hud(_t("snap_vertex", idx=int(vi)), 'gold')
+                        snap_indicator_pt = snapped
                     elif iren.GetControlKey():
                         snapped, info = self._snap_point_to_edge(
                             pick_result[0], pick_result[1])
@@ -2174,10 +2328,11 @@ class GeodesicSplineApp(MidpointShooterApp):
                                            self.geo.find_face(snapped))
                             va, vb, t = info
                             self._set_hud(
-                                f"SNAP → edge {va}-{vb} t={t:.2f}",
-                                'cyan')
+                                _t("snap_edge", va=va, vb=vb, t=t), 'cyan')
+                            snap_indicator_pt = snapped
                 self._stitch_actor.SetVisibility(False)
                 self._cancel_geodesic_spans(dragged)
+                self._update_snap_indicator(snap_indicator_pt)
             super()._on_move(obj, event, pick_override=pick_result)
 
         if dragged:
@@ -2186,6 +2341,10 @@ class GeodesicSplineApp(MidpointShooterApp):
             self._curve_hover_actor.SetVisibility(False)
             self.curve_hover_info = None
             return
+
+        # Not dragging anymore -- hide snap indicator if it was shown.
+        if self._snap_indicator_actor.GetVisibility():
+            self._snap_indicator_actor.SetVisibility(False)
 
         # Skip stitch preview and curve hover when hovering a handle marker
         if hovering_marker:
@@ -2251,7 +2410,7 @@ class GeodesicSplineApp(MidpointShooterApp):
             self._submit_geodesic_spans()
             self._refresh_visuals()
             self._update_stitch()
-            self._set_hud("LOOP OPENED", 'yellow')
+            self._set_hud(_t("loop_opened"), 'yellow')
             self.plotter.render()
             return
 
@@ -2294,7 +2453,7 @@ class GeodesicSplineApp(MidpointShooterApp):
         self.active_spline_idx = len(self.splines) - 1
         self._stitch_actor.SetVisibility(False)
         self._refresh_visuals()
-        self._set_hud("LOOP CLOSED + BREAK", 'cyan')
+        self._set_hud(_t("loop_closed_break"), 'cyan')
         self.plotter.render()
 
     def _on_backspace(self) -> None:
@@ -2345,9 +2504,9 @@ class GeodesicSplineApp(MidpointShooterApp):
                     if removed:
                         safe_remove_actor(self.plotter, removed[1])
                 self._hover_dirty = True
-                self._set_hud("LOOP OPENED", 'yellow')
+                self._set_hud(_t("loop_opened"), 'yellow')
             else:
-                self._set_hud("BREAK REMOVED", 'yellow')
+                self._set_hud(_t("break_removed"), 'yellow')
             self._refresh_visuals()
             self._update_stitch()
             self.plotter.render()
@@ -2411,6 +2570,22 @@ class GeodesicSplineApp(MidpointShooterApp):
         self._stitch_origin_cache = None
         self._stitch_origin_node_id = -1
 
+    def _update_snap_indicator(self, pt: np.ndarray | None) -> None:
+        """Shows / hides / repositions the gold snap-target sphere.
+
+        *pt* is the on-surface point the drag will land on after Shift
+        (vertex) or Ctrl (edge) snapping.  Pass ``None`` to hide the
+        indicator (no snap modifier held, or no valid snap target).
+        """
+        if pt is None:
+            if self._snap_indicator_actor.GetVisibility():
+                self._snap_indicator_actor.SetVisibility(False)
+            return
+        self._snap_indicator_buf[0] = pt
+        self._snap_indicator_pd.points = self._snap_indicator_buf
+        self._snap_indicator_pd.Modified()
+        self._snap_indicator_actor.SetVisibility(True)
+
     def _update_stitch(self, q=None) -> None:
         """Updates the prospective-span preview from last node to cursor.
 
@@ -2456,7 +2631,11 @@ class GeodesicSplineApp(MidpointShooterApp):
                 return
             try:
                 pts = cache['solver'].find_geodesic_path(idx_s, idx_e)
-            except Exception:
+            except Exception as exc:  # noqa: BLE001 — solver C++ wrapper
+                # The wrapper raises a generic ``Exception`` from the
+                # native solver; we cannot narrow the type and the
+                # fallback (hide the stitch) is the same regardless.
+                log.debug("stitch local solver failed: %s", exc)
                 self._stitch_actor.SetVisibility(False)
                 return
         else:
@@ -2469,7 +2648,8 @@ class GeodesicSplineApp(MidpointShooterApp):
                 return
             try:
                 pts = self.geo._solver.find_geodesic_path(idx_s, idx_e)
-            except Exception:
+            except Exception as exc:  # noqa: BLE001 — solver C++ wrapper
+                log.debug("stitch global solver failed: %s", exc)
                 self._stitch_actor.SetVisibility(False)
                 return
 
@@ -2496,8 +2676,7 @@ class GeodesicSplineApp(MidpointShooterApp):
         was_degraded = key in self._degraded_spans
         if degraded and not was_degraded:
             self._degraded_spans.add(key)
-            self._set_hud(f"GEODESIC FALLBACK on span {key[0]}:{key[1]}",
-                          'red')
+            self._set_hud(_t("geodesic_fallback", sid=key[0], i=key[1]), 'red')
             # Clear any cached drag-state so _set_span will repaint.
             self._span_drag_state.pop(key, None)
         elif not degraded and was_degraded:
@@ -2633,16 +2812,21 @@ class GeodesicSplineApp(MidpointShooterApp):
             ctrl = [n0.origin, n0.p_b, n1.p_a, n1.origin]
             n = self.geo.adaptive_samples(ctrl, res, min_s, max_s)
             t_vals = GeodesicMesh.curvature_adaptive_t_vals(ctrl, n) if adaptive else None
-            # Two-mode Bézier: during drag use fast Euclidean+projection
-            # for H_out→H_in (path_12=None); on consolidation compute the
+            # Two-mode Bezier: during drag use fast Euclidean+projection
+            # for H_out->H_in (path_12=None); on consolidation compute the
             # exact geodesic path_12 via compute_endpoint_local for a
-            # semi-geodesic curve (~25ms extra per span).
-            path_12 = None if is_dragging else self.geo.compute_endpoint_local(
-                n0.p_b, n1.p_a)
-            # Track fallbacks only on consolidation (when path_12 is
-            # actually computed).  During drag the hybrid skips the
-            # solver entirely so there is nothing to flag.
+            # semi-geodesic curve (~25ms extra per span).  The solver
+            # may return ``None`` (very rare — disconnected components,
+            # all retries exhausted); treat that as "no extra accuracy
+            # available" and fall back to the drag-style hybrid by
+            # passing ``path_12=None``.
+            path_12 = None
             if not is_dragging:
+                path_12 = self.geo.compute_endpoint_local(n0.p_b, n1.p_a)
+                if path_12 is not None and len(path_12) < 2:
+                    path_12 = None
+                # Track fallbacks only on consolidation.  During drag the
+                # hybrid skips the solver entirely so there is nothing to flag.
                 self._mark_span_degraded(
                     (sid, i), self.geo._last_was_fallback)
             pts = self.geo.hybrid_de_casteljau_curve(
@@ -2729,16 +2913,25 @@ class GeodesicSplineApp(MidpointShooterApp):
             tck, u = splprep(
                 [origins[:, 0], origins[:, 1], origins[:, 2]],
                 s=0, k=k, per=closed)
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 — scipy raises bare Exception
+            log.debug("splprep failed for spline %d: %s", sid, exc)
             self._set_interp_curve(sid, None)
             return
 
-        # High base sample count — the 3D B-spline has no geodesic
+        # High base sample count -- the 3D B-spline has no geodesic
         # awareness, so shorter initial chords reduce surface deviation.
+        # During drag, ~4x downsample keeps the cost ~1 ms instead of
+        # ~5 ms per frame.  The overall shape is still recognisable
+        # because the polyline is projected onto the surface; the user
+        # gets the precise version on consolidation when secant
+        # subdivision also runs.
         sc = self.scfg
-        n = max(sc.INTERP_MIN_SAMPLES,
-                self.geo.adaptive_samples(origins, sc.RESOLUTION,
-                                          sc.INTERP_MIN_SAMPLES, 500))
+        if is_dragging:
+            n = max(sc.INTERP_DRAG_SAMPLES, k + 2)
+        else:
+            n = max(sc.INTERP_MIN_SAMPLES,
+                    self.geo.adaptive_samples(origins, sc.RESOLUTION,
+                                              sc.INTERP_MIN_SAMPLES, 500))
 
         u_fine = np.linspace(0.0, 1.0, n)
         x, y, z = splev(u_fine, tck)
@@ -2863,12 +3056,35 @@ class GeodesicSplineApp(MidpointShooterApp):
                 continue
             # Hide orange actor while recomputing
             self._set_geo_span(sid, i, None)
-            # Submit the orange worker directly (no more green pipeline).
+            # Submit the orange worker.  The manager owns the batch
+            # counter — no per-call bookkeeping here.
             self._work_mgr.submit_span(
                 span_key, ctrl,
                 n0.path_b, n1.path_a[::-1],
                 sc.GEO_SAMPLES, adaptive=sc.ADAPTIVE_SAMPLING)
-            self._orange_batch_total += 1
+
+    def _rebuild_all_orange(self) -> None:
+        """Resubmits the fully-geodesic (orange) workers for **every** span
+        across **every** spline, even when the user has not dragged.
+
+        Bound to the ``r`` key.  Useful after toggling ``ADAPTIVE_SAMPLING``,
+        loading a session, or recovering from a worker crash — situations
+        where the orange polylines are stale or absent and a manual rebuild
+        is faster than orchestrating dummy drags.
+
+        Cancels any in-flight workers first so the batch counter starts
+        fresh and the HUD reflects the new total.
+        """
+        self._work_mgr.cancel_all()
+        saved_sid = self.active_spline_idx
+        try:
+            for sid in range(len(self.splines)):
+                self.active_spline_idx = sid
+                self._submit_geodesic_spans()
+        finally:
+            self.active_spline_idx = saved_sid
+        self._set_hud(_t("orange_rebuilt"), 'orange')
+        self.plotter.render()
 
     def _cancel_geodesic_spans(self, node: GeodesicSegment) -> None:
         """Cancels running workers and hides geodesic actors for spans
@@ -2895,116 +3111,136 @@ class GeodesicSplineApp(MidpointShooterApp):
             self._set_geo_span(sid, j, None)
 
     def _on_poll_timer(self, obj, event) -> None:
-        """Master Clock heartbeat.
+        """Master Clock heartbeat — orchestrator only.
 
-        Polls the orange worker pipes for progressive curve updates.
-        Also detects camera movement and refreshes handle arrow scales.
+        The actual work is split across small helpers so each
+        responsibility (drain, HUD, camera, render of progressive
+        results, dead-worker cleanup) is testable in isolation:
+
+          1. ``_apply_worker_fallbacks``  — degraded-span flag merging.
+          2. ``_update_orange_hud``       — progress text in the HUD.
+          3. ``_refresh_arrows_on_camera_change`` — fixed-screen-size arrows.
+          4. ``_apply_orange_progress``   — progressive polyline updates.
+          5. ``_clear_dead_orange_spans`` — actors orphaned by worker death.
         """
         super()._on_poll_timer(obj, event)
         has_worker_results = self._work_mgr.drain_queue()
 
-        # Orange worker fallback reports — merge into the app-level set
-        # so ``_set_geo_span`` (and blue ``_set_span``) can paint red.
-        # Workers only mutate ``degraded_spans`` during 'done', which
-        # coincides with ``dirty_spans`` so the state is consumed in the
-        # same drain pass without extra synchronization.
-        if self._work_mgr.degraded_spans:
-            for span_key in list(self._work_mgr.degraded_spans):
-                self._mark_span_degraded(span_key, True)
-            self._work_mgr.degraded_spans.clear()
+        self._apply_worker_fallbacks()
+        self._update_orange_hud()
 
-        needs_render = False
-
-        # --- Orange progress HUD ---
-        # Show "COMPUTING ORANGE k/N" while any orange span is active.
-        # Clears when all spans finish.
-        n_active = len(self._work_mgr.active_spans)
-        if n_active > 0:
-            done = self._orange_batch_total - n_active
-            self._set_hud(
-                f"COMPUTING ORANGE {done}/{self._orange_batch_total}",
-                'orange')
-            self._orange_hud_active = True
-        elif self._orange_hud_active:
-            # Just finished — reset batch counter and clear HUD
-            self._orange_batch_total = 0
-            self._orange_hud_active = False
-            self._set_hud("ORANGE DONE", 'lime')
-
-        # --- Camera-change detection: refresh arrow scales ---
-        # Must run before the worker-results guard — arrows must update
-        # even when no background workers are active (e.g. user is just
-        # navigating the camera after finishing edits).
-        cam = self.plotter.camera.position
-        if cam != self._last_cam_pos:
-            self._last_cam_pos = cam
-            for _, _, node in self._iter_all_nodes():
-                node.refresh_arrows(self.plotter)
-            needs_render = True
+        needs_render = self._refresh_arrows_on_camera_change()
 
         if not has_worker_results:
             if needs_render:
                 self.plotter.render()
             return
 
-        # --- Orange results: progressive update ---
-        # Exclude dead spans — their worker died, don't show partial data
-        dirty_orange = self._work_mgr.dirty_spans - self._work_mgr.dead_spans
-        self._work_mgr.dirty_spans = set()
-        for span_key in dirty_orange:
-            sid, i = span_key
-            if sid >= len(self.splines) or i >= self._span_count(sid):
-                continue
-            pts = self._work_mgr.get_points(span_key)
-            if pts is not None:
-                # Secant subdivision only on completion — avoids O(N²)
-                # cost of re-subdividing the growing polyline on every
-                # progressive point arrival.
-                is_done = span_key in self._work_mgr.done_spans
-                if is_done:
-                    pts = self.geo.subdivide_secant_chords(
-                        pts, tol=self._secant_tol,
-                        max_depth=self.scfg.SECANT_MAX_DEPTH)
-                    self._work_mgr.done_spans.discard(span_key)
-                # ``computing`` is True while the worker is still active
-                # (dimmer color, optional dashed pattern).  Flips to
-                # False on the 'done' message and the curve consolidates
-                # to full-orange solid.
-                self._set_geo_span(*span_key, pts,
-                                   computing=not is_done)
-                needs_render = True
-
-        # --- Dead workers: clear orphaned actor geometry ---
-        dead = self._work_mgr.dead_spans
-        if dead:
-            self._work_mgr.dead_spans = set()
-            for span_key in dead:
-                self._set_geo_span(*span_key, None)
+        if self._apply_orange_progress():
+            needs_render = True
+        if self._clear_dead_orange_spans():
             needs_render = True
 
         if needs_render:
             self.plotter.render()
 
+    def _apply_worker_fallbacks(self) -> None:
+        """Merges ``_work_mgr.degraded_spans`` into the app-level set.
+
+        Workers only set the flag inside their ``'done'`` payload, which
+        is delivered alongside ``dirty_spans`` — no separate
+        synchronisation is needed.
+        """
+        if not self._work_mgr.degraded_spans:
+            return
+        for span_key in list(self._work_mgr.degraded_spans):
+            self._mark_span_degraded(span_key, True)
+        self._work_mgr.degraded_spans.clear()
+
+    def _update_orange_hud(self) -> None:
+        """Translates the manager's batch counters into a HUD line."""
+        done, total = self._work_mgr.progress()
+        if self._work_mgr.active_spans:
+            self._set_hud(_t("computing_orange", done=done, total=total), 'orange')
+            self._orange_hud_active = True
+        elif self._orange_hud_active:
+            self._work_mgr.maybe_reset_progress()
+            self._orange_hud_active = False
+            self._set_hud(_t("orange_done"), 'lime')
+
+    def _refresh_arrows_on_camera_change(self) -> bool:
+        """Refreshes fixed-screen-size handle arrows on camera movement.
+
+        Runs irrespective of whether workers produced results — the user
+        may simply be orbiting after finishing edits.  Returns True when
+        a render is required.
+        """
+        cam = self.plotter.camera.position
+        if cam == self._last_cam_pos:
+            return False
+        self._last_cam_pos = cam
+        for _, _, node in self._iter_all_nodes():
+            node.refresh_arrows(self.plotter)
+        return True
+
+    def _apply_orange_progress(self) -> bool:
+        """Pushes new orange points into their actors.
+
+        Returns True if at least one polyline was updated.  Excludes
+        dead spans — their worker terminated abnormally and any cached
+        partial data should be discarded by ``_clear_dead_orange_spans``
+        instead of being rendered.
+        """
+        dirty_orange = self._work_mgr.dirty_spans - self._work_mgr.dead_spans
+        self._work_mgr.dirty_spans = set()
+        rendered = False
+        for span_key in dirty_orange:
+            sid, i = span_key
+            if sid >= len(self.splines) or i >= self._span_count(sid):
+                continue
+            pts = self._work_mgr.get_points(span_key)
+            if pts is None:
+                continue
+            # Secant subdivision only on completion — avoids O(N^2) cost
+            # of re-subdividing the growing polyline on every progressive
+            # point arrival.
+            is_done = span_key in self._work_mgr.done_spans
+            if is_done:
+                pts = self.geo.subdivide_secant_chords(
+                    pts, tol=self._secant_tol,
+                    max_depth=self.scfg.SECANT_MAX_DEPTH)
+                self._work_mgr.done_spans.discard(span_key)
+            self._set_geo_span(*span_key, pts, computing=not is_done)
+            rendered = True
+        return rendered
+
+    def _clear_dead_orange_spans(self) -> bool:
+        """Removes geometry of spans whose worker died unexpectedly."""
+        dead = self._work_mgr.dead_spans
+        if not dead:
+            return False
+        self._work_mgr.dead_spans = set()
+        for span_key in dead:
+            self._set_geo_span(*span_key, None)
+        return True
+
     # --- Save / Load ---
 
     def _on_save(self) -> None:
-        """Saves all splines to a timestamped JSON file.
+        """Saves all splines to a timestamped JSON file (atomic, UTF-8).
 
         Format: ``yyyymmdd_HHMMSS.json`` in the current directory.
         Each node stores only **2 fields** at full float64 precision:
 
-          - **origin** (x, y, z) — 3-D position on the surface.
-          - **tangent** (dx, dy, dz) — 3-D vector whose direction is the
+          - **origin** (x, y, z) -- 3-D position on the surface.
+          - **tangent** (dx, dy, dz) -- 3-D vector whose direction is the
             shoot direction for path_b and whose magnitude is h_length.
 
-        On load, ``h_length = |tangent|``, direction = ``tangent / |tangent|``.
-        ``face_idx``, normal, frame (u, v), ``local_v``, and all paths/handles
-        are reconstructed via ``find_face`` + ``_build_local_frame`` +
-        ``compute_shoot``.
-
-        The 3-D tangent-with-magnitude is the most compact representation —
-        two fields fully define the node's geometry, and it survives mesh
-        remeshing as long as the surface shape is preserved.
+        Atomicity: the JSON is first written to ``<name>.tmp`` and then
+        ``os.replace``-d into place.  A crash mid-write therefore leaves
+        either the previous file untouched or no .json at all -- never a
+        truncated half-written one.  Disk-full / permission errors are
+        reported on the HUD instead of being silently swallowed.
         """
         data = {
             'version': 1,
@@ -3017,7 +3253,7 @@ class GeodesicSplineApp(MidpointShooterApp):
                 'nodes': [],
             }
             for node in nodes:
-                # 3D tangent with magnitude = shoot direction × h_length
+                # 3D tangent with magnitude = shoot direction * h_length
                 tangent_3d = (node.local_v[0] * node.u
                               + node.local_v[1] * node.v) * node.h_length
                 spline_data['nodes'].append({
@@ -3029,28 +3265,53 @@ class GeodesicSplineApp(MidpointShooterApp):
         # numpy .tolist() produces Python floats which json.dump writes
         # with full repr precision (~17 significant digits) by default.
         fname = datetime.now().strftime('%Y%m%d_%H%M%S') + '.json'
-        with open(fname, 'w') as f:
-            json.dump(data, f, indent=2)
+        try:
+            self._atomic_write_json(fname, data)
+        except OSError as exc:
+            log.error("save failed: %s", exc)
+            self._set_hud(_t("save_failed", err=str(exc)), 'red')
+            self.plotter.render()
+            return
         n_nodes = sum(len(s) for s in self.splines)
-        self._set_hud(f"SAVED {n_nodes} nodes → {fname}", 'gold')
-        print(f"[*] Saved {n_nodes} nodes across {len(self.splines)} "
-              f"splines to {fname}")
+        self._set_hud(_t("saved", n=n_nodes, fname=fname), 'gold')
+        log.info("saved %d nodes across %d splines to %s",
+                 n_nodes, len(self.splines), fname)
         self.plotter.render()
+
+    @staticmethod
+    def _atomic_write_json(fname: str, data: dict) -> None:
+        """Writes *data* as JSON to *fname* atomically (UTF-8).
+
+        Strategy: dump to a sibling ``*.tmp`` file, fsync, then
+        ``os.replace`` it onto the target.  ``os.replace`` is atomic on
+        both POSIX and Windows for files on the same volume — the user
+        sees either the old file or the new one, never a partial write.
+        """
+        target = Path(fname)
+        with tempfile.NamedTemporaryFile(
+                'w', encoding='utf-8',
+                dir=target.parent if str(target.parent) else None,
+                prefix=target.stem + '.', suffix='.tmp',
+                delete=False) as tmp:
+            json.dump(data, tmp, indent=2)
+            tmp.flush()
+            try:
+                os.fsync(tmp.fileno())
+            except OSError:
+                # Some filesystems (network, exotic) don't support fsync.
+                # Replace below is still atomic at the inode level.
+                pass
+            tmp_path = tmp.name
+        os.replace(tmp_path, fname)
 
     def _on_load(self) -> None:
         """Loads splines from a JSON file, replacing all current splines.
 
         Opens a file dialog defaulting to the most recent ``*.json`` in
-        the current directory.
-        Reconstructs each node via:
-
-          1. ``|tangent|`` → h_length; ``tangent / |tangent|`` → direction
-          2. ``find_face(origin)`` → face_idx
-          3. ``_build_local_frame(origin, face_idx)`` → normal, u, v
-          4. ``compute_shoot(origin, ±direction, h_length)`` → paths, handles
-          5. ``update_local_v()`` → local_v from reconstructed paths
-
-        All derived state is recomputed from the 2 saved fields per node.
+        the current directory.  Validates schema version and per-node
+        shape (3-element ``origin`` and ``tangent``) before mutating any
+        state — a malformed JSON cannot leave the editor in a partially
+        loaded state.
         """
         import tkinter as tk
         from tkinter import filedialog
@@ -3071,51 +3332,70 @@ class GeodesicSplineApp(MidpointShooterApp):
             return
 
         try:
-            with open(fpath, 'r') as f:
+            with open(fpath, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-        except Exception as exc:
-            print(f"[!] Failed to read {fpath}: {exc}")
-            self._set_hud("LOAD FAILED", 'red')
+        except (OSError, json.JSONDecodeError) as exc:
+            log.error("failed to read %s: %s", fpath, exc)
+            self._set_hud(_t("load_failed"), 'red')
             self.plotter.render()
             return
 
         version = data.get('version')
         if version != 1:
-            print(f"[!] Unknown format version: {version}")
-            self._set_hud("LOAD FAILED: unknown version", 'red')
+            log.error("unknown JSON version: %s", version)
+            self._set_hud(_t("load_failed_version"), 'red')
+            self.plotter.render()
+            return
+
+        try:
+            _validate_session_dict(data)
+        except ValueError as exc:
+            log.error("invalid session JSON %s: %s", fpath, exc)
+            self._set_hud(_t("load_failed_format"), 'red')
             self.plotter.render()
             return
 
         self._push_undo()
         n_nodes = self._load_from_data(data)
-        self._set_hud(f"LOADED {n_nodes} nodes from {fpath}", 'lime')
-        print(f"[*] Loaded {n_nodes} nodes across {len(self.splines)} "
-              f"splines from {fpath}")
+        self._set_hud(_t("loaded", n=n_nodes, fname=fpath), 'lime')
+        log.info("loaded %d nodes across %d splines from %s",
+                 n_nodes, len(self.splines), fpath)
         self.plotter.render()
+
+    def _clear_all_curve_caches(self) -> None:
+        """Cancels all background workers and removes every curve actor.
+
+        Used by ``_load_from_data`` (full replace) and ``cleanup``
+        (window close).  Leaves ``self.segments`` untouched — callers
+        decide whether to clear that list as well.
+        """
+        self._work_mgr.cancel_all()
+        for cache in (self._span_cache, self._geo_span_cache):
+            for _pd, actor in cache.values():
+                safe_remove_actor(self.plotter, actor)
+            cache.clear()
+        for _pd, actor in self._interp_cache.values():
+            safe_remove_actor(self.plotter, actor)
+        self._interp_cache.clear()
+        self._span_drag_state.clear()
+        self._degraded_spans.clear()
 
     def _load_from_data(self, data: dict) -> int:
         """Replaces all splines with those described in *data*.
 
         Clears existing state (workers, actors, caches), reconstructs
         each node from the 2 saved fields (origin + tangent), and
-        recomputes all derived geometry.
+        recomputes all derived geometry.  Always leaves ``self.splines``
+        with at least one (possibly empty) entry so downstream code can
+        rely on that invariant.
 
         Returns the total number of nodes loaded.
         """
         # --- Clear existing splines ---
-        self._work_mgr.cancel_all()
+        self._clear_all_curve_caches()
         for seg in list(self.segments):
             seg.clear_actors(self.plotter)
         self.segments.clear()
-        for cache in (self._span_cache, self._geo_span_cache):
-            for pd, actor in cache.values():
-                safe_remove_actor(self.plotter, actor)
-            cache.clear()
-        for pd, actor in self._interp_cache.values():
-            safe_remove_actor(self.plotter, actor)
-        self._interp_cache.clear()
-        self._span_drag_state.clear()
-        self._degraded_spans.clear()
         self.state.hover_seg = None
         self.state.hover_marker = None
         self.state.active_seg = None
@@ -3126,36 +3406,11 @@ class GeodesicSplineApp(MidpointShooterApp):
         self.splines_closed = []
 
         for spline_data in data['splines']:
-            nodes = []
+            nodes: list[GeodesicSegment] = []
             for nd in spline_data['nodes']:
                 origin = np.array(nd['origin'], dtype=float)
                 tangent_full = np.array(nd['tangent'], dtype=float)
-
-                # Decompose tangent vector into direction + magnitude
-                h_length = float(np.linalg.norm(tangent_full))
-                if h_length > 1e-15:
-                    tangent_dir = tangent_full / h_length
-                else:
-                    tangent_dir = np.array([1.0, 0.0, 0.0])
-                    h_length = 0.01
-
-                # Reconstruct face, frame, paths from origin + tangent
-                face_idx = self.geo.find_face(origin)
-                normal, u, v = self._build_local_frame(origin, face_idx)
-                seg = GeodesicSegment(origin, face_idx, normal, u, v)
-                seg.h_length = h_length
-                seg.is_active = True
-
-                seg.path_b = self.geo.compute_shoot(
-                    origin, tangent_dir, h_length, face_idx)
-                seg.path_a = self.geo.compute_shoot(
-                    origin, -tangent_dir, h_length, face_idx)
-                if seg.path_b is not None:
-                    seg.p_b = seg.path_b[-1]
-                if seg.path_a is not None:
-                    seg.p_a = seg.path_a[-1]
-                seg.update_local_v(self.geo)
-
+                seg = self._node_from_record(origin, tangent_full)
                 nodes.append(seg)
                 self.segments.append(seg)
                 seg.update_visuals(self.plotter)
@@ -3163,7 +3418,9 @@ class GeodesicSplineApp(MidpointShooterApp):
             self.splines.append(nodes)
             self.splines_closed.append(bool(spline_data.get('closed', False)))
 
-        # Ensure at least one spline exists
+        # Invariant: there is always at least one spline (the active
+        # editable target).  Callers that pass empty data still end up
+        # with a usable editor.
         if not self.splines:
             self.splines.append([])
             self.splines_closed.append(False)
@@ -3181,17 +3438,26 @@ class GeodesicSplineApp(MidpointShooterApp):
     def cleanup(self) -> None:
         """Shuts down background workers and clears all curve-layer actors.
 
-        Wraps actor removal in try/except because the plotter may already
-        be closed (window X button) when cleanup runs.
+        Also restores the global VTK polygon-offset state set in
+        ``__init__`` so that other apps importing this module are not
+        affected by leftover state.  Wraps actor removal in try/except
+        via ``safe_remove_actor`` because the plotter may already be
+        closed (window X button) when cleanup runs.
         """
         self._work_mgr.shutdown()
-        for cache in (self._span_cache, self._geo_span_cache):
-            for pd, actor in cache.values():
-                safe_remove_actor(self.plotter, actor)
-            cache.clear()
-        for pd, actor in self._interp_cache.values():
-            safe_remove_actor(self.plotter, actor)
-        self._interp_cache.clear()
+        self._clear_all_curve_caches()
+        # Restore VTK global state to defaults — ``__init__`` flips the
+        # mapper resolution to PolygonOffset to keep curves above the
+        # surface.  Other applications running in the same interpreter
+        # (e.g. tests, notebooks) shouldn't inherit that decision.
+        try:
+            vtk.vtkMapper.SetResolveCoincidentTopologyToDefault()
+        except AttributeError:
+            # Older VTK versions: best-effort restore.
+            try:
+                vtk.vtkMapper.SetResolveCoincidentTopologyToOff()
+            except Exception as exc:  # noqa: BLE001
+                log.debug("VTK polygon-offset restore failed: %s", exc)
         super().cleanup()
 
     # --- Visuals ---
@@ -3303,76 +3569,93 @@ def _make_icosahedron(radius: float = 10.0, subdivisions: int = 2) -> pv.PolyDat
     return pv.PolyData(V, faces=pv_faces).triangulate().clean()
 
 
-# Sentinel mesh_path for the built-in icosahedron demo mesh.
-ICOSAHEDRON = "ICOSAHEDRON"
+# Sentinel mesh label kept for backwards compatibility with v1 JSON
+# files saved before the prefixed form ``__builtin__:icosahedron`` was
+# introduced.  Loading still accepts the legacy plain string; new saves
+# use ``BUILTIN_ICOSAHEDRON``.
+ICOSAHEDRON = BUILTIN_ICOSAHEDRON  # legacy alias
 
 
-if __name__ == "__main__":
-    import json as _json
-    import os
-    import sys
+def _is_icosahedron_label(label: str) -> bool:
+    """Returns True for any historical or current icosahedron sentinel."""
+    return label in (BUILTIN_ICOSAHEDRON, _LEGACY_ICOSAHEDRON)
 
-    usage = (
-        "Usage:\n"
-        "  python geo_splines.py                  "
-        "— demo icosahedron, no splines\n"
-        "  python geo_splines.py mesh.ply          "
-        "— open mesh, no splines\n"
-        "  python geo_splines.py session.json       "
-        "— open mesh + splines from JSON\n"
-    )
 
-    arg = sys.argv[1] if len(sys.argv) > 1 else None
-    json_path = None
+def _resolve_mesh(arg: str | None) -> tuple[object, str, str | None]:
+    """Resolves the CLI ``arg`` into ``(mesh_or_path, mesh_label, json_path)``.
 
+    Behaviour:
+      - ``None`` -> default mesh ``fandisk.obj`` if present in the
+        current directory, otherwise the in-memory icosahedron.
+      - ``*.json`` -> reads the session, recurses on its ``mesh_file``.
+      - any other path -> treated as a mesh file (PyVista handles
+        ``.ply``, ``.obj``, ``.stl`` and other VTK-supported formats).
+    """
     if arg is None:
-        # No arguments → demo icosahedron (in-memory, no file)
-        mesh_or_path = _make_icosahedron(radius=10.0)
-        mesh_label = ICOSAHEDRON
-    elif arg.lower().endswith('.json'):
-        # JSON file → read mesh_path from it, load splines after init
-        json_path = arg
-        if not os.path.exists(json_path):
-            print(f"[!] JSON file not found: {json_path}")
-            sys.exit(1)
-        with open(json_path, 'r') as f:
-            data = _json.load(f)
-        mesh_label = data.get('mesh_file', '')
-        if mesh_label == ICOSAHEDRON:
-            mesh_or_path = _make_icosahedron(radius=10.0)
-        else:
-            if not os.path.exists(mesh_label):
-                print(f"[!] Mesh file not found: {mesh_label}")
-                sys.exit(1)
-            mesh_or_path = mesh_label
-    else:
-        # Mesh file directly
-        if not os.path.exists(arg):
-            print(f"[!] Mesh file not found: {arg}")
-            sys.exit(1)
-        mesh_or_path = arg
-        mesh_label = arg
+        if os.path.exists(DEFAULT_MESH_FILENAME):
+            log.info("default mesh: %s", DEFAULT_MESH_FILENAME)
+            return DEFAULT_MESH_FILENAME, DEFAULT_MESH_FILENAME, None
+        log.info("default mesh '%s' not found, falling back to icosahedron",
+                 DEFAULT_MESH_FILENAME)
+        return _make_icosahedron(radius=10.0), BUILTIN_ICOSAHEDRON, None
 
+    if arg.lower().endswith('.json'):
+        if not os.path.exists(arg):
+            log.error("JSON file not found: %s", arg)
+            sys.exit(1)
+        with open(arg, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        label = data.get('mesh_file', '')
+        if _is_icosahedron_label(label):
+            return _make_icosahedron(radius=10.0), BUILTIN_ICOSAHEDRON, arg
+        if not label or not os.path.exists(label):
+            log.error("mesh file referenced by session not found: %s", label)
+            sys.exit(1)
+        return label, label, arg
+
+    if not os.path.exists(arg):
+        log.error("mesh file not found: %s", arg)
+        sys.exit(1)
+    return arg, arg, None
+
+
+def _cli_main() -> None:
+    """Entry point for the ``geo-splines`` console script."""
+    log.info(
+        "Usage: python geo_splines.py [<mesh.{obj,ply,stl}> | <session.json>]"
+    )
+    arg = sys.argv[1] if len(sys.argv) > 1 else None
+    mesh_or_path, mesh_label, json_path = _resolve_mesh(arg)
+
+    app: GeodesicSplineApp | None = None
     try:
         app = GeodesicSplineApp(mesh_or_path, mesh_label=mesh_label)
 
-        # Load splines from JSON if provided
         if json_path is not None:
-            with open(json_path, 'r') as f:
-                data = _json.load(f)
+            with open(json_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
             if data.get('version') != 1:
-                print(f"[!] Unknown JSON version: {data.get('version')}")
+                log.error("unknown JSON version: %s", data.get('version'))
             else:
-                n_nodes = app._load_from_data(data)
-                print(f"[*] Loaded {n_nodes} nodes from {json_path}")
+                try:
+                    _validate_session_dict(data)
+                except ValueError as exc:
+                    log.error("invalid session JSON %s: %s", json_path, exc)
+                else:
+                    n_nodes = app._load_from_data(data)
+                    log.info("loaded %d nodes from %s", n_nodes, json_path)
 
         app.run()
     except KeyboardInterrupt:
         pass
     finally:
-        # Ensure workers are cleaned up even if init/load was interrupted
-        if 'app' in locals() and hasattr(app, '_work_mgr'):
+        # Ensure workers are cleaned up even if init/load was interrupted.
+        if app is not None and hasattr(app, '_work_mgr'):
             try:
                 app._work_mgr.shutdown()
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001 — teardown best-effort
+                log.debug("worker shutdown: %s", exc)
+
+
+if __name__ == "__main__":
+    _cli_main()

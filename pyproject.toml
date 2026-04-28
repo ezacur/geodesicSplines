@@ -1,0 +1,47 @@
+[project]
+name = "geodesic-splines"
+version = "0.2.0"
+description = "Interactive multi-spline editor for triangulated meshes with hybrid geodesic Bezier curves."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24,<3",
+    "scipy>=1.10",
+    "pyvista>=0.42",
+    "vtk>=9.2",
+    "potpourri3d>=1.2",
+]
+
+[project.optional-dependencies]
+jit = ["numba>=0.58"]
+dev = [
+    "ruff>=0.6",
+    "pytest>=8",
+    "mypy>=1.10",
+]
+
+[project.scripts]
+geo-splines = "geo_splines:_cli_main"
+spline-export = "spline_export:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["geo_splines", "geo_shoot", "geodesics", "gizmo", "spline_export"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_unused_ignores = true
+ignore_missing_imports = true
+files = ["geodesics.py", "gizmo.py"]

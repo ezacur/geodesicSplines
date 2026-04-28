@@ -10,19 +10,26 @@ smooth curves that lie precisely on the surface.
 # Install dependencies (pinned in requirements.txt)
 pip install -r requirements.txt
 
-# Demo on built-in icosahedron
+# No argument -> opens fandisk.obj if present in the current directory,
+# otherwise falls back to the in-memory icosahedron demo mesh.
 python geo_splines.py
 
-# Open a mesh file
+# Open a specific mesh file (any VTK-supported format: .obj, .ply, .stl, ...)
 python geo_splines.py mesh.ply
+python geo_splines.py custom.obj
 
-# Resume a saved session
+# Resume a saved session (loads the mesh referenced inside the JSON)
 python geo_splines.py session.json
 ```
 
-See `requirements.txt` for exact version constraints. `potpourri3d`
-needs a C++17 compiler on first install (MSVC 2022 Build Tools on
-Windows, gcc >= 9 on Linux).
+Requires Python 3.10+ (see `pyproject.toml`).
+`potpourri3d` needs a C++17 compiler on first install
+(MSVC 2022 Build Tools on Windows, gcc >= 9 on Linux).
+
+The session JSON references the source mesh via the `mesh_file` field.
+The string `__builtin__:icosahedron` (or the legacy plain `ICOSAHEDRON`)
+is reserved for the in-memory demo mesh; any other value is treated as
+a filesystem path.
 
 ## Architecture
 
@@ -36,6 +43,54 @@ The system is split into four modules with clear responsibilities:
 | `geo_splines.py` | `GeodesicSplineApp`: multi-node splines, three curve layers, background workers, save/load, CLI |
 | `spline_export.py` | Command-line curve exporter (JSON to CSV) |
 
+### Class diagram
+
+```mermaid
+classDiagram
+    class GeodesicMesh {
+        +V, F, _face_adj, _kdtree
+        +compute_shoot()
+        +compute_endpoint()
+        +compute_endpoint_local()
+        +project_smooth_batch()
+        +subdivide_secant_chords()
+        +hybrid_de_casteljau_curve()
+    }
+    class SegmentData {
+        +origin, face_idx, normal, u, v
+        +p_a, p_b, path_a, path_b, h_length
+        +update_from_a/b/p()
+    }
+    class GeodesicSegment {
+        +_act_line, _handle_act
+        +update_visuals()
+        +refresh_arrows()
+    }
+    class MidpointShooterApp {
+        +plotter, geo, segments
+        +_pick(), _on_move()
+        +_setup_interaction(), cleanup(), run()
+    }
+    class GeodesicSplineApp {
+        +splines, splines_closed
+        +_work_mgr : _SpanWorkManager
+        +_span_cache, _geo_span_cache, _interp_cache
+        +_recompute_spans(), _submit_geodesic_spans()
+        +_on_save(), _on_load()
+    }
+    class _SpanWorkManager {
+        +_executor : ProcessPoolExecutor
+        +submit_span(), cancel_span(), drain_queue()
+        +progress(), shutdown()
+    }
+    SegmentData <|-- GeodesicSegment
+    MidpointShooterApp <|-- GeodesicSplineApp
+    GeodesicSplineApp *-- _SpanWorkManager : owns
+    GeodesicSplineApp ..> GeodesicMesh : uses (self.geo)
+    GeodesicSplineApp *-- "many" GeodesicSegment : nodes
+    _SpanWorkManager ..> GeodesicMesh : (per-process replica)
+```
+
 ## Interaction
 
 ### Mouse
@@ -46,8 +101,8 @@ The system is split into four modules with clear responsibilities:
 | Double-click Right | Start a new spline (break) |
 | Drag Red (P) | Translate node on surface (parallel transport preserves tangent) |
 | Drag Blue/Green (A/B) | Adjust tangent direction and length (symmetric ray update) |
-| Shift + Drag | Snap drag target to the nearest mesh vertex (any marker) |
-| Ctrl + Drag | Snap drag target to the nearest edge of the face under the cursor (perpendicular projection, clamped) |
+| Shift + Drag | Snap drag target to the nearest mesh vertex (any marker). A gold sphere shows the exact target while held. |
+| Ctrl + Drag | Snap drag target to the nearest edge of the face under the cursor (perpendicular projection, clamped). Gold sphere indicator while held. |
 
 ### Keyboard
 
@@ -59,11 +114,19 @@ The system is split into four modules with clear responsibilities:
 | Ctrl+Y | Redo |
 | b / o / k | Toggle blue / orange / interp curve visibility |
 | t | Cycle gizmo opacity (0.2, 0.4, 0.7, 1.0) |
-| s | Save splines to timestamped JSON |
-| l | Load splines from JSON (file dialog) |
+| r | Rebuild all orange (fully geodesic) curves -- handy after layer toggles, loads, or worker crashes |
+| s | Save splines to timestamped JSON (atomic UTF-8 write) |
+| l | Load splines from JSON (file dialog; schema-validated) |
 | e | Export geodesic paths to TXT |
 | w | Toggle wireframe overlay |
 | a | Cycle surface transparency |
+
+### Localisation and logging
+
+HUD text is localised via `GEO_SPLINES_LANG` (default `es`; set to `en` for English).
+Diagnostic output uses Python `logging` under the `geo_splines` logger.
+Set `GEO_SPLINES_DEBUG=1` to raise the level to `DEBUG` (worker traces,
+snap diagnostics).
 
 ### Checkboxes
 

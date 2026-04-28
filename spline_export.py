@@ -50,7 +50,7 @@ NAN_LINE = "NaN , NaN , NaN"
 
 
 def load_json(path: str) -> dict:
-    with open(path, 'r') as f:
+    with open(path, 'r', encoding='utf-8') as f:
         return json.load(f)
 
 
@@ -69,7 +69,9 @@ def rebuild_mesh_and_nodes(data: dict):
 
     mesh_file = data['mesh_file']
     print(f"# Loading mesh: {mesh_file}", file=sys.stderr)
-    if mesh_file == "ICOSAHEDRON":
+    # Both the prefixed sentinel ("__builtin__:icosahedron") and the
+    # legacy plain string ("ICOSAHEDRON") map to the in-memory demo mesh.
+    if mesh_file in ("__builtin__:icosahedron", "ICOSAHEDRON"):
         # Import the generator from geo_splines
         from geo_splines import _make_icosahedron
         mesh = _make_icosahedron(radius=10.0)
@@ -298,7 +300,7 @@ def compute_interp(geo, nodes, closed, n_samples):
 
 def write_obj(path, spline_points_list):
     """Writes curve points as an OBJ file with vertices and lines."""
-    with open(path, 'w') as f:
+    with open(path, 'w', encoding='utf-8') as f:
         f.write("# Geodesic Spline Export\n")
         v_offset = 1
         for spline_idx, spans in enumerate(spline_points_list):
