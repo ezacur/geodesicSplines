@@ -812,6 +812,31 @@ class MidpointShooterApp:
         mapper.SetRelativeCoincidentTopologyLineOffsetParameters(0, offset)
         mapper.SetRelativeCoincidentTopologyPointOffsetParameter(offset)
 
+    def _is_marker_occluded(self, marker_pos: np.ndarray) -> bool:
+        """Returns True if *marker_pos* is occluded by the mesh from the camera view.
+
+        Performs a ray-cast from the camera to the marker. If the first hit on
+        the mesh is significantly closer than the marker itself, it is
+        considered occluded.
+        """
+        cam_pos = np.array(self.plotter.camera.position)
+        # Ray cast from camera to marker
+        hit = self.geo.locator.IntersectWithLine(
+            cam_pos, marker_pos, 0.0001,
+            self._pick_t, self._pick_pt, self._pick_pcoords,
+            self._pick_sub_id, self._pick_cell_id, self._pick_cell
+        )
+        if hit:
+            # First hit position
+            hit_pt = np.array([self._pick_pt[0], self._pick_pt[1], self._pick_pt[2]])
+            # dist_hit and dist_marker from camera
+            dist_hit = np.linalg.norm(hit_pt - cam_pos)
+            dist_marker = np.linalg.norm(marker_pos - cam_pos)
+            # Threshold: 1e-4 * mesh diagonal to avoid self-occlusion artifacts.
+            if dist_hit < dist_marker - self.diag * 1e-4:
+                return True
+        return False
+
     # --- UI Helpers ---
 
     def _pick(self) -> tuple[np.ndarray | None, int | None]:
@@ -1055,6 +1080,11 @@ class MidpointShooterApp:
                                          float(x), float(y))
         if best_sq >= self.cfg.PICK_TOLERANCE_SQ:
             return False
+        
+        # Occlusion check: skip if hidden by mesh
+        if self._is_marker_occluded(self._hover_pts_3d[best]):
+            return False
+
         seg, tag = self._hover_tags[best]
         self.state.active_seg = seg
         self.state.drag_marker = tag
@@ -1107,7 +1137,9 @@ class MidpointShooterApp:
                 best, best_sq = _hover_argmin_sq(pts_2d, self._hover_n,
                                                  float(x), float(y))
                 if best_sq < self.cfg.PICK_TOLERANCE_SQ:
-                    new_h_s, new_h_m = self._hover_tags[best]
+                    # Occlusion check: skip if hidden by mesh
+                    if not self._is_marker_occluded(self._hover_pts_3d[best]):
+                        new_h_s, new_h_m = self._hover_tags[best]
 
         needs_render = False
         if (new_h_s, new_h_m) != (self.state.hover_seg, self.state.hover_marker):

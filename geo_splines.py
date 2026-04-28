@@ -1032,15 +1032,18 @@ class GeodesicSplineApp(MidpointShooterApp):
                     all_2d[start:start + n], n, mx, my)
                 effective_sq = sq + penalty
                 if effective_sq < best_sq and seg + 1 < n:
-                    best_sq = effective_sq
+                    # Potential hit, but check occlusion
                     p0 = pts_3d[seg]
                     p1 = pts_3d[seg + 1]
-                    best_pt_3d = p0 * (1.0 - frac) + p1 * frac
-                    best_info = {
-                        'spline_idx': sid, 'span_idx': i,
-                        'layer': layer, 'seg': seg, 'frac': frac,
-                        'point': best_pt_3d,
-                    }
+                    pt_3d = p0 * (1.0 - frac) + p1 * frac
+                    if not self._is_marker_occluded(pt_3d):
+                        best_sq = effective_sq
+                        best_pt_3d = pt_3d
+                        best_info = {
+                            'spline_idx': sid, 'span_idx': i,
+                            'layer': layer, 'seg': seg, 'frac': frac,
+                            'point': best_pt_3d,
+                        }
 
         changed = False
         if best_info is not None:
@@ -1531,6 +1534,10 @@ class GeodesicSplineApp(MidpointShooterApp):
         best, best_sq = _hover_argmin_sq(pts_2d, self._hover_n,
                                          float(x), float(y))
         if best_sq >= self.cfg.PICK_TOLERANCE_SQ:
+            return False
+
+        # Occlusion check: skip if hidden by mesh
+        if self._is_marker_occluded(self._hover_pts_3d[best]):
             return False
 
         seg, tag = self._hover_tags[best]
