@@ -72,31 +72,54 @@ def load_json(path: str) -> dict:
 def _read_mesh_VF(mesh_file: str) -> tuple[np.ndarray, np.ndarray]:
     """Reads ``mesh_file`` and returns ``(V, F)`` as plain numpy arrays.
 
-    Uses ``meshio`` so the CLI does not depend on the PyVista / VTK
-    rendering pipeline — important for headless CI / Docker, where
-    ``pv.read`` historically pulled in display-bound classes that
-    fail without an X server.
+    Two-tier strategy:
 
-    The mesh is expected to be already triangulated; ``meshio`` does
-    not auto-triangulate quads.  If the file only contains quads or
-    other non-triangle cells, raises ``ValueError`` with a message
-    suggesting the user pre-triangulate (most ``.obj`` exports already
-    are; some ``.ply`` files may not be).
+      1. **meshio first** — light, no VTK rendering pipeline.  Covers
+         the common formats (``.obj``, ``.ply``, ``.stl``, legacy ``.vtk``
+         with triangle cells, ``.vtu``).  This is the path that lets
+         the CLI run on headless CI / Docker without an X server.
+      2. **PyVista fallback** — lazy-imported.  Handles formats meshio
+         either does not know (``.vtp``, ``.gltf``) or reads but stores
+         in non-triangle cell types (VTK PolyData saved as
+         ``polygon`` / ``triangle_strip`` / ``vertex``).  PyVista's
+         ``extract_surface().triangulate().clean()`` chain produces a
+         clean triangle mesh for any VTK-readable input.  ``pv.read``
+         itself does not need a display — only ``Plotter()`` does — so
+         this fallback is still safe in offscreen contexts.
 
     Built-in icosahedron sentinel is handled by the caller — this
     helper deals only with on-disk meshes.
     """
-    import meshio
-    mesh = meshio.read(mesh_file)
-    cells = mesh.cells_dict
-    if 'triangle' not in cells:
-        raise ValueError(
-            f"{mesh_file}: no triangle cells found "
-            f"(got {list(cells.keys())}).  Pre-triangulate the mesh "
-            f"before exporting (e.g. open in MeshLab / Blender and "
-            f"re-export as triangulated .obj or .ply).")
-    V = np.ascontiguousarray(mesh.points, dtype=float)
-    F = np.ascontiguousarray(cells['triangle'], dtype=int)
+    # Tier 1: meshio (fast, no PyVista / VTK rendering).
+    try:
+        import meshio
+        mesh = meshio.read(mesh_file)
+        cells = mesh.cells_dict
+        if 'triangle' in cells:
+            V = np.ascontiguousarray(mesh.points, dtype=float)
+            F = np.ascontiguousarray(cells['triangle'], dtype=int)
+            return V, F
+        log.debug(
+            "meshio read %s but no triangle cells (got %s); "
+            "falling back to PyVista", mesh_file, list(cells.keys()))
+    except Exception as exc:  # noqa: BLE001 — meshio raises various types
+        # Common: unsupported extension (.vtp), corrupt header, mismatched
+        # binary/ascii flag.  All recoverable via the PyVista fallback.
+        log.debug("meshio failed on %s (%s); falling back to PyVista",
+                  mesh_file, exc)
+
+    # Tier 2: PyVista fallback — covers VTK PolyData (.vtp, .vtk
+    # PolyData) and formats meshio does not handle.  Imported lazily so
+    # the common path stays VTK-free.
+    import warnings
+    import pyvista as pv
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore")
+        mesh_pv = pv.read(mesh_file).extract_surface().triangulate().clean()
+    V = np.asarray(mesh_pv.points, dtype=float)
+    # PyVista stores faces as flat [n, i0, i1, ..., n, i0, ...] — for
+    # an all-triangle mesh after .triangulate() that is [3, a, b, c, 3, ...].
+    F = np.asarray(mesh_pv.faces, dtype=int).reshape(-1, 4)[:, 1:]
     return V, F
 
 
