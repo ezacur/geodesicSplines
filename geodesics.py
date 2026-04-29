@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """
 geodesics.py — Geodesic algorithms for triangulated meshes.
 
@@ -43,6 +44,14 @@ no-op and the functions execute as regular Python — identical semantics.
   * ``_shoot_loop`` — full inner loop of ``compute_shoot`` (phases 1–7).
   * ``_project_batch_kernel`` — analytical face-plane projection +
     barycentric clamping for ``project_smooth_batch``.
+
+See also: the editor and gizmo modules ship four additional ``@njit``
+kernels for screen-space and rendering work — ``_to_screen_kernel``,
+``_hover_argmin_sq``, ``_closest_seg_on_polyline_2d`` (in
+``geo_shoot.py``) and ``_rotation_x_to_jit`` (in ``gizmo.py``).  They
+follow the same scalar-inlined conventions as the ones below.  The
+README's "Numba JIT Kernels" table lists all eight with measured
+speedups.
 
 All four kernels follow the same conventions — the scalar-inlined style
 that was originally motivated by Python interpreter overhead remains
@@ -283,7 +292,10 @@ class OriginCache(TypedDict):
 
 try:
     from numba import njit
+    HAS_NUMBA: bool = True
 except ImportError:
+    HAS_NUMBA = False
+
     def njit(*args, **kwargs):
         """Transparent no-op when Numba is unavailable."""
         if args and callable(args[0]):

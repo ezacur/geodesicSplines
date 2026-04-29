@@ -868,6 +868,13 @@ During drag, affected spans show a lighter/thinner appearance:
 Handle opacity follows the global gizmo opacity (cycled with `t`), but
 hovered handles always go fully opaque for visual prominence.
 
+The drag preview itself is governed by the `AGILE_DRAG` flag in
+`gizmo.py`: when `True` (default) the in-flight handle uses a
+vertex-snapped geodesic (~17 ms) for smooth real-time feedback; the
+exact geodesic (~340 ms) is computed only on debounce consolidation.
+Set `AGILE_DRAG = False` to keep the preview always exact at the cost
+of a noticeably less responsive drag.
+
 ## Undo / Redo
 
 Ctrl+Z and Ctrl+Y provide snapshot-based undo/redo across all spline
@@ -916,21 +923,26 @@ This matches the user's mental model: "undo the last edit to my curves."
 
 ### Numba JIT Kernels
 
-Four hot-path functions compile to native machine code on first call
-(~1-2 s, cached to disk across sessions):
+Eight hot-path functions compile to native machine code on first call
+(~1-2 s, cached to disk across sessions). Four live in `geodesics.py`
+(geometry kernels), three in `geo_shoot.py` (screen-space kernels)
+and one in `gizmo.py`:
 
-| Kernel | Role | Speedup |
-|---|---|---|
-| `_parallel_transport` | Dihedral rotation across edge | ~50x |
-| `_ray_edge_jit` | Ray-edge intersection | ~50x |
-| `_shoot_loop` | Full shooting inner loop | ~2000x |
-| `_project_batch_kernel` | Batch surface projection | ~90x |
-| `_to_screen_kernel` | World-to-screen projection | ~22x |
-| `_hover_argmin_sq` | Nearest-marker search | ~10x |
-| `_rotation_x_to_jit` | Arrow cone orientation | ~5x |
+| Kernel | Module | Role | Speedup |
+|---|---|---|---|
+| `_parallel_transport` | `geodesics.py` | Dihedral rotation across edge | ~50x |
+| `_ray_edge_jit` | `geodesics.py` | Ray-edge intersection | ~50x |
+| `_shoot_loop` | `geodesics.py` | Full shooting inner loop | ~2000x |
+| `_project_batch_kernel` | `geodesics.py` | Batch surface projection | ~90x |
+| `_to_screen_kernel` | `geo_shoot.py` | World-to-screen projection | ~22x |
+| `_hover_argmin_sq` | `geo_shoot.py` | Nearest-marker search | ~10x |
+| `_closest_seg_on_polyline_2d` | `geo_shoot.py` | Closest 2D segment for curve hover | ~10x |
+| `_rotation_x_to_jit` | `gizmo.py` | Arrow cone orientation | ~5x |
 
 When Numba is not installed, the `@njit` decorator is a transparent
-no-op and all functions execute as regular Python.
+no-op and all functions execute as regular Python. The editor logs a
+visible WARNING at startup so the user notices the regression instead
+of mistaking the slowness for a different bug.
 
 ### Hot-Path Discipline
 
@@ -967,6 +979,14 @@ int32 face indices).
 own `GeodesicMesh(V, F)` at startup (no VTK locator, no GIL contention).
 Communication via `mp.Pipe` per span -- `Connection.poll()` is a
 non-blocking kernel call (~microseconds).
+
+Stale-result prevention: the per-span pipe topology acts as an implicit
+ticket / generation counter -- creating a fresh pipe on resubmission is
+equivalent to incrementing a generation, and the previous worker's
+`BrokenPipeError` is equivalent to discarding any result that carries
+the old generation. The full rationale (race windows, key reuse,
+cross-batch isolation) is documented in the docstring of
+`_SpanWorkManager` in `geo_splines.py`.
 
 ### Debounce Pattern
 

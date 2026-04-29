@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """
 geo_splines.py — Geodesic Spline Editor (interactive UI).
 
@@ -49,7 +50,7 @@ import pyvista as pv
 import vtk
 
 from geo_shoot import MidpointShooterApp, _hover_argmin_sq, _closest_seg_on_polyline_2d
-from geodesics import GeodesicMesh
+from geodesics import GeodesicMesh, HAS_NUMBA
 from scipy.interpolate import splprep, splev
 from gizmo import (
     GeodesicSegment,
@@ -73,6 +74,24 @@ if not log.handlers:
     log.addHandler(_handler)
     log.propagate = False
 log.setLevel(logging.DEBUG if os.environ.get("GEO_SPLINES_DEBUG") else logging.INFO)
+
+
+# ---------------------------------------------------------------
+# Numba availability — visible warning when the JIT is absent.
+# ---------------------------------------------------------------
+# When Numba is missing, the @njit decorator in geodesics.py is a no-op
+# and the hot kernels fall back to pure-Python execution (50-2000x
+# slower).  The ``@njit`` no-op silently masks this regression — the
+# editor still works, but real-time drag becomes unresponsive on any
+# non-trivial mesh.  We surface a one-time WARNING at import so users
+# notice during the first session instead of mistaking the slowness for
+# a different bug.  Skipped inside spawn-mode worker children: the warning
+# would otherwise fire once per worker on every session start.
+if not HAS_NUMBA and mp.current_process().name == "MainProcess":
+    log.warning(
+        "Numba not installed — geodesic shooting and projection kernels "
+        "fall back to pure Python (~50-2000x slower).  "
+        "Install with `pip install numba` for interactive performance.")
 
 
 # ---------------------------------------------------------------
@@ -188,6 +207,25 @@ def _validate_session_dict(data: dict) -> None:
     a node's ``origin`` / ``tangent`` does not match the expected shape.
     Done before any state mutation so a malformed file never leaves the
     editor in a half-loaded state.
+
+    Degenerate-spline rules
+    -----------------------
+    The interactive editor enforces these invariants implicitly.  When
+    they are violated by a loaded session (manually edited JSON, or a
+    bug in a future writer) the downstream renderer reaches code paths
+    that assume them and crashes obscurely.  Catching them here turns a
+    runtime crash into a clean rejection at load time:
+
+      - **Open spline**: any node count is allowed, including 0 (a
+        "break" placeholder created by ``Dbl-click R``) and 1 (a
+        single-point spline mid-construction).  No span constraint.
+      - **Closed spline**: requires at least 3 nodes.  A 2-node closed
+        loop has both spans coincident on the same chord and renders as
+        zero curvature; the wrap-around bezier is degenerate.  A 1- or
+        0-node closed loop has no spans at all.  None of these can be
+        produced by ``_on_close_spline`` (which itself enforces ≥ 3),
+        so a closed flag with < 3 nodes can only come from a
+        hand-edited or corrupted save.
     """
     if not isinstance(data, dict):
         raise ValueError("top-level value is not an object")
@@ -216,6 +254,12 @@ def _validate_session_dict(data: dict) -> None:
                         raise ValueError(
                             f"splines[{si}].nodes[{ni}].{field_}[{j}] "
                             f"must be a finite number")
+        # Closed loops require >= 3 nodes (interactive editor enforces
+        # this in _on_close_spline; loaded sessions might violate it).
+        if bool(sd.get('closed', False)) and len(nodes) < 3:
+            raise ValueError(
+                f"splines[{si}].closed=true requires at least 3 nodes "
+                f"(got {len(nodes)})")
 
 
 # ---------------------------------------------------------------
@@ -574,6 +618,54 @@ class _SpanWorkManager:
 
     Cancellation: closing the read-end of the pipe causes the worker's
     next ``send()`` to raise ``BrokenPipeError`` and exit.
+
+    Pipe-per-span as an implicit ticket / generation system
+    -------------------------------------------------------
+    A common review question on multiprocessing curve renderers is:
+    *"What stops a stale background result from overwriting the curve
+    after the user has already deleted or undone the segment?"*
+    The textbook answer is to attach a generation counter (a ticket) to
+    every job and discard incoming results whose ticket no longer
+    matches the current generation for that span_key.
+
+    This module **does not** carry an explicit generation counter and
+    does not need one — the per-span pipe topology gives the same
+    isolation guarantee for free:
+
+      1. ``submit_span(span_key, ...)`` always calls
+         ``cancel_span(span_key)`` first, which closes the *old*
+         reader end of the pipe.
+      2. A **brand-new** ``mp.Pipe(duplex=False)`` is then created.
+         The fresh ``writer`` is shipped to the new worker; the fresh
+         ``reader`` is mapped to ``span_key`` in ``self._readers``.
+      3. The previous worker, on its next ``send()``, hits
+         ``BrokenPipeError`` (its writer is no longer connected to a
+         live reader) and exits silently.  Any partial messages it had
+         already pushed into the OS pipe buffer are discarded the
+         moment the parent's ``reader.close()`` returns — there is no
+         shared queue from which they could be re-read.
+      4. The new worker writes only to ``writer_new``; the parent only
+         reads from ``reader_new``.  Cross-batch contamination is
+         topologically impossible.
+
+    In other words, **the pipe object itself acts as the ticket**:
+    creating a new pipe is equivalent to incrementing a generation
+    counter, and the old pipe's death is equivalent to discarding any
+    result that carries the previous generation.  This is enforced by
+    the OS / Python runtime, not by application code, which makes the
+    invariant easier to reason about and impossible to forget.
+
+    The same logic applies to span-key reuse: when a node is deleted
+    and a new one is added at the same ``(sid, i)``, the ``submit_span``
+    call clears all state for that key (``_points``, ``_futures``,
+    ``done_spans``, ``active_spans``) before installing the new pipe,
+    so even a same-key resubmit cannot inherit stale data from the
+    previous lifetime.
+
+    The single remaining race-window is between ``cancel_span`` and the
+    next ``drain_queue``: an in-flight ``'point'`` message that arrived
+    just before ``reader.close()`` is silently dropped by the OS.  That
+    is the desired behaviour — we *want* cancelled work to be invisible.
     """
 
     def __init__(self, V: np.ndarray, F: np.ndarray, max_workers: int = 4):
@@ -668,6 +760,12 @@ class _SpanWorkManager:
         # ``cancel_span`` decrement ``_batch_submitted`` so that the
         # increment below is balanced (otherwise rapid resubmits inflate
         # the HUD numerator forever).
+        #
+        # Cancel-then-new-pipe is also our **ticket / generation system**:
+        # the freshly created pipe below is unreachable to the previous
+        # worker (its writer end is now dangling), so any stale result
+        # it might still produce can never reach this reader.  See the
+        # class docstring for the full rationale.
         self.cancel_span(span_key)
         reader, writer = mp.Pipe(duplex=False)
         self._readers[span_key] = reader
@@ -836,6 +934,13 @@ class _SpanWorkManager:
         """Cancels all workers, shuts down the process pool, and releases
         shared memory blocks for V and F.  Safe to call multiple times.
 
+        Runs each phase under its own try / except so a failure in one
+        (e.g. ``shm.close`` raising on a half-mapped buffer) cannot stop
+        the others (executor shutdown, ``shm.unlink`` of the second
+        block, finalizer detach).  Pre-refactor a single ``except`` would
+        skip the rest of the cleanup and leak the un-unlinked block on
+        POSIX ``/dev/shm``.
+
         ``executor.shutdown(cancel_futures=True)`` (Python >= 3.9) sends
         SIGTERM equivalents to live workers — they can occasionally emit
         ``BrokenPipeError`` tracebacks during this teardown.  Those are
@@ -846,24 +951,51 @@ class _SpanWorkManager:
         if getattr(self, '_shutdown_done', False):
             return
         self._shutdown_done = True
-        self.cancel_all()
+        try:
+            self.cancel_all()
+        except Exception as exc:  # noqa: BLE001 — best-effort
+            log.debug("cancel_all during shutdown: %s", exc)
         try:
             self._executor.shutdown(wait=False, cancel_futures=True)
         except TypeError:
             # Python < 3.9: cancel_futures not supported (defensive — pyproject pins >=3.10)
-            self._executor.shutdown(wait=False)
+            try:
+                self._executor.shutdown(wait=False)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("executor.shutdown fallback: %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("executor.shutdown: %s", exc)
+        # Each shm block is cleaned independently: a failure to close()
+        # one must not skip unlink() of either.  Both close & unlink are
+        # idempotent and safe to call after the executor is gone.
         for shm_block in (self._shm_V, self._shm_F):
             try:
                 shm_block.close()
+            except Exception as exc:  # noqa: BLE001
+                log.debug("shm.close (%s): %s", shm_block.name, exc)
+            try:
                 shm_block.unlink()
             except FileNotFoundError:
                 pass  # already unlinked by another process
-            except Exception as exc:  # noqa: BLE001 — release is best-effort
-                log.debug("shm cleanup (%s): %s", shm_block.name, exc)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("shm.unlink (%s): %s", shm_block.name, exc)
         # Detach the finalizer so atexit will not retry this work.
         finalizer = getattr(self, '_finalizer', None)
         if finalizer is not None:
-            finalizer.detach()
+            try:
+                finalizer.detach()
+            except Exception as exc:  # noqa: BLE001
+                log.debug("finalizer.detach: %s", exc)
+
+    # Context-manager protocol so callers (tests, scripts) can wrap the
+    # manager in ``with _SpanWorkManager(...) as wm:`` and be sure the
+    # process pool + shared memory are released on exit, including on
+    # KeyboardInterrupt / unhandled exception.
+    def __enter__(self) -> "_SpanWorkManager":
+        return self
+
+    def __exit__(self, exc_type, exc_value, tb) -> None:
+        self.shutdown()
 
 
 class GeodesicSplineApp(MidpointShooterApp):
@@ -1478,7 +1610,8 @@ class GeodesicSplineApp(MidpointShooterApp):
     def _on_undo_ctrl_z(self) -> None:
         """Ctrl+Z: restores the previous spline state from the undo stack."""
         if not self._undo_stack:
-            self._set_hud(_t("nothing_to_undo"), 'grey')
+            # Sticky: silent no-op is too easy to miss otherwise.
+            self._set_hud(_t("nothing_to_undo"), 'grey', sticky_seconds=1.5)
             self.plotter.render()
             return
         self._redo_stack.append(self._snapshot())
@@ -1490,7 +1623,7 @@ class GeodesicSplineApp(MidpointShooterApp):
     def _on_redo(self) -> None:
         """Ctrl+Y: re-applies the last undone operation from the redo stack."""
         if not self._redo_stack:
-            self._set_hud(_t("nothing_to_redo"), 'grey')
+            self._set_hud(_t("nothing_to_redo"), 'grey', sticky_seconds=1.5)
             self.plotter.render()
             return
         self._undo_stack.append(self._snapshot())
@@ -1531,7 +1664,19 @@ class GeodesicSplineApp(MidpointShooterApp):
         number of splines, different node counts per spline, closed flag
         changed), delegates to ``_load_from_data`` which clears all actors
         and reconstructs everything from scratch.
+
+        Snapshots are produced internally by ``_snapshot()`` so they are
+        well-formed by construction.  The validation pass below is
+        defence-in-depth: a future bug in ``_snapshot`` (or a manual
+        injection of a malformed dict) would otherwise crash inside the
+        renderer.  ``_validate_session_dict`` rejects closed splines with
+        < 3 nodes — the same invariant the interactive editor enforces.
         """
+        try:
+            _validate_session_dict(data)
+        except ValueError as exc:
+            log.error("invalid undo/redo snapshot — refusing to restore: %s", exc)
+            return
         active = data.pop('active_spline_idx', 0)
 
         if not self._can_use_diff_restore(data):
@@ -2676,7 +2821,13 @@ class GeodesicSplineApp(MidpointShooterApp):
         was_degraded = key in self._degraded_spans
         if degraded and not was_degraded:
             self._degraded_spans.add(key)
-            self._set_hud(_t("geodesic_fallback", sid=key[0], i=key[1]), 'red')
+            # Sticky: a geodesic fallback is a real correctness signal
+            # (the curve is no longer geodesic).  Without stickiness the
+            # next routine HUD update — drag preview, hover, orange
+            # progress — overwrites it within a frame and the user never
+            # sees the warning.
+            self._set_hud(_t("geodesic_fallback", sid=key[0], i=key[1]),
+                          'red', sticky_seconds=3.0)
             # Clear any cached drag-state so _set_span will repaint.
             self._span_drag_state.pop(key, None)
         elif not degraded and was_degraded:
@@ -3269,7 +3420,8 @@ class GeodesicSplineApp(MidpointShooterApp):
             self._atomic_write_json(fname, data)
         except OSError as exc:
             log.error("save failed: %s", exc)
-            self._set_hud(_t("save_failed", err=str(exc)), 'red')
+            self._set_hud(_t("save_failed", err=str(exc)), 'red',
+                          sticky_seconds=4.0)
             self.plotter.render()
             return
         n_nodes = sum(len(s) for s in self.splines)
@@ -3336,14 +3488,14 @@ class GeodesicSplineApp(MidpointShooterApp):
                 data = json.load(f)
         except (OSError, json.JSONDecodeError) as exc:
             log.error("failed to read %s: %s", fpath, exc)
-            self._set_hud(_t("load_failed"), 'red')
+            self._set_hud(_t("load_failed"), 'red', sticky_seconds=4.0)
             self.plotter.render()
             return
 
         version = data.get('version')
         if version != 1:
             log.error("unknown JSON version: %s", version)
-            self._set_hud(_t("load_failed_version"), 'red')
+            self._set_hud(_t("load_failed_version"), 'red', sticky_seconds=4.0)
             self.plotter.render()
             return
 
@@ -3351,7 +3503,7 @@ class GeodesicSplineApp(MidpointShooterApp):
             _validate_session_dict(data)
         except ValueError as exc:
             log.error("invalid session JSON %s: %s", fpath, exc)
-            self._set_hud(_t("load_failed_format"), 'red')
+            self._set_hud(_t("load_failed_format"), 'red', sticky_seconds=4.0)
             self.plotter.render()
             return
 

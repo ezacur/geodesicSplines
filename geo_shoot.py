@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """
 geo_shoot.py — Interactive Geodesic Midpoint Shooter.
 
@@ -983,15 +984,50 @@ class MidpointShooterApp:
         buf[1] = (cy / cw * 0.5 + 0.5) * self.state._vp_h + self.state._vp_oy
         return buf
 
-    def _set_hud(self, message: str, color: str = 'white') -> None:
-        """Updates the on-screen HUD text."""
+    def _set_hud(self, message: str, color: str = 'white',
+                 sticky_seconds: float = 0.0) -> None:
+        """Updates the on-screen HUD text.
+
+        Parameters
+        ----------
+        message : str
+            Text to display (uppercased automatically).
+        color : str
+            Named PyVista color for the text.
+        sticky_seconds : float
+            When > 0, the message remains protected from being overwritten
+            by other ``_set_hud`` calls for that many seconds — used by
+            transient but important events (geodesic fallback, save /
+            load failure, "nothing to undo") so the user actually sees
+            the message before a routine progress / drag update covers
+            it.  Subsequent calls with a non-zero ``sticky_seconds`` of
+            their own bypass the protection (a newer urgent message wins).
+
+        Sticky window is honoured per-process via ``time.monotonic``.  The
+        progress HUD (``_t("computing_orange", ...)``) is *not* sticky and
+        therefore won't fire while a stickier message is still on screen,
+        which is desirable: the user sees the error first, then the
+        progress text resumes once the window expires.
+        """
+        import time
+        now = time.monotonic()
+        sticky_until = getattr(self, '_hud_sticky_until', 0.0)
+        # Non-sticky callers must wait out an in-progress sticky window.
+        # Sticky callers always win (assumed to be at least as important).
+        if sticky_seconds <= 0.0 and now < sticky_until:
+            return
         msg = message.upper()
         if msg == self._hud_text and color == self._hud_color:
+            # Still update the sticky deadline — repeated identical
+            # warnings from different code paths should extend protection.
+            if sticky_seconds > 0.0:
+                self._hud_sticky_until = now + sticky_seconds
             return
         self._hud_text = msg
         self._hud_color = color
         self._hud_actor.SetText(2, msg)  # 2 = upper_left corner
         self._hud_actor.GetTextProperty().SetColor(_color_rgb(color))
+        self._hud_sticky_until = now + sticky_seconds if sticky_seconds > 0.0 else 0.0
 
     # --- Interaction Logic ---
 

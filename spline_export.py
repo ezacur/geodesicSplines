@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """
 spline_export.py — Command-line exporter for geodesic spline curves.
 
@@ -36,10 +37,13 @@ Examples::
     python spline_export.py 20260414_153022.json k > interp_curve.csv
 """
 
+from __future__ import annotations
+
 import argparse
 import json
-import sys
+import logging
 import os
+import sys
 from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
@@ -47,6 +51,17 @@ from geodesics import GeodesicMesh
 
 
 NAN_LINE = "NaN , NaN , NaN"
+
+# Diagnostics on stderr.  Aligned with geo_splines.log so users see the
+# same "[LEVEL] module: msg" prefix across both tools and a single
+# environment variable controls verbosity.  CSV output stays on stdout.
+log = logging.getLogger("spline_export")
+if not log.handlers:
+    _h = logging.StreamHandler(sys.stderr)
+    _h.setFormatter(logging.Formatter("[%(levelname)s] %(name)s: %(message)s"))
+    log.addHandler(_h)
+    log.propagate = False
+log.setLevel(logging.DEBUG if os.environ.get("GEO_SPLINES_DEBUG") else logging.INFO)
 
 
 def load_json(path: str) -> dict:
@@ -68,7 +83,7 @@ def rebuild_mesh_and_nodes(data: dict):
     import warnings
 
     mesh_file = data['mesh_file']
-    print(f"# Loading mesh: {mesh_file}", file=sys.stderr)
+    log.info("loading mesh: %s", mesh_file)
     # Both the prefixed sentinel ("__builtin__:icosahedron") and the
     # legacy plain string ("ICOSAHEDRON") map to the in-memory demo mesh.
     if mesh_file in ("__builtin__:icosahedron", "ICOSAHEDRON"):
@@ -136,7 +151,7 @@ def compute_blue(geo, nodes, closed, n_samples):
         path_a_rev = n1['path_a'][::-1] if n1['path_a'] is not None else None
 
         # Geodesic H_out → H_in via local submesh solver
-        print(f"#   span {i}: computing path_12...", file=sys.stderr)
+        log.debug("span %d: computing path_12 (H_out -> H_in)", i)
         path_12 = geo.compute_endpoint_local(n0['p_b'], n1['p_a'])
         if path_12 is None or len(path_12) < 2:
             path_12 = None
@@ -186,16 +201,23 @@ def _orange_span_worker(task_data):
         b12 = GeodesicMesh.geodesic_lerp(path_12, t, cum_12, total_12)
         b23 = GeodesicMesh.geodesic_lerp(path_a_rev, t, cum_a, total_a)
 
+        # The C++ solver wrapper raises a generic ``Exception`` from
+        # potpourri3d on degenerate input; we cannot narrow the type
+        # any further than that.  RuntimeError covers the common case
+        # (non-manifold input, disconnected components); a bare except
+        # would also swallow KeyboardInterrupt.
         try:
             path_c0 = geo.compute_endpoint_local(b01, b12)
-        except Exception:
+        except (RuntimeError, ValueError) as exc:
+            log.debug("compute_endpoint_local(b01, b12) failed: %s", exc)
             path_c0 = np.array([b01, b12])
         if path_c0 is None or len(path_c0) < 2:
             path_c0 = np.array([b01, b12])
 
         try:
             path_c1 = geo.compute_endpoint_local(b12, b23)
-        except Exception:
+        except (RuntimeError, ValueError) as exc:
+            log.debug("compute_endpoint_local(b12, b23) failed: %s", exc)
             path_c1 = np.array([b12, b23])
         if path_c1 is None or len(path_c1) < 2:
             path_c1 = np.array([b12, b23])
@@ -207,7 +229,8 @@ def _orange_span_worker(task_data):
 
         try:
             path_f = geo.compute_endpoint_local(c0, c1)
-        except Exception:
+        except (RuntimeError, ValueError) as exc:
+            log.debug("compute_endpoint_local(c0, c1) failed: %s", exc)
             path_f = np.array([c0, c1])
         if path_f is None or len(path_f) < 2:
             path_f = np.array([c0, c1])
@@ -248,7 +271,7 @@ def compute_orange(geo, nodes, closed, n_samples):
         
         tasks.append((v, f, n0_min, n1_min, n_samples))
 
-    print(f"#   Computing {n_spans} spans in parallel...", file=sys.stderr)
+    log.info("computing %d spans in parallel...", n_spans)
     
     all_pts = [None] * n_spans
     valid_task_indices = [i for i, t in enumerate(tasks) if t is not None]
@@ -285,7 +308,8 @@ def compute_interp(geo, nodes, closed, n_samples):
         tck, _ = splprep(
             [origins[:, 0], origins[:, 1], origins[:, 2]],
             s=0, k=k, per=closed)
-    except Exception:
+    except (TypeError, ValueError) as exc:
+        log.debug("splprep failed (degenerate node layout): %s", exc)
         return []
 
     n = max(n_samples, 200)
@@ -416,15 +440,15 @@ def main():
                   'o': 'orange (fully geodesic)',
                   'k': 'black (interpolation)'}
 
-    print(f"# Layer: {layer_name[args.layer]}", file=sys.stderr)
-    print(f"# Splines: {len(splines)}", file=sys.stderr)
-    print(f"# Samples/span: {args.samples}", file=sys.stderr)
+    log.info("layer: %s", layer_name[args.layer])
+    log.info("splines: %d", len(splines))
+    log.info("samples/span: %d", args.samples)
 
     all_spline_points = []
     for sid, (nodes, closed) in enumerate(zip(splines, splines_closed)):
         n_nodes = len(nodes)
-        print(f"# Spline {sid}: {n_nodes} nodes, "
-              f"{'closed' if closed else 'open'}", file=sys.stderr)
+        log.info("spline %d: %d nodes, %s",
+                 sid, n_nodes, 'closed' if closed else 'open')
 
         if n_nodes < 2:
             all_spline_points.append([])
@@ -437,11 +461,11 @@ def main():
 
     if args.obj:
         obj_path = os.path.splitext(args.json_file)[0] + ".obj"
-        print(f"# Exporting to OBJ: {obj_path}", file=sys.stderr)
+        log.info("exporting to OBJ: %s", obj_path)
         write_obj(obj_path, all_spline_points)
     elif args.vtk:
         vtk_path = os.path.splitext(args.json_file)[0] + ".vtk"
-        print(f"# Exporting to binary legacy VTK: {vtk_path}", file=sys.stderr)
+        log.info("exporting to binary legacy VTK: %s", vtk_path)
         write_vtk(vtk_path, all_spline_points)
     else:
         # CSV output to stdout
@@ -457,7 +481,7 @@ def main():
                 for pt in span:
                     print(format_point(pt))
 
-    print(f"# Done.", file=sys.stderr)
+    log.info("done.")
 
 
 if __name__ == '__main__':

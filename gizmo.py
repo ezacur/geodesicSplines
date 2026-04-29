@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """
 gizmo.py — Interactive geodesic segment widget and visualization.
 

@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install ruff
+        run: pip install ruff
+      - name: Ruff lint
+        run: ruff check .
+      - name: Ruff format check
+        run: ruff format --check .
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        # potpourri3d needs a C++17 compiler at install time and pyvista
+        # pulls in VTK which is multi-hundred-MB on Linux runners.  Both
+        # are required by the editor, but the headless tests here only
+        # exercise pure-Python code paths (JSON validation, helpers) so
+        # we install a slim subset that completes in seconds.
+        run: |
+          pip install --upgrade pip
+          pip install numpy scipy pytest
+      - name: Run pure-Python tests
+        run: pytest tests/ -m "not gpu and not gui" -q
