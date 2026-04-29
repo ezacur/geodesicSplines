@@ -2403,7 +2403,15 @@ class GeodesicMesh:
 
         prev_cum = np.where(indices > 0, cum[indices - 1], 0.0)
         sl = cum[indices] - prev_cum
-        frac = np.where(sl > 1e-15, (targets - prev_cum) / sl, 0.0)
+        # ``np.where(cond, a/b, 0.0)`` would still evaluate ``a/b`` on
+        # the masked elements (numpy is eager) and emit a "divide by
+        # zero" RuntimeWarning for any zero-length segment that happens
+        # to fall on a duplicate point in the polyline.  ``np.divide``
+        # with ``where=`` actually skips the division on those indices,
+        # so the warning never fires and the result for those samples
+        # comes from the pre-zeroed output buffer.
+        frac = np.zeros_like(sl)
+        np.divide(targets - prev_cum, sl, out=frac, where=sl > 1e-15)
 
         frac_col = frac[:, np.newaxis]
         return path[indices] * (1.0 - frac_col) + path[indices + 1] * frac_col
