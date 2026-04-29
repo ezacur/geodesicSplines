@@ -18,5 +18,7 @@ scipy>=1.10
 pyvista>=0.42
 vtk>=9.2
 potpourri3d>=1.2
+meshio>=5.3          # used by spline_export.py for headless mesh I/O
+                     # (avoids pulling in PyVista in CI / Docker)
 numba>=0.58          # optional — @njit becomes a no-op if missing,
                      #            but all hot paths will be ~50-2000x slower

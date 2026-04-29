@@ -11,6 +11,9 @@ dependencies = [
     "pyvista>=0.42",
     "vtk>=9.2",
     "potpourri3d>=1.2",
+    # ``spline_export.py`` reads meshes via meshio so the CLI can run in
+    # headless CI / Docker without the PyVista rendering pipeline.
+    "meshio>=5.3",
 ]
 
 [project.optional-dependencies]

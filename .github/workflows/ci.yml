@@ -39,6 +39,6 @@ jobs:
         # we install a slim subset that completes in seconds.
         run: |
           pip install --upgrade pip
-          pip install numpy scipy pytest
+          pip install numpy scipy pytest meshio
       - name: Run pure-Python tests
         run: pytest tests/ -m "not gpu and not gui" -q

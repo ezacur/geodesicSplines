@@ -51,6 +51,19 @@ import vtk
 
 from geo_shoot import MidpointShooterApp, _hover_argmin_sq, _closest_seg_on_polyline_2d
 from geodesics import GeodesicMesh, HAS_NUMBA
+
+
+# ---------------------------------------------------------------
+# Type aliases
+# ---------------------------------------------------------------
+# A span is identified by ``(spline_index, span_index_within_spline)``.
+# This tuple is used as a dict key in 4 caches (``_span_cache``,
+# ``_geo_span_cache``, ``_span_drag_state``, ``_SpanWorkManager._points``)
+# and as a set element in 5 sets (degraded / dead / dirty / done /
+# active spans).  Naming the type makes those signatures legible and
+# documents the intent — "tuple" alone could mean RGB, screen coords,
+# or anything else.
+SpanKey = tuple[int, int]
 from scipy.interpolate import splprep, splev
 from gizmo import (
     GeodesicSegment,
@@ -485,7 +498,7 @@ def _hierarchical_inner_order(total: int) -> list[int]:
 
 
 def _geodesic_decasteljau_worker(
-    span_key: tuple,
+    span_key: SpanKey,
     ctrl: list[np.ndarray],
     path_b: np.ndarray,
     path_a_rev: np.ndarray,
@@ -698,23 +711,23 @@ class _SpanWorkManager:
                                            weakref.ref(self))
 
         # --- Orange (fully geodesic) tracking ---
-        self._readers: dict[tuple, Connection] = {}
-        self._futures: dict[tuple, Future] = {}
-        self._points: dict[tuple, list[np.ndarray]] = {}
-        self.dirty_spans: set[tuple] = set()
-        self.done_spans: set[tuple] = set()  # spans whose worker sent 'done'
+        self._readers: dict[SpanKey, Connection] = {}
+        self._futures: dict[SpanKey, Future] = {}
+        self._points: dict[SpanKey, list[np.ndarray]] = {}
+        self.dirty_spans: set[SpanKey] = set()
+        self.done_spans: set[SpanKey] = set()  # spans whose worker sent 'done'
         # Spans whose worker reported a geodesic fallback.  The main
         # thread consumes this set after ``drain_queue`` and repaints
         # the affected orange/blue actors in red.
-        self.degraded_spans: set[tuple] = set()
+        self.degraded_spans: set[SpanKey] = set()
 
         # Spans whose worker died unexpectedly (pipe broken) — main
         # thread should clear the actor geometry on next poll tick.
-        self.dead_spans: set[tuple] = set()
+        self.dead_spans: set[SpanKey] = set()
 
         # Spans that are actively being computed (submitted but not yet
         # done/cancelled/dead).  Used by the UI to show a progress HUD.
-        self.active_spans: set[tuple] = set()
+        self.active_spans: set[SpanKey] = set()
 
         # Batch progress counters.  ``_batch_submitted`` reflects the
         # current outstanding work plus completed-since-idle; cancelling
@@ -741,7 +754,7 @@ class _SpanWorkManager:
 
     # --- Fully geodesic (orange) ---
 
-    def submit_span(self, span_key: tuple,
+    def submit_span(self, span_key: SpanKey,
                     ctrl: list[np.ndarray], path_b: np.ndarray,
                     path_a_rev: np.ndarray, n_samples: int,
                     adaptive: bool = False) -> None:
@@ -793,7 +806,7 @@ class _SpanWorkManager:
         self.active_spans.add(span_key)
         self._batch_submitted += 1
 
-    def cancel_span(self, span_key: tuple) -> None:
+    def cancel_span(self, span_key: SpanKey) -> None:
         """Closes the pipe for the fully geodesic worker on *span_key*.
 
         If the span was actively counted in the current batch, the
@@ -816,7 +829,7 @@ class _SpanWorkManager:
 
     # --- Shared ---
 
-    def cancel_all_for_span(self, span_key: tuple) -> None:
+    def cancel_all_for_span(self, span_key: SpanKey) -> None:
         """Cancels the orange worker for *span_key*."""
         self.cancel_span(span_key)
 
@@ -910,7 +923,7 @@ class _SpanWorkManager:
                 had_results = True
         return had_results
 
-    def get_points(self, span_key: tuple) -> np.ndarray | None:
+    def get_points(self, span_key: SpanKey) -> np.ndarray | None:
         """Compacts the sparse per-span buffer into a t-sorted polyline.
 
         The buffer is a list of length ``n_samples`` pre-seeded with the
@@ -1013,14 +1026,14 @@ class GeodesicSplineApp(MidpointShooterApp):
         self._redo_stack: list[dict] = []
         self._MAX_UNDO = 50
         self._prev_active_spline_idx = 0
-        self._span_cache: dict[tuple, tuple[pv.PolyData, vtk.vtkActor]] = {}
+        self._span_cache: dict[SpanKey, tuple[pv.PolyData, vtk.vtkActor]] = {}
         # Per-span style key (dragging, degraded) — repaints only fire on change.
-        self._span_drag_state: dict[tuple, tuple[bool, bool]] = {}
-        self._geo_span_cache: dict[tuple, tuple[pv.PolyData, vtk.vtkActor]] = {}
+        self._span_drag_state: dict[SpanKey, tuple[bool, bool]] = {}
+        self._geo_span_cache: dict[SpanKey, tuple[pv.PolyData, vtk.vtkActor]] = {}
         # Spans whose geodesic solver fell back to a straight line.  Set
         # by ``_recompute_spans`` and orange-worker drain; consumed by
         # ``_set_span`` / ``_set_geo_span`` to repaint in red.
-        self._degraded_spans: set[tuple] = set()
+        self._degraded_spans: set[SpanKey] = set()
         # Interpolation curve: one actor per spline (keyed by spline index)
         self._interp_cache: dict[int, tuple[pv.PolyData, vtk.vtkActor]] = {}
         self._last_stitch_screen: tuple = (0.0, 0.0)
@@ -2809,7 +2822,7 @@ class GeodesicSplineApp(MidpointShooterApp):
 
     # --- Span rendering ---
 
-    def _mark_span_degraded(self, key: tuple, degraded: bool) -> None:
+    def _mark_span_degraded(self, key: SpanKey, degraded: bool) -> None:
         """Updates the ``_degraded_spans`` set and flashes a HUD warning.
 
         Called by ``_recompute_spans`` after every blue-layer

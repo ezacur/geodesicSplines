@@ -69,6 +69,37 @@ def load_json(path: str) -> dict:
         return json.load(f)
 
 
+def _read_mesh_VF(mesh_file: str) -> tuple[np.ndarray, np.ndarray]:
+    """Reads ``mesh_file`` and returns ``(V, F)`` as plain numpy arrays.
+
+    Uses ``meshio`` so the CLI does not depend on the PyVista / VTK
+    rendering pipeline — important for headless CI / Docker, where
+    ``pv.read`` historically pulled in display-bound classes that
+    fail without an X server.
+
+    The mesh is expected to be already triangulated; ``meshio`` does
+    not auto-triangulate quads.  If the file only contains quads or
+    other non-triangle cells, raises ``ValueError`` with a message
+    suggesting the user pre-triangulate (most ``.obj`` exports already
+    are; some ``.ply`` files may not be).
+
+    Built-in icosahedron sentinel is handled by the caller — this
+    helper deals only with on-disk meshes.
+    """
+    import meshio
+    mesh = meshio.read(mesh_file)
+    cells = mesh.cells_dict
+    if 'triangle' not in cells:
+        raise ValueError(
+            f"{mesh_file}: no triangle cells found "
+            f"(got {list(cells.keys())}).  Pre-triangulate the mesh "
+            f"before exporting (e.g. open in MeshLab / Blender and "
+            f"re-export as triangulated .obj or .ply).")
+    V = np.ascontiguousarray(mesh.points, dtype=float)
+    F = np.ascontiguousarray(cells['triangle'], dtype=int)
+    return V, F
+
+
 def rebuild_mesh_and_nodes(data: dict):
     """Rebuilds GeodesicMesh and node data from JSON.
 
@@ -79,22 +110,23 @@ def rebuild_mesh_and_nodes(data: dict):
     of lists of dicts with 'origin', 'face_idx', 'p_a', 'p_b', 'path_a',
     'path_b'.
     """
-    import pyvista as pv
-    import warnings
-
     mesh_file = data['mesh_file']
     log.info("loading mesh: %s", mesh_file)
     # Both the prefixed sentinel ("__builtin__:icosahedron") and the
-    # legacy plain string ("ICOSAHEDRON") map to the in-memory demo mesh.
+    # legacy plain string ("ICOSAHEDRON") map to the in-memory demo
+    # mesh.  This branch is rare (demo only); the lazy import of
+    # ``_make_icosahedron`` keeps PyVista out of the default
+    # mesh-file path that runs in CI and headless containers.
     if mesh_file in ("__builtin__:icosahedron", "ICOSAHEDRON"):
-        # Import the generator from geo_splines
         from geo_splines import _make_icosahedron
         mesh = _make_icosahedron(radius=10.0)
+        # Extract V, F from the pv.PolyData so GeodesicMesh receives
+        # plain arrays (no locator built — fine, we don't pick).
+        V = np.asarray(mesh.points, dtype=float)
+        F = np.asarray(mesh.faces, dtype=int).reshape(-1, 4)[:, 1:]
     else:
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore")
-            mesh = pv.read(mesh_file).extract_surface().triangulate().clean()
-    geo = GeodesicMesh(mesh)
+        V, F = _read_mesh_VF(mesh_file)
+    geo = GeodesicMesh(V, F)
 
     splines = []
     splines_closed = []
@@ -169,17 +201,15 @@ def compute_blue(geo, nodes, closed, n_samples):
 def _orange_span_worker(task_data):
     """Worker function to compute a single orange span in a separate process."""
     (v, f, n0, n1, n_samples) = task_data
-    
-    # We must build a local GeodesicMesh in each worker
-    # Importing here to ensure it's available in the worker process
+
+    # Local imports — needed inside spawn-mode worker children.
     import numpy as np
     from geodesics import GeodesicMesh
-    import pyvista as pv
-    
-    # Create mesh from arrays (faster than reading file)
-    # We use a dummy pyvista mesh to satisfy GeodesicMesh
-    mesh = pv.PolyData(v, np.hstack([np.full((len(f), 1), 3), f]))
-    geo = GeodesicMesh(mesh)
+
+    # GeodesicMesh accepts (V, F) arrays directly — no PyVista wrap
+    # needed.  The VTK locator stays None on this path (we don't pick),
+    # and find_face falls back to its KDTree path if it ever runs.
+    geo = GeodesicMesh(v, f)
     
     H_out, H_in = n0['p_b'], n1['p_a']
     path_b = n0['path_b']
