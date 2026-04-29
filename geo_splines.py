@@ -1150,6 +1150,20 @@ class GeodesicSplineApp(MidpointShooterApp):
         self._snap_indicator_actor.SetVisibility(False)
         self._snap_indicator_buf = np.empty((1, 3), dtype=float)
 
+        # --- Hover-curve cache ---
+        # ``_collect_visible_curves`` packs every visible polyline into
+        # a single (N, 3) buffer for batched screen projection.  Hover
+        # detection is gated to "not dragging, not hovering a marker",
+        # so the buffer changes only when geometry of a visible span
+        # changes (not on every move).  We invalidate the cache via
+        # ``_hover_curve_dirty`` and rebuild lazily; reuse otherwise.
+        # On a session with several splines this saves a few ms per
+        # mouse-move event when the cursor wanders the surface between
+        # edits.
+        self._hover_curve_dirty: bool = True
+        self._hover_curve_items_cached: list[_CurveHoverItem] = []
+        self._hover_curve_buf_total: int = 0
+
     # Visual z-priority penalty for curve hover.  When multiple curves
     # overlap on screen, the one rendered on top should win the hover.
     # A small penalty (in squared pixels) is added to lower-priority
@@ -1183,7 +1197,20 @@ class GeodesicSplineApp(MidpointShooterApp):
         capacity (rare — initial 2048 fits ~10 medium splines).
         Returns one ``_CurveHoverItem`` per visible polyline; an empty
         list short-circuits the caller.
+
+        Cached behaviour: the result is memoised in
+        ``self._hover_curve_items_cached`` until ``_hover_curve_dirty``
+        is set by any callsite that mutates curve geometry, layer
+        visibility, or actor membership (``_set_span``, ``_set_geo_span``,
+        ``_set_interp_curve``, ``_toggle_layer``, ``_load_from_data``,
+        ``_clear_*`` family).  Hover detection is gated to mouse-moves
+        without an active drag, so this cache is only hit while geometry
+        is stable — exactly the regime where rebuilding it per move was
+        wasteful.  Cost of marking dirty is one bool assignment.
         """
+        if not self._hover_curve_dirty:
+            return self._hover_curve_items_cached
+
         items: list[_CurveHoverItem] = []
         total_n = 0
 
@@ -1226,6 +1253,10 @@ class GeodesicSplineApp(MidpointShooterApp):
                 items.append(_CurveHoverItem(
                     LayerKind.INTERP, sid, None, total_n, n, pts_3d))
                 total_n += n
+
+        self._hover_curve_items_cached = items
+        self._hover_curve_buf_total = total_n
+        self._hover_curve_dirty = False
         return items
 
     def _pick_closest_curve(self, items: list[_CurveHoverItem],
@@ -1334,7 +1365,19 @@ class GeodesicSplineApp(MidpointShooterApp):
         """Checkbox callback: shows or hides all actors in a curve layer.
 
         *layer* is ``'blue'``, ``'orange'``, or ``'interp'``.
+
+        Special case for ``interp``: while hidden, ``_recompute_interp_curve``
+        is short-circuited so the synchronous splprep / splev / projection
+        chain does not steal main-thread frames from the visible layers.
+        That means the cached actor geometry can be stale when the user
+        toggles the layer ON.  We compensate by forcing a full recompute
+        across all splines on the OFF→ON transition, so the curve appears
+        immediately at full quality (no perceptible lag).  Blue and orange
+        have separate behaviour: blue is recomputed live during drag, and
+        orange is computed by background workers regardless of visibility,
+        so neither needs this hand-off.
         """
+        was_visible = self._layer_visible.get(layer, False)
         self._layer_visible[layer] = visible
         cache_map = {
             'blue': self._span_cache,
@@ -1345,8 +1388,16 @@ class GeodesicSplineApp(MidpointShooterApp):
             for _, actor in cache.values():
                 actor.SetVisibility(visible)
         if layer == 'interp':
+            # OFF → ON transition: regenerate from scratch since
+            # _recompute_interp_curve was no-op'd while hidden.
+            if visible and not was_visible:
+                for s in range(len(self.splines)):
+                    self._recompute_interp_curve(s, is_dragging=False)
             for _, actor in self._interp_cache.values():
                 actor.SetVisibility(visible)
+        # Hover detection scans visible curves only — visibility change
+        # invalidates the cached buffer.
+        self._hover_curve_dirty = True
         self.plotter.render()
 
     def _fire_debounce(self) -> None:
@@ -1884,6 +1935,8 @@ class GeodesicSplineApp(MidpointShooterApp):
                 self._degraded_spans.discard(key)
         self._span_drag_state = {
             k: v for k, v in self._span_drag_state.items() if k[0] != sid}
+        # Span set for this spline changed — invalidate hover cache.
+        self._hover_curve_dirty = True
 
     def _insert_node_from_interp(self, info: dict, sid: int,
                                 nodes: list, closed: bool) -> None:
@@ -2872,9 +2925,14 @@ class GeodesicSplineApp(MidpointShooterApp):
 
         pd, actor = self._span_cache[key]
         if pts is None or len(pts) < 2:
+            if actor.GetVisibility():
+                self._hover_curve_dirty = True
             actor.SetVisibility(False)
             return
         update_line_inplace(pd, pts)
+        # Geometry changed — invalidate the hover cache so the next
+        # mouse-move (without drag) rebuilds the buffer.
+        self._hover_curve_dirty = True
 
         degraded = key in self._degraded_spans
         # Tri-state style key: (dragging, degraded).  Using ``None`` as the
@@ -3024,6 +3082,8 @@ class GeodesicSplineApp(MidpointShooterApp):
         if pts is None or len(pts) < 2:
             entry = self._interp_cache.get(sid)
             if entry is not None:
+                if entry[1].GetVisibility():
+                    self._hover_curve_dirty = True
                 entry[1].SetVisibility(False)
             return
 
@@ -3041,6 +3101,8 @@ class GeodesicSplineApp(MidpointShooterApp):
         pd, actor = self._interp_cache[sid]
         update_line_inplace(pd, pts)
         actor.SetVisibility(self._layer_visible['interp'])
+        # Geometry changed — let hover detection rebuild on next idle move.
+        self._hover_curve_dirty = True
 
     def _recompute_interp_curve(self, sid: int | None = None,
                                 is_dragging: bool = False) -> None:
@@ -3057,7 +3119,21 @@ class GeodesicSplineApp(MidpointShooterApp):
         consolidation, the full refinement runs (~5-10 ms).
 
         When *sid* is None, recomputes all splines.
+
+        Visibility gating
+        -----------------
+        Skipped when the interp layer is hidden (the default at startup).
+        This is *unlike* the orange layer, which always computes via its
+        ``_SpanWorkManager`` workers regardless of visibility — orange
+        runs in child processes, so background work is free.  Interp
+        runs synchronously on the main thread inside the drag-event
+        loop, so computing it while invisible would cost 1-15 ms per
+        frame stolen from the visible layers.  When the user toggles
+        the layer ON, ``_toggle_layer`` triggers a one-shot recompute
+        so the curve appears immediately at full quality.
         """
+        if not self._layer_visible[LayerKind.INTERP]:
+            return
         if sid is None:
             for s in range(len(self.splines)):
                 self._recompute_interp_curve(s, is_dragging=is_dragging)
@@ -3150,6 +3226,8 @@ class GeodesicSplineApp(MidpointShooterApp):
         if pts is None or len(pts) < 2:
             entry = self._geo_span_cache.get(key)
             if entry is not None:
+                if entry[1].GetVisibility():
+                    self._hover_curve_dirty = True
                 # Clear geometry so stale data can't reappear
                 entry[0].points = np.zeros((0, 3), dtype=float)
                 entry[0].Modified()
@@ -3170,6 +3248,8 @@ class GeodesicSplineApp(MidpointShooterApp):
 
         pd, actor = self._geo_span_cache[key]
         sc = self.scfg
+        # Geometry of an orange span changed — invalidate hover cache.
+        self._hover_curve_dirty = True
         use_dashed = computing and sc.GEO_DASHED_WHILE_COMPUTING
         if use_dashed:
             update_dashed_line_inplace(pd, pts)
@@ -3548,6 +3628,9 @@ class GeodesicSplineApp(MidpointShooterApp):
         self._interp_cache.clear()
         self._span_drag_state.clear()
         self._degraded_spans.clear()
+        # All curve actors gone — hover cache must be rebuilt next time.
+        self._hover_curve_dirty = True
+        self._hover_curve_items_cached = []
 
     def _load_from_data(self, data: dict) -> int:
         """Replaces all splines with those described in *data*.
@@ -3688,6 +3771,10 @@ class GeodesicSplineApp(MidpointShooterApp):
             interp_vis = layer_vis['interp']
             for _, actor in self._interp_cache.values():
                 actor.SetVisibility(interp_vis)
+        # Per-spline actor visibility may have changed — invalidate the
+        # hover cache so the next idle move rebuilds it from the new
+        # visible-actor set.
+        self._hover_curve_dirty = True
 
 
 def _make_icosahedron(radius: float = 10.0, subdivisions: int = 2) -> pv.PolyData:
