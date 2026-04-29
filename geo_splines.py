@@ -382,11 +382,20 @@ class SplineConfig:
     SECANT_TOL_FACTOR: float = 0.01   # fraction of mean edge length
     SECANT_MAX_DEPTH: int = 6         # max recursive splits (6 → 64× local)
 
-    # LOD during drag: aggressive coarse sampling for real-time feedback
-    # (blue gets accuracy back on consolidation via geodesic path_12).
-    DRAG_RESOLUTION_FACTOR: float = 3.5
-    DRAG_MIN_DIVISOR: int = 3
-    DRAG_MAX_DIVISOR: int = 3
+    # LOD during drag: historically these divided the resting sample
+    # count by 3-4x to "save time".  In practice drag time is dominated
+    # by ``project_smooth_batch`` (Numba-JIT, ~µs per sample), and the
+    # only expensive operator — ``compute_endpoint_local`` (~25 ms) —
+    # is already skipped during drag (path_12=None forces the Euclidean
+    # middle segment).  Keeping the divisors only degraded the visual
+    # quality of the drag preview (handles with short poly_length hit
+    # the floor at 5 samples → visibly polygonal) without saving any
+    # perceptible CPU.  All set to 1 so drag uses the same density as
+    # the consolidated curve; the cheap LOD switch is *what* operator
+    # runs (no path_12), not *how many* samples.
+    DRAG_RESOLUTION_FACTOR: float = 1.0
+    DRAG_MIN_DIVISOR: int = 1
+    DRAG_MAX_DIVISOR: int = 1
 
     # Geometry
     HANDLE_FRACTION: float = 1 / 3
