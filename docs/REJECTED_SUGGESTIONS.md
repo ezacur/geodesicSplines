@@ -21,9 +21,16 @@ the ray-cast (`self.geo.locator.IntersectWithLine`) with a Z-buffer
 read via `vtkHardwareSelector`, claiming O(1) GPU lookup vs O(log N)
 ray traversal and "fails on holes".
 
+This proposal has resurfaced under different framings (dirty topology,
+noisy 3D scans).  The analysis below covers all of them.
+
 **Rejected because**:
-- The "fails on holes" premise is wrong. `vtkStaticCellLocator.IntersectWithLine`
-  tests against actual face geometry — holes are handled correctly.
+- The "fails on holes" premise is mechanically wrong.
+  `vtkStaticCellLocator.IntersectWithLine` tests against actual face
+  geometry.  A hole = empty space with no face to intersect → method
+  returns "no hit" → "not occluded".  That is the correct answer for
+  a hole; nothing "slips through" because there is no face for the
+  ray to slip around.
 - O(log N) vs O(1) is a misleading comparison.  For N = 240k faces,
   log N ≈ 18 native operations.  Negligible compared with the Python
   overhead around the call.
@@ -31,6 +38,20 @@ ray traversal and "fails on holes".
   differently across VTK versions, and has known issues in offscreen
   contexts.  Trades a robust mechanism for one with more quirks and
   no measured speedup.
+- Pathological cases for `IntersectWithLine` (silhouette edges,
+  non-2-manifold triangles, mis-oriented normals) are **not** fixed by
+  `vtkHardwareSelector` — Z-buffer reads have their own pathologies
+  (Z-fighting near silhouettes, off-by-one at pixel edges).
+- For noisy 3D scans the actual problem is normal-field instability,
+  which the codebase already addresses via the smoothing pipeline at
+  [geodesics.py:97-117](../geodesics.py#L97-L117).  The occlusion
+  test is downstream of that and not the right place to compensate
+  for upstream geometry quality.
+
+**Re-open if**: a real reproduction surfaces (mesh + camera + marker
+position + screenshot) where `IntersectWithLine` returns the wrong
+occlusion answer *and* `vtkHardwareSelector` returns the right one
+on the same input.
 
 ### Replace cone arrows with `vtkGlyph3D`
 
