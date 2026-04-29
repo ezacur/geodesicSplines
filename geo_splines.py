@@ -362,11 +362,21 @@ def _process_initializer(v_shm_name: str, v_shape: tuple, v_dtype: str,
 @dataclass
 class SplineConfig:
     """Centralized spline editing tokens and thresholds."""
-    # Bézier curve sampling
+    # Bézier curve sampling — base resolution before curvature & secant
+    # refinement.  ``adaptive_samples`` in geodesics.py converts a span's
+    # control-polygon length into a sample count via
+    # ``n = poly_len / RESOLUTION + 1``, clamped to ``[MIN, MAX]``.
+    # The previous defaults (RESOLUTION=0.5, MAX=60) capped a typical
+    # span at ~30 samples, leaving the blue layer visibly polygonal in
+    # smooth regions where neither the curvature refiner nor the secant
+    # subdivision had a feature to refine on.  Tightened so the base
+    # density is enough for visual smoothness; consolidation cost rises
+    # by a few ms per span (still dominated by ``compute_endpoint_local``,
+    # which is independent of sample count).
     ADAPTIVE_SAMPLING: bool = True   # curvature-aware non-uniform t distribution
-    RESOLUTION: float = 0.5
-    MIN_SAMPLES: int = 10
-    MAX_SAMPLES: int = 60
+    RESOLUTION: float = 0.2
+    MIN_SAMPLES: int = 16
+    MAX_SAMPLES: int = 200
 
     # Secant chord subdivision — eliminates chords that cut through mesh ridges
     SECANT_TOL_FACTOR: float = 0.01   # fraction of mean edge length
