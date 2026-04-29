@@ -209,19 +209,31 @@ adding a wrap-around span.
 ## Three Curve Layers
 
 Each spline has up to three simultaneous curve representations with
-increasing accuracy and computational cost:
+increasing accuracy and computational cost.
+
+> **Default visibility at startup**: only the blue layer is shown.
+> Orange (`'o'`) and interp (`'k'`) start hidden — orange because it is
+> heavy to compute (the background workers run regardless of visibility,
+> so toggling on shows whatever is already done) and interp because it
+> is purely a B-spline through node origins, useful but rarely the
+> primary signal.  Press the corresponding key to toggle.
 
 ### Blue -- Bezier (dual-mode)
 
 The workhorse curve — always visible, accurate.  Dual-mode:
 
-- **During drag** (~3 ms per span): fast hybrid.  Level-1 geodesic
+- **During drag** (~3-8 ms per span): fast hybrid.  Level-1 geodesic
   lerp on the two outer paths (`path_b`, `path_a`), Euclidean lerp +
-  projection on H_out→H_in.  Levels 2-3 Euclidean + projection.
-- **On consolidation** (debounce fires, ~25 ms per span):
+  projection on H_out→H_in.  Levels 2-3 Euclidean + projection.  The
+  expensive `compute_endpoint_local` call is *skipped* during drag —
+  that is what makes the preview cheap, not the sample count, so blue
+  uses the same density as the resting curve and the polyline is
+  visually smooth even mid-gesture.
+- **On consolidation** (debounce fires, ~25-40 ms per span):
   semi-geodesic.  `compute_endpoint_local` provides an exact geodesic
   `path_12` between H_out and H_in, so level-1 is fully geodesic.
-  Levels 2-3 remain Euclidean + projection.
+  Levels 2-3 remain Euclidean + projection.  Cost is dominated by the
+  solver call (~25 ms) rather than the de Casteljau levels.
 
 This dual-mode keeps interactive drag fluid while snapping to accurate
 geometry the moment the user stops moving.  Computed synchronously in
@@ -238,14 +250,14 @@ sequenceDiagram
 
     U->>M: mousemove (drag handle)
     activate M
-    M->>M: hybrid Bezier (path_12=None, ~3ms)
+    M->>M: hybrid Bezier (path_12=None, ~3-8ms)
     M->>M: render blue (fast, thin, 60% opacity)
     M->>DB: schedule 'drag_exact' @ now+150ms
     deactivate M
 
     U->>M: mousemove (drag continues)
     activate M
-    M->>M: hybrid Bezier (~3ms)
+    M->>M: hybrid Bezier (~3-8ms)
     M->>DB: reschedule 'drag_exact' (deadline slides)
     deactivate M
 
@@ -254,7 +266,7 @@ sequenceDiagram
     DB->>M: 'drag_exact' fires
     activate M
     M->>M: compute_endpoint_local(H_out, H_in)
-    M->>M: hybrid Bezier (path_12=exact, ~25ms)
+    M->>M: hybrid Bezier (path_12=exact, ~25-40ms)
     M->>M: secant subdivision + project
     M->>M: render blue (full color, normal width)
     M->>W: submit orange workers (4 workers max)
@@ -319,8 +331,14 @@ exists for responsiveness, not for geometric correctness.
   - `INTERP_MIN_SAMPLES = 200` (high base count for short chords)
   - `INTERP_SECANT_TOL_FACTOR = 0.002` (5x tighter than Bezier's 0.01)
   - `INTERP_SECANT_MAX_DEPTH = 8` (256x local refinement)
-- Cost: ~1-5 ms. Recomputed synchronously on every drag frame (no
-  background worker needed).
+- Cost: ~1-5 ms.  Computed synchronously on the main thread.
+  **Visibility-gated**: while the layer is hidden (the default at startup),
+  `_recompute_interp_curve` is short-circuited so the splprep / splev /
+  project chain does not steal frames from the visible layers during
+  drag.  On the OFF→ON transition `_toggle_layer` triggers a one-shot
+  recompute across all splines so the curve appears immediately at full
+  quality.  Unlike orange (which always computes via background workers),
+  interp must run on the main thread, so the gating matters.
 - Toggle: key `k`. Z-depth -6 (behind all Bezier layers).
 - Cache: `_interp_cache` keyed by spline index (one curve per spline,
   not per span like the Bezier layers).
@@ -816,6 +834,19 @@ The closest point, its spline/span index, curve layer, segment index, and
 interpolation fraction are stored in `curve_hover_info`. This metadata is
 used by node insertion (double-click) to know exactly where on which curve
 the user clicked.
+
+### Buffer cache
+
+The (N, 3) buffer assembled by `_collect_visible_curves` is memoised
+behind a `_hover_curve_dirty` flag.  Hover detection only runs while no
+drag is active, so the buffer changes only when curve geometry or layer
+visibility actually mutates — exactly the regime where rebuilding it
+per mouse-move was wasteful.  The flag is set by `_set_span`,
+`_set_geo_span`, `_set_interp_curve`, `_toggle_layer`, the bulk-clear
+helpers, and `_refresh_visuals`.  Marking dirty is a single bool
+assignment, so the drag regime (where the cache is unused anyway) is
+unaffected; idle mouse-moves over a stable scene now skip the rebuild
+entirely.
 
 ## Data / Rendering Separation
 
