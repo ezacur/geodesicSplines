@@ -4,6 +4,53 @@ Interactive multi-spline editor for 3D triangulated meshes. Combines exact
 discrete geodesic computation with cubic Bezier interpolation to produce
 smooth curves that lie precisely on the surface.
 
+## 🎯 Why this matters? (Geodesic vs. Euclidean Splines)
+
+If you have ever tried to draw a smooth curve on a 3D scanned mesh or an
+STL file using standard 3D software, you have likely encountered the
+**Projection Problem**.
+
+Most commercial 3D tools (Blender, Maya, CAD projection tools) "cheat"
+when drawing curves on meshes. They compute the spline in empty 3D space
+(Euclidean space) and then forcefully project it down onto the nearest
+surface polygons (e.g. Shrinkwrap).
+
+This creates severe artifacts on complex geometry:
+
+- **The "Rubber Band" effect**: in concave areas (like the inside of a
+  bowl or the folds of an ear), the curve jumps off the surface and
+  floats in the air.
+- **Mesh Penetration**: in convex areas (like sharp ridges), the
+  Euclidean curve cuts straight through the inside of the mesh.
+- **Length Distortion**: the arc-length of the projected curve is
+  mathematically wrong, making it useless for precise manufacturing
+  (fabric pattern cutting, CNC routing).
+
+This editor solves the problem by computing **true discrete geodesics**.
+Instead of projecting a floating curve, the engine computes the spline
+intrinsically over the surface manifold. Using the **Edge-Flip Geodesic
+Solver** (Sharp & Crane 2020, via [potpourri3d](https://github.com/nmwsharp/potpourri3d))
+under the hood, the curve travels exactly across the faces of the
+triangles.
+
+The result:
+
+- **Zero Penetration**: the curve behaves like a physical string wrapped
+  tightly around the object. It hugs every ridge and valley of the
+  underlying triangulation exactly.
+- **True Arc-Length**: every segment is mathematically exact. The
+  distance measured along the spline is the true distance across the
+  surface.
+- **Real-Time Interaction**: historically, exact geodesic math is too
+  slow for interactive UIs. By combining a [local sub-mesh solver](#local-submesh-solver-compute_endpoint_local),
+  [Numba JIT-compiled kernels](#numba-jit-kernels), and
+  [asynchronous background workers](#background-workers), this tool
+  brings academic-grade computational geometry into a fluid interactive
+  editing experience.
+
+**Perfect for**: reverse engineering, carbon-fiber layup paths, custom
+orthotics on 3D scans, and precise fabric pattern flattening.
+
 ## Quick Start
 
 ```bash
