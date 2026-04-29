@@ -797,14 +797,29 @@ class GeodesicSegment(SegmentData):
             line_opacity = GIZMO_OPACITY
             lw = line_width
 
-        # 1. Main Geodesic Path — write into pre-allocated buffer
+        # 1. Main Geodesic Path — write into pre-allocated buffer.
+        # The initial size (802) covers the ``compute_shoot`` worst case
+        # (max_steps=400 → at most 401 points per ray → 802 total).  But
+        # ``update_from_a`` / ``update_from_b`` on debounce assign
+        # ``path_a`` / ``path_b`` from ``compute_endpoint_from_origin``,
+        # whose pp3d-solver-returned polyline has no such bound and on
+        # dense meshes can run to several hundred points.  Grow the
+        # buffer (with headroom) before writing so the slice assignment
+        # is never clipped — the historical bug was a silent destination
+        # truncation that surfaced as ``ValueError: could not broadcast
+        # input array from shape (X,3) into shape (Y,3)``.
+        na = len(self.path_a) if self.path_a is not None and len(self.path_a) > 1 else 0
+        nb_total = len(self.path_b) if self.path_b is not None and len(self.path_b) > 1 else 0
+        nb = max(0, nb_total - 1)  # path_b[1:] skips the shared origin
+        needed = na + nb
+        if needed > self._line_buf.shape[0]:
+            self._line_buf = np.empty((needed * 2, 3), dtype=float)
+
         n = 0
-        if self.path_a is not None and len(self.path_a) > 1:
-            na = len(self.path_a)
+        if na > 0:
             self._line_buf[:na] = self.path_a[::-1]
             n = na
-        if self.path_b is not None and len(self.path_b) > 1:
-            nb = len(self.path_b) - 1
+        if nb > 0:
             self._line_buf[n:n + nb] = self.path_b[1:]
             n += nb
 
