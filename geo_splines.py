@@ -567,7 +567,7 @@ def _geodesic_decasteljau_worker(
                 path_c0 = geo.compute_endpoint_local(b01, b12)
                 if geo._last_was_fallback:
                     degraded_any = True
-            except Exception as exc:  # noqa: BLE001 — solver C++ wrapper
+            except (RuntimeError, ValueError, TypeError, IndexError) as exc:
                 logging.getLogger("geo_splines.worker").debug(
                     "compute_endpoint_local(b01, b12) failed: %s", exc)
                 path_c0 = np.array([b01, b12])
@@ -580,7 +580,7 @@ def _geodesic_decasteljau_worker(
                 path_c1 = geo.compute_endpoint_local(b12, b23)
                 if geo._last_was_fallback:
                     degraded_any = True
-            except Exception as exc:  # noqa: BLE001 — solver C++ wrapper
+            except (RuntimeError, ValueError, TypeError, IndexError) as exc:
                 logging.getLogger("geo_splines.worker").debug(
                     "compute_endpoint_local(b12, b23) failed: %s", exc)
                 path_c1 = np.array([b12, b23])
@@ -598,7 +598,7 @@ def _geodesic_decasteljau_worker(
                 path_final = geo.compute_endpoint_local(c0, c1)
                 if geo._last_was_fallback:
                     degraded_any = True
-            except Exception as exc:  # noqa: BLE001 — solver C++ wrapper
+            except (RuntimeError, ValueError, TypeError, IndexError) as exc:
                 logging.getLogger("geo_splines.worker").debug(
                     "compute_endpoint_local(c0, c1) failed: %s", exc)
                 path_final = np.array([c0, c1])
@@ -1056,7 +1056,11 @@ class GeodesicSplineApp(MidpointShooterApp):
         if SSAO_ENABLED:
             try:
                 self.plotter.enable_ssao()
-            except Exception as exc:
+            except (AttributeError, RuntimeError) as exc:
+                # Older PyVista lacks enable_ssao (AttributeError); some
+                # OpenGL contexts reject the SSAO render pass at runtime
+                # (RuntimeError from VTK).  Both are non-fatal: SSAO is
+                # purely cosmetic and the editor works without it.
                 log.warning("SSAO unavailable: %s", exc)
 
         # Resolve z-fighting: lines/points always render on top of solid surfaces
@@ -2789,7 +2793,7 @@ class GeodesicSplineApp(MidpointShooterApp):
                 return
             try:
                 pts = cache['solver'].find_geodesic_path(idx_s, idx_e)
-            except Exception as exc:  # noqa: BLE001 — solver C++ wrapper
+            except (RuntimeError, ValueError, TypeError, IndexError) as exc:
                 # The wrapper raises a generic ``Exception`` from the
                 # native solver; we cannot narrow the type and the
                 # fallback (hide the stitch) is the same regardless.
@@ -2806,7 +2810,7 @@ class GeodesicSplineApp(MidpointShooterApp):
                 return
             try:
                 pts = self.geo._solver.find_geodesic_path(idx_s, idx_e)
-            except Exception as exc:  # noqa: BLE001 — solver C++ wrapper
+            except (RuntimeError, ValueError, TypeError, IndexError) as exc:
                 log.debug("stitch global solver failed: %s", exc)
                 self._stitch_actor.SetVisibility(False)
                 return

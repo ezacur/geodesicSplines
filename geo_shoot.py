@@ -205,9 +205,9 @@ Next steps
 
 from __future__ import annotations
 
+import logging
 import os
 import time
-import traceback
 import warnings
 from dataclasses import dataclass, field
 
@@ -217,6 +217,14 @@ import vtk
 
 from geodesics import GeodesicMesh
 from gizmo import GeodesicSegment, WARN_SHOOT, _color_rgb
+
+
+# Module-level logger.  No handler is attached here; geo_splines
+# configures the root for the editor session.  Keep WARNING by default
+# so VTK observer-callback failures (which we cannot let propagate, but
+# still must surface) reach the user via the same channel as the rest
+# of the diagnostics.
+log = logging.getLogger("geo_shoot")
 
 try:
     from numba import njit
@@ -1153,9 +1161,14 @@ class MidpointShooterApp:
                 if pt is not None:
                     self._create_segment(pt, cid)
                     self.plotter.render()
-        except Exception:
-            print("[CRITICAL] Press handler failed:")
-            print(traceback.format_exc())
+        except Exception:  # noqa: BLE001 — VTK observer must not propagate
+            # VTK's C++ event loop cannot tolerate a raised exception from
+            # a Python observer callback (segfault risk).  We deliberately
+            # catch any failure, log with full traceback, and return
+            # cleanly.  log.exception emits at ERROR with traceback —
+            # equivalent to the previous bare prints but routed through
+            # the standard logger.
+            log.exception("press handler failed")
 
     def _detect_hover(self, x: int, y: int) -> tuple[GeodesicSegment | None, str | None, bool]:
         """Tests all segment handles against screen position for hover highlight.
@@ -1289,9 +1302,10 @@ class MidpointShooterApp:
                         self._set_hud("READY", 'white')
                 self.plotter.render()
 
-        except Exception:
-            print("[CRITICAL] Interaction loop failed:")
-            print(traceback.format_exc())
+        except Exception:  # noqa: BLE001 — VTK observer must not propagate
+            # Same rationale as press handler: any uncaught exception
+            # here would crash VTK's event loop.
+            log.exception("interaction loop failed")
 
     def _schedule_debounce(self) -> None:
         """Registers the drag consolidation in the Master Clock.
@@ -1362,9 +1376,8 @@ class MidpointShooterApp:
             dragged.is_preview = False
             dragged.is_dragging = False
             self._finalize_release(dragged)
-        except Exception:
-            print("[CRITICAL] Release handler failed:")
-            print(traceback.format_exc())
+        except Exception:  # noqa: BLE001 — VTK observer must not propagate
+            log.exception("release handler failed")
         finally:
             # Guarantee cleanup regardless of success/failure.
             dragged.is_preview = False
@@ -1477,8 +1490,11 @@ class MidpointShooterApp:
         for seg in self.segments:
             try:
                 seg.clear_actors(self.plotter)
-            except Exception:
-                pass
+            except (AttributeError, RuntimeError) as exc:
+                # VTK actor may already be detached or the plotter may
+                # have torn down its renderer.  Log at debug — this is
+                # cleanup, not a fatal path.
+                log.debug("seg.clear_actors during cleanup: %s", exc)
         self.segments.clear()
 
         # Clear pending debounces
@@ -1520,8 +1536,10 @@ class MidpointShooterApp:
         finally:
             try:
                 self.cleanup()
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001 — teardown best-effort
+                # The window may already be closed by VTK; cleanup is a
+                # belt-and-braces pass so any exception here is non-fatal.
+                log.debug("cleanup in run() finally: %s", exc)
 
 
 if __name__ == "__main__":

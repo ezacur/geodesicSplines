@@ -280,14 +280,19 @@ def safe_remove_actor(plotter: pv.Plotter, actor) -> None:
     """
     if actor is None:
         return
+    # VTK actor / plotter teardown — both calls can raise on a
+    # half-destroyed pipeline (RuntimeError from native side, AttributeError
+    # if the actor's mapper was already nulled).  We deliberately keep the
+    # catch broad but typed: this runs during shutdown, must never crash
+    # the X-button cleanup path.  KeyboardInterrupt still propagates.
     try:
         if hasattr(actor, 'SetMapper'):
             actor.SetMapper(None)
-    except Exception:
+    except (AttributeError, RuntimeError):
         pass
     try:
         plotter.remove_actor(actor)
-    except Exception:
+    except (AttributeError, RuntimeError, KeyError):
         pass
 
 
@@ -388,7 +393,13 @@ class SegmentData:
             return np.array([self.origin, target])
         try:
             return cache['solver'].find_geodesic_path(idx_s, idx_e)
-        except Exception:
+        except (RuntimeError, ValueError, TypeError) as exc:
+            # pp3d failure on the local submesh — degrade to the
+            # straight-line approximation so the drag preview never
+            # disappears.  Diagnostic via the geodesics logger.
+            import logging
+            logging.getLogger("geodesics").debug(
+                "AGILE_DRAG solver failed: %s", exc)
             return np.array([self.origin, target])
 
     def update_from_a(self, new_a: np.ndarray, geo: GeodesicMesh, exact: bool = False) -> None:

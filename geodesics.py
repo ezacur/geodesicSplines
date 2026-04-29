@@ -239,6 +239,7 @@ Next steps
 """
 from __future__ import annotations
 
+import logging
 from math import sqrt as _math_sqrt
 from typing import TypedDict
 
@@ -247,6 +248,15 @@ import numpy.typing as npt
 import vtk
 from scipy.spatial import KDTree
 import potpourri3d as pp3d
+
+
+# Module-level logger for solver diagnostics.  Stays at WARNING by
+# default so a normal session is silent; set the parent logger to
+# DEBUG (e.g. via ``GEO_SPLINES_DEBUG=1`` from the editor) to surface
+# pp3d / VTK fallback chatter.  No handler is attached here — callers
+# (geo_splines, spline_export) configure formatting on their own
+# loggers, and Python's default propagation routes our records there.
+log = logging.getLogger("geodesics")
 
 # Common ndarray type aliases — using numpy.typing for IDE autocompletion
 # and static type checkers.  Shape isn't encoded in these (numpy typing
@@ -1574,11 +1584,17 @@ class GeodesicMesh:
         V_buf, F_buf, nv, nf = self._make_work_buffers(extra_verts=3, extra_faces=10)
         idx_o, nv, nf = self._add_point_buf(p_origin, V_buf, F_buf, nv, nf)
         nf = self._remove_degenerate_faces(F_buf, nf)
+        # pp3d's pybind11 wrapper can raise RuntimeError (manifold check
+        # fails on degenerate input) or ValueError (bad array dtype/shape).
+        # We deliberately do NOT catch broader Exception — KeyboardInterrupt
+        # and MemoryError must propagate so the user can interrupt long
+        # session loads or surface OOM cleanly.
         try:
             solver = pp3d.EdgeFlipGeodesicSolver(V_buf[:nv], F_buf[:nf])
-        except Exception:
+        except (RuntimeError, ValueError, TypeError) as exc:
             # Topology insertion produced a degenerate mesh.  Fall back to
             # the pre-built solver with vertex-snapped origin.
+            log.debug("EdgeFlipGeodesicSolver failed in prepare_origin: %s", exc)
             _, idx_o = self._kdtree.query(p_origin)
             idx_o = int(idx_o)
             solver = self._solver
@@ -1632,7 +1648,14 @@ class GeodesicMesh:
 
             # Tier 2: local submesh solver (~10× faster than global)
             return self.compute_endpoint_local(origin_cache['p'], p_end)
-        except Exception:
+        except (RuntimeError, ValueError, TypeError, IndexError, KeyError) as exc:
+            # Tier 1 failure modes:
+            #   - RuntimeError / ValueError  → solver rejected the snap.
+            #   - IndexError                 → bary helpers got a stale F_buf row.
+            #   - KeyError                   → caller passed a malformed cache dict.
+            # All recoverable; degrade to Tier 2.  KeyboardInterrupt and
+            # MemoryError still propagate.
+            log.debug("compute_endpoint_from_origin tier-1 failed: %s", exc)
             return self.compute_endpoint_local(origin_cache['p'], p_end)
 
     def _try_endpoint_insertion(self, p_start, p_end):
@@ -1783,7 +1806,11 @@ class GeodesicMesh:
 
             solver = pp3d.EdgeFlipGeodesicSolver(V_buf[:nv], F_buf[:nf])
             path = solver.find_geodesic_path(idx_s, idx_e)
-        except Exception:
+        except (RuntimeError, ValueError, TypeError, IndexError) as exc:
+            # pp3d / topology-insertion failure on this submesh region.
+            # Caller (compute_endpoint_local) treats ('error', None) as a
+            # signal to widen the seed and retry.
+            log.debug("local submesh solver failed: %s", exc)
             return ('error', None)
 
         if path is None or len(path) < 2:
@@ -1873,7 +1900,10 @@ class GeodesicMesh:
             # t=0 / t=1 (possible on very sliver triangles).
             seed_set.update(self._faces_for_point(p_start))
             seed_set.update(self._faces_for_point(p_end))
-        except Exception:
+        except (ValueError, IndexError, RuntimeError) as exc:
+            # Projection kernel or face lookup failed on degenerate seed
+            # input.  Bail out to the global solver — slower but robust.
+            log.debug("seed construction failed for compute_endpoint_local: %s", exc)
             return self.compute_endpoint(p_start, p_end)
 
         if not seed_set:
@@ -2000,8 +2030,8 @@ class GeodesicMesh:
             if ok:
                 self.diagnose_path(path, "endpoint")
                 return path
-        except Exception:
-            pass
+        except (RuntimeError, ValueError, TypeError, IndexError) as exc:
+            log.debug("compute_endpoint attempt-1 failed: %s", exc)
 
         # Attempt 2: nudge both points toward their face centroids.
         # Nudge fraction is relative to the shortest edge of each face
@@ -2023,12 +2053,12 @@ class GeodesicMesh:
             if ok:
                 self.diagnose_path(path, "endpoint-nudged")
                 return path
-        except Exception:
-            pass
+        except (RuntimeError, ValueError, TypeError, IndexError) as exc:
+            log.debug("compute_endpoint attempt-2 (nudged) failed: %s", exc)
 
         # Last resort: snap to nearest vertices and use pre-built solver
         if self.locator is not None:
-            print("  [diag:endpoint] insertion failed after retry, vertex snap")
+            log.warning("endpoint insertion failed after retry; falling back to vertex snap")
         _, idx_s = self._kdtree.query(p_start)
         _, idx_e = self._kdtree.query(p_end)
         idx_s, idx_e = int(idx_s), int(idx_e)
@@ -2039,7 +2069,8 @@ class GeodesicMesh:
             path = self._solver.find_geodesic_path(idx_s, idx_e)
             self.diagnose_path(path, "endpoint-snapped")
             return path
-        except Exception:
+        except (RuntimeError, ValueError, TypeError) as exc:
+            log.debug("vertex-snap solver failed: %s", exc)
             self._last_was_fallback = True
             return np.array([p_start, p_end])
 
