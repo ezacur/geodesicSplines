@@ -91,6 +91,16 @@ def _read_mesh_VF(mesh_file: str) -> tuple[np.ndarray, np.ndarray]:
     helper deals only with on-disk meshes.
     """
     # Tier 1: meshio (fast, no PyVista / VTK rendering).
+    #
+    # meshio's design quirk: when a reader's ``ReadError`` propagates up
+    # through ``meshio.read``, the library prints "Error: Couldn't
+    # read file ..." in red **and calls ``sys.exit(1)`` directly**
+    # (see meshio/_helpers.py).  ``sys.exit`` raises ``SystemExit``,
+    # which inherits from ``BaseException`` — NOT ``Exception`` — so a
+    # plain ``except Exception:`` does NOT catch it and the process
+    # would die before reaching our fallback.  Catching both restores
+    # the intended behaviour (try meshio, fall through on any failure)
+    # without swallowing ``KeyboardInterrupt``.
     try:
         import meshio
         mesh = meshio.read(mesh_file)
@@ -102,9 +112,10 @@ def _read_mesh_VF(mesh_file: str) -> tuple[np.ndarray, np.ndarray]:
         log.debug(
             "meshio read %s but no triangle cells (got %s); "
             "falling back to PyVista", mesh_file, list(cells.keys()))
-    except Exception as exc:  # noqa: BLE001 — meshio raises various types
-        # Common: unsupported extension (.vtp), corrupt header, mismatched
-        # binary/ascii flag.  All recoverable via the PyVista fallback.
+    except (Exception, SystemExit) as exc:  # noqa: BLE001
+        # Common: unsupported extension (.vtp), legacy ``.vtk``
+        # POLYDATA dataset (meshio prints + exit(1)), corrupt header,
+        # mismatched binary/ascii flag.  All recoverable via PyVista.
         log.debug("meshio failed on %s (%s); falling back to PyVista",
                   mesh_file, exc)
 
