@@ -1343,14 +1343,26 @@ class GeodesicMesh:
             orientation across edges).  Faster but less accurate on curved
             surfaces.  Used for cursor crosshair and drag previews.
         """
+        # ``_vtk_cp`` is only meaningful when ``find_face`` took the VTK
+        # locator branch — that branch is what populates it via
+        # ``locator.FindClosestPoint``.  When the mesh was built from
+        # raw (V, F) arrays (no ``pv.PolyData``), ``self.locator`` is
+        # None, ``find_face`` falls through to the KDTree path, and
+        # ``_vtk_cp`` keeps its zero-initialised value — historically
+        # this silently zeroed ``p_start``, so the shoot started at the
+        # world origin and the inner loop returned None for every node.
+        # Only snap to the locator's closest-point when we actually have
+        # a locator; otherwise trust the input ``p_start``.
         if face_idx is None:
             face_idx = self.find_face(p_start)
-            p_start = np.array(self._vtk_cp, dtype=float)
+            if self.locator is not None:
+                p_start = np.array(self._vtk_cp, dtype=float)
         else:
             u, v, w = self.get_barycentric(p_start, face_idx)
             if min(u, v, w) < -0.1 or max(u, v, w) > 1.1:
                 face_idx = self.find_face(p_start)
-                p_start = np.array(self._vtk_cp, dtype=float)
+                if self.locator is not None:
+                    p_start = np.array(self._vtk_cp, dtype=float)
 
         curr_p = np.empty(3, dtype=float)
         curr_p[0] = p_start[0]; curr_p[1] = p_start[1]; curr_p[2] = p_start[2]

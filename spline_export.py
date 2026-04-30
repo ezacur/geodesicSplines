@@ -209,43 +209,61 @@ def compute_blue(geo, nodes, closed, n_samples):
 
 
 def _orange_span_worker(task_data):
-    """Worker function to compute a single orange span in a separate process."""
-    (v, f, n0, n1, n_samples) = task_data
+    """Worker function to compute a single orange span in a separate process.
+
+    Mirrors ``_geodesic_decasteljau_worker`` in ``geo_splines.py`` for
+    bit-for-bit parity with the editor's orange layer:
+
+      - **Endpoints are pre-seeded with the literal P0 / P1**
+        (``ctrl[0]`` / ``ctrl[3]`` = node origins).  Computing the
+        endpoints via ``de_casteljau(t=0)`` and ``de_casteljau(t=1)``
+        chains five ``compute_endpoint_local`` calls, each of which
+        inserts points into the mesh with a topology-tolerance / nudge
+        step that drifts up to ~0.2 units away from the true node
+        position.  The editor avoids this by seeding the endpoints
+        explicitly and only sampling the *interior* t values; we do
+        the same here.
+
+      - The t grid is ``curvature_adaptive_t_vals`` when adaptive=True
+        (matches the editor's default ``ADAPTIVE_SAMPLING=True``),
+        falling back to ``np.linspace`` otherwise.
+
+    The caller is responsible for the secant-chord subdivision pass
+    (the editor runs it post-worker in ``_apply_orange_progress``).
+    """
+    (v, f, ctrl, path_b, path_a_rev, t_grid) = task_data
 
     # Local imports — needed inside spawn-mode worker children.
     import numpy as np
     from geodesics import GeodesicMesh
 
-    # GeodesicMesh accepts (V, F) arrays directly — no PyVista wrap
-    # needed.  The VTK locator stays None on this path (we don't pick),
-    # and find_face falls back to its KDTree path if it ever runs.
+    # GeodesicMesh accepts (V, F) arrays directly.
     geo = GeodesicMesh(v, f)
-    
-    H_out, H_in = n0['p_b'], n1['p_a']
-    path_b = n0['path_b']
-    path_a_rev = n1['path_a'][::-1]
+
+    P0, H_out, H_in, P1 = ctrl
 
     path_12 = geo.compute_endpoint_local(H_out, H_in)
     if path_12 is None or len(path_12) < 2:
         path_12 = np.array([H_out, H_in])
-    
+
     cum_b, total_b = GeodesicMesh.compute_path_lengths(path_b)
     cum_a, total_a = GeodesicMesh.compute_path_lengths(path_a_rev)
     cum_12, total_12 = GeodesicMesh.compute_path_lengths(path_12)
 
-    t_vals = np.linspace(0.0, 1.0, n_samples)
-    span_pts = []
+    n = len(t_grid)
+    span_pts = [None] * n
+    # Pre-seed endpoints with the literal node origins (matches editor).
+    span_pts[0]  = np.asarray(P0, dtype=float)
+    span_pts[-1] = np.asarray(P1, dtype=float)
 
-    for t in t_vals:
+    # Inner indices only — endpoints are already seeded.
+    for idx in range(1, n - 1):
+        t = float(t_grid[idx])
+
         b01 = GeodesicMesh.geodesic_lerp(path_b, t, cum_b, total_b)
         b12 = GeodesicMesh.geodesic_lerp(path_12, t, cum_12, total_12)
         b23 = GeodesicMesh.geodesic_lerp(path_a_rev, t, cum_a, total_a)
 
-        # The C++ solver wrapper raises a generic ``Exception`` from
-        # potpourri3d on degenerate input; we cannot narrow the type
-        # any further than that.  RuntimeError covers the common case
-        # (non-manifold input, disconnected components); a bare except
-        # would also swallow KeyboardInterrupt.
         try:
             path_c0 = geo.compute_endpoint_local(b01, b12)
         except (RuntimeError, ValueError) as exc:
@@ -276,22 +294,37 @@ def _orange_span_worker(task_data):
             path_f = np.array([c0, c1])
 
         cum_f, total_f = GeodesicMesh.compute_path_lengths(path_f)
-        result = GeodesicMesh.geodesic_lerp(path_f, t, cum_f, total_f)
-        span_pts.append(result)
+        span_pts[idx] = GeodesicMesh.geodesic_lerp(path_f, t, cum_f, total_f)
 
     return np.array(span_pts)
 
 
-def compute_orange(geo, nodes, closed, n_samples):
-    """Computes fully geodesic (orange) de Casteljau points for one spline in parallel."""
+def compute_orange(geo, nodes, closed, n_samples, adaptive: bool = True):
+    """Computes fully geodesic (orange) de Casteljau points for one spline.
+
+    Mirrors the editor's orange-layer pipeline end-to-end so the export
+    produces the exact curve the user sees on screen:
+
+      1. Per-span control points ``[P0, H_out, H_in, P1]`` built from
+         the node origins + handle endpoints.
+      2. ``t_grid`` from ``curvature_adaptive_t_vals`` when ``adaptive``
+         (matches editor's default ``ADAPTIVE_SAMPLING=True``), else
+         ``np.linspace``.
+      3. Worker computes only the *inner* points; the parent (here)
+         pre-seeds endpoints with the literal node origins via the
+         worker's seed logic.
+      4. ``subdivide_secant_chords`` post-processing identical to
+         ``_apply_orange_progress`` in the editor.
+    """
     n_nodes = len(nodes)
     if n_nodes < 2:
         return []
 
     n_spans = n_nodes if closed else n_nodes - 1
     tasks = []
-    
-    # Prepare mesh data once to avoid repeated extraction
+
+    # Mesh arrays passed by reference once per task — avoids re-pickling
+    # the large V / F per worker call.
     v = geo.V
     f = geo.F
 
@@ -304,15 +337,25 @@ def compute_orange(geo, nodes, closed, n_samples):
         if n0['path_b'] is None or n1['path_a'] is None:
             tasks.append(None)
             continue
-        
-        # We pass minimal dicts to avoid pickling overhead
-        n0_min = {'p_b': n0['p_b'], 'path_b': n0['path_b']}
-        n1_min = {'p_a': n1['p_a'], 'path_a': n1['path_a']}
-        
-        tasks.append((v, f, n0_min, n1_min, n_samples))
+
+        ctrl = [
+            np.asarray(n0['origin'], dtype=float),  # P0
+            np.asarray(n0['p_b'], dtype=float),     # H_out
+            np.asarray(n1['p_a'], dtype=float),     # H_in
+            np.asarray(n1['origin'], dtype=float),  # P1
+        ]
+        path_b = np.asarray(n0['path_b'], dtype=float)
+        path_a_rev = np.asarray(n1['path_a'], dtype=float)[::-1].copy()
+
+        if adaptive:
+            t_grid = GeodesicMesh.curvature_adaptive_t_vals(ctrl, n_samples)
+        else:
+            t_grid = np.linspace(0.0, 1.0, n_samples)
+
+        tasks.append((v, f, ctrl, path_b, path_a_rev, t_grid))
 
     log.info("computing %d spans in parallel...", n_spans)
-    
+
     all_pts = [None] * n_spans
     valid_task_indices = [i for i, t in enumerate(tasks) if t is not None]
     valid_tasks = [tasks[i] for i in valid_task_indices]
@@ -320,8 +363,17 @@ def compute_orange(geo, nodes, closed, n_samples):
     with ProcessPoolExecutor() as executor:
         results = list(executor.map(_orange_span_worker, valid_tasks))
 
+    # Post-process: same secant chord subdivision the editor applies in
+    # _apply_orange_progress when the worker emits 'done'.  Keeps the
+    # polyline visibly close to the surface even when the de Casteljau
+    # samples land on opposite sides of a ridge.
+    mean_edge = float(np.sqrt(geo._face_edge_len2.mean()))
+    secant_tol = mean_edge * 0.01
     for i, res in zip(valid_task_indices, results):
-        all_pts[i] = res
+        if res is None or len(res) < 2:
+            all_pts[i] = res
+            continue
+        all_pts[i] = geo.subdivide_secant_chords(res, tol=secant_tol, max_depth=6)
 
     return [p for p in all_pts if p is not None]
 
