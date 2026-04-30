@@ -72,64 +72,40 @@ def load_json(path: str) -> dict:
 def _read_mesh_VF(mesh_file: str) -> tuple[np.ndarray, np.ndarray]:
     """Reads ``mesh_file`` and returns ``(V, F)`` as plain numpy arrays.
 
-    Two-tier strategy:
+    Uses the same pipeline as the interactive editor
+    (``geo_shoot.py:_load_mesh`` / [geo_shoot.py:698]):
 
-      1. **meshio first** — light, no VTK rendering pipeline.  Covers
-         the common formats (``.obj``, ``.ply``, ``.stl``, legacy ``.vtk``
-         with triangle cells, ``.vtu``).  This is the path that lets
-         the CLI run on headless CI / Docker without an X server.
-      2. **PyVista fallback** — lazy-imported.  Handles formats meshio
-         either does not know (``.vtp``, ``.gltf``) or reads but stores
-         in non-triangle cell types (VTK PolyData saved as
-         ``polygon`` / ``triangle_strip`` / ``vertex``).  PyVista's
-         ``extract_surface().triangulate().clean()`` chain produces a
-         clean triangle mesh for any VTK-readable input.  ``pv.read``
-         itself does not need a display — only ``Plotter()`` does — so
-         this fallback is still safe in offscreen contexts.
+        pv.read(path).extract_surface().triangulate().clean()
+
+    This guarantees byte-for-byte parity with what ``geo_splines`` sees
+    when it loads the same file: the same V / F arrays, same
+    deduplication of coincident vertices, same removal of degenerate
+    triangles.  Without this parity, the orange worker downstream
+    builds its face-adjacency matrix on slightly different topology
+    (duplicate vertices break edge-key matching) and ``compute_shoot``
+    truncates short of where it should — producing a visibly **shorter
+    curve** than the editor displays.
+
+    A previous version of this function had a "meshio fast path" for
+    ``.obj`` / ``.ply`` / ``.stl`` to avoid the PyVista import in
+    headless CI, but meshio does not deduplicate vertices or remove
+    degenerate triangles, and the geometry mismatch silently shifted
+    the orange curve.  Parity with the editor is more important than
+    a one-time PyVista import cost (~1 s); ``pv.read`` itself does
+    not require a display, so this is still safe in offscreen
+    contexts (``Plotter()`` is the only PyVista API that needs X).
 
     Built-in icosahedron sentinel is handled by the caller — this
     helper deals only with on-disk meshes.
     """
-    # Tier 1: meshio (fast, no PyVista / VTK rendering).
-    #
-    # meshio's design quirk: when a reader's ``ReadError`` propagates up
-    # through ``meshio.read``, the library prints "Error: Couldn't
-    # read file ..." in red **and calls ``sys.exit(1)`` directly**
-    # (see meshio/_helpers.py).  ``sys.exit`` raises ``SystemExit``,
-    # which inherits from ``BaseException`` — NOT ``Exception`` — so a
-    # plain ``except Exception:`` does NOT catch it and the process
-    # would die before reaching our fallback.  Catching both restores
-    # the intended behaviour (try meshio, fall through on any failure)
-    # without swallowing ``KeyboardInterrupt``.
-    try:
-        import meshio
-        mesh = meshio.read(mesh_file)
-        cells = mesh.cells_dict
-        if 'triangle' in cells:
-            V = np.ascontiguousarray(mesh.points, dtype=float)
-            F = np.ascontiguousarray(cells['triangle'], dtype=int)
-            return V, F
-        log.debug(
-            "meshio read %s but no triangle cells (got %s); "
-            "falling back to PyVista", mesh_file, list(cells.keys()))
-    except (Exception, SystemExit) as exc:  # noqa: BLE001
-        # Common: unsupported extension (.vtp), legacy ``.vtk``
-        # POLYDATA dataset (meshio prints + exit(1)), corrupt header,
-        # mismatched binary/ascii flag.  All recoverable via PyVista.
-        log.debug("meshio failed on %s (%s); falling back to PyVista",
-                  mesh_file, exc)
-
-    # Tier 2: PyVista fallback — covers VTK PolyData (.vtp, .vtk
-    # PolyData) and formats meshio does not handle.  Imported lazily so
-    # the common path stays VTK-free.
     import warnings
     import pyvista as pv
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore")
         mesh_pv = pv.read(mesh_file).extract_surface().triangulate().clean()
     V = np.asarray(mesh_pv.points, dtype=float)
-    # PyVista stores faces as flat [n, i0, i1, ..., n, i0, ...] — for
-    # an all-triangle mesh after .triangulate() that is [3, a, b, c, 3, ...].
+    # PyVista stores faces as flat [n, i0, i1, ..., n, i0, ...] — for an
+    # all-triangle mesh after .triangulate() this is [3, a, b, c, 3, ...].
     F = np.asarray(mesh_pv.faces, dtype=int).reshape(-1, 4)[:, 1:]
     return V, F
 
