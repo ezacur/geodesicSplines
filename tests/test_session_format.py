@@ -154,3 +154,114 @@ def test_closed_spline_with_zero_nodes_rejected():
 def test_open_spline_with_zero_nodes_accepted():
     """Empty splines are valid placeholders for "break" (Dbl-click R)."""
     validate({"splines": [{"closed": False, "nodes": []}]})
+
+
+# --- v2 schema (origin + p_a + p_b) -------------------------------------
+
+
+def test_v2_node_with_explicit_handles_accepted():
+    validate(
+        {
+            "version": 2,
+            "splines": [
+                {
+                    "closed": False,
+                    "nodes": [
+                        {
+                            "origin": [0.0, 0.0, 0.0],
+                            "p_a": [-1.0, 0.0, 0.0],
+                            "p_b": [1.0, 0.0, 0.0],
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+
+def test_v2_node_with_null_handles_accepted():
+    """Null p_a / p_b is valid for placeholder single-node splines."""
+    validate(
+        {
+            "version": 2,
+            "splines": [
+                {
+                    "closed": False,
+                    "nodes": [
+                        {"origin": [0.0, 0.0, 0.0], "p_a": None, "p_b": None}
+                    ],
+                }
+            ],
+        }
+    )
+
+
+def test_v2_node_with_p_a_nan_rejected():
+    with pytest.raises(ValueError):
+        validate(
+            {
+                "version": 2,
+                "splines": [
+                    {
+                        "closed": False,
+                        "nodes": [
+                            {
+                                "origin": [0.0, 0.0, 0.0],
+                                "p_a": [math.nan, 0.0, 0.0],
+                                "p_b": [1.0, 0.0, 0.0],
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+
+
+def test_node_missing_tangent_and_handles_rejected():
+    """A node must have either v1 'tangent' or v2 'p_a' + 'p_b'."""
+    with pytest.raises(ValueError, match="tangent"):
+        validate(
+            {
+                "splines": [
+                    {"closed": False, "nodes": [{"origin": [0.0, 0.0, 0.0]}]}
+                ]
+            }
+        )
+
+
+def test_node_with_only_p_a_rejected():
+    """Half-v2 (p_a without p_b) is rejected — it's neither schema."""
+    with pytest.raises(ValueError):
+        validate(
+            {
+                "splines": [
+                    {
+                        "closed": False,
+                        "nodes": [
+                            {"origin": [0.0, 0.0, 0.0], "p_a": [1.0, 0.0, 0.0]}
+                        ],
+                    }
+                ]
+            }
+        )
+
+
+def test_mixed_v1_v2_nodes_in_same_spline_accepted():
+    """The validator dispatches per-node, so a session can mix schemas."""
+    validate(
+        {
+            "splines": [
+                {
+                    "closed": False,
+                    "nodes": [
+                        {"origin": [0.0, 0.0, 0.0], "tangent": [1.0, 0.0, 0.0]},
+                        {
+                            "origin": [1.0, 0.0, 0.0],
+                            "p_a": [0.5, 0.0, 0.0],
+                            "p_b": [1.5, 0.0, 0.0],
+                        },
+                    ],
+                }
+            ]
+        }
+    )

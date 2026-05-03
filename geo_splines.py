@@ -245,6 +245,19 @@ def _validate_session_dict(data: dict) -> None:
     splines = data.get('splines')
     if not isinstance(splines, list):
         raise ValueError("'splines' missing or not a list")
+    # Schema dispatch is per-node, not per-file: a session is allowed
+    # to mix v1 and v2 records (handy when manually concatenating
+    # sessions or migrating piecemeal).  Each record is valid if it
+    # has either ``tangent`` (v1) or both ``p_a`` and ``p_b`` (v2).
+    def _validate_3vec_or_none(label, v, allow_none):
+        if v is None and allow_none:
+            return
+        if not isinstance(v, (list, tuple)) or len(v) != 3:
+            raise ValueError(f"{label} must be a 3-element list")
+        for j, x in enumerate(v):
+            if not isinstance(x, (int, float)) or x != x:  # x!=x catches NaN
+                raise ValueError(f"{label}[{j}] must be a finite number")
+
     for si, sd in enumerate(splines):
         if not isinstance(sd, dict):
             raise ValueError(f"splines[{si}] is not an object")
@@ -256,17 +269,26 @@ def _validate_session_dict(data: dict) -> None:
         for ni, nd in enumerate(nodes):
             if not isinstance(nd, dict):
                 raise ValueError(f"splines[{si}].nodes[{ni}] is not an object")
-            for field_ in ('origin', 'tangent'):
-                v = nd.get(field_)
-                if not isinstance(v, (list, tuple)) or len(v) != 3:
-                    raise ValueError(
-                        f"splines[{si}].nodes[{ni}].{field_} "
-                        f"must be a 3-element list")
-                for j, x in enumerate(v):
-                    if not isinstance(x, (int, float)) or x != x:  # x!=x catches NaN
-                        raise ValueError(
-                            f"splines[{si}].nodes[{ni}].{field_}[{j}] "
-                            f"must be a finite number")
+            base = f"splines[{si}].nodes[{ni}]"
+            _validate_3vec_or_none(f"{base}.origin", nd.get('origin'),
+                                   allow_none=False)
+            has_v2 = 'p_a' in nd and 'p_b' in nd
+            has_v1 = 'tangent' in nd
+            if not (has_v1 or has_v2):
+                raise ValueError(
+                    f"{base} must have either 'tangent' (v1) "
+                    f"or both 'p_a' and 'p_b' (v2)")
+            if has_v2:
+                # ``p_a`` / ``p_b`` may be null for placeholder nodes
+                # (e.g. a freshly added single node before the second
+                # node sets up symmetric tangents).
+                _validate_3vec_or_none(f"{base}.p_a", nd['p_a'],
+                                       allow_none=True)
+                _validate_3vec_or_none(f"{base}.p_b", nd['p_b'],
+                                       allow_none=True)
+            else:
+                _validate_3vec_or_none(f"{base}.tangent", nd['tangent'],
+                                       allow_none=False)
         # Closed loops require >= 3 nodes (interactive editor enforces
         # this in _on_close_spline; loaded sessions might violate it).
         if bool(sd.get('closed', False)) and len(nodes) < 3:
@@ -1658,26 +1680,27 @@ class GeodesicSplineApp(MidpointShooterApp):
     def _snapshot(self) -> dict:
         """Captures the current spline state as a lightweight dict.
 
-        Uses the same 2-field-per-node representation as the JSON save
-        format (origin + tangent-with-magnitude), so ``_load_from_data``
-        can restore it directly.  Typical size: ~48 bytes per node.
+        Uses the **v2** schema: each node serialises ``origin``, ``p_a``,
+        and ``p_b`` as literal 3-D positions.  This lossless layout is
+        what the JSON save format also writes — see ``_on_save`` for
+        the rationale.  Typical size: ~96 bytes per node (3× the v1
+        layout's 32 bytes; trivial in the snapshot stack).
         """
         splines = []
         for sid, nodes in enumerate(self.splines):
             node_data = []
             for node in nodes:
-                tangent_3d = (node.local_v[0] * node.u
-                              + node.local_v[1] * node.v) * node.h_length
                 node_data.append({
                     'origin': node.origin.tolist(),
-                    'tangent': tangent_3d.tolist(),
+                    'p_a': node.p_a.tolist() if node.p_a is not None else None,
+                    'p_b': node.p_b.tolist() if node.p_b is not None else None,
                 })
             splines.append({
                 'closed': self.splines_closed[sid],
                 'nodes': node_data,
             })
         return {
-            'version': 1,
+            'version': 2,
             'splines': splines,
             'active_spline_idx': self.active_spline_idx,
         }
@@ -1775,20 +1798,39 @@ class GeodesicSplineApp(MidpointShooterApp):
             return
 
         # Differential path: same structure, reconstruct only changed nodes.
+        # ``_snapshot`` always emits v2 records (with p_a / p_b); v1 records
+        # only ever reach _load_from_data (full rebuild path).  So here we
+        # compare on (origin, p_a, p_b) — the same invariant the live state
+        # carries.
         changed_splines: set[int] = set()
         for sid, sd in enumerate(data['splines']):
             current_nodes = self.splines[sid]
             for nid, nd in enumerate(sd['nodes']):
-                target_origin = np.array(nd['origin'], dtype=float)
-                target_tangent = np.array(nd['tangent'], dtype=float)
+                target_origin = np.asarray(nd['origin'], dtype=float)
                 seg = current_nodes[nid]
-                cur_tangent = (seg.local_v[0] * seg.u
-                               + seg.local_v[1] * seg.v) * seg.h_length
-                if (np.allclose(seg.origin, target_origin, atol=1e-12)
-                        and np.allclose(cur_tangent, target_tangent, atol=1e-12)):
-                    continue  # node unchanged
-                # Reconstruct this node's geometry in place
-                self._rebuild_node_inplace(seg, target_origin, target_tangent)
+                if not np.allclose(seg.origin, target_origin, atol=1e-12):
+                    self._rebuild_node_inplace(seg, nd)
+                    changed_splines.add(sid)
+                    continue
+
+                def _arr_or_none(v):
+                    return np.asarray(v, dtype=float) if v is not None else None
+
+                tgt_pa = _arr_or_none(nd.get('p_a'))
+                tgt_pb = _arr_or_none(nd.get('p_b'))
+                cur_pa = _arr_or_none(seg.p_a)
+                cur_pb = _arr_or_none(seg.p_b)
+
+                def _same(a, b):
+                    if a is None and b is None:
+                        return True
+                    if a is None or b is None:
+                        return False
+                    return np.allclose(a, b, atol=1e-12)
+
+                if _same(cur_pa, tgt_pa) and _same(cur_pb, tgt_pb):
+                    continue  # node geometry unchanged
+                self._rebuild_node_inplace(seg, nd)
                 changed_splines.add(sid)
 
         # Recompute spans only for splines with changed nodes
@@ -1830,13 +1872,35 @@ class GeodesicSplineApp(MidpointShooterApp):
         return np.array([1.0, 0.0, 0.0]), 0.01
 
     def _apply_record_to_node(self, seg: GeodesicSegment,
-                              origin: np.ndarray,
-                              tangent_full: np.ndarray) -> None:
-        """Repopulates *seg*'s geometry from the canonical (origin, tangent)
-        record.  Shared by ``_node_from_record`` (creation) and
-        ``_rebuild_node_inplace`` (in-place restore for undo/redo).
+                              record: dict) -> None:
+        """Repopulates *seg*'s geometry from a serialized node record.
+
+        Accepts either of two schemas:
+
+        **v2** (preferred, written by the current ``_on_save``):
+            ``{origin, p_a, p_b}`` — both handle endpoints as literal
+            3-D positions.  Reconstructed via the same solver call
+            (``compute_endpoint_from_origin``) the editor uses during
+            drag, so the geodesic between origin and each handle is
+            identical (down to float precision) to what the user saw
+            on screen at save time.  This is the only path that
+            preserves user edits exactly: with a single tangent vector
+            the solver-curving information is lost on round-trip.
+
+        **v1** (legacy, ``{origin, tangent}``):
+            ``tangent`` = direction × h_length.  Reconstructed via
+            ``compute_shoot`` (parallel-transport ray) ± tangent_dir.
+            Path_a is the symmetric ray of path_b.  This is what
+            broke for the user: a handle dragged via the solver to a
+            curved surface point landed ~0.2 units away on reload
+            because compute_shoot does not curve to a target point.
+
+        Schema dispatch is done by presence of ``'p_a'`` / ``'p_b'``
+        keys.  If both are present the v2 branch runs; otherwise we
+        fall back to ``'tangent'`` (v1).  Mixed schemas are rejected
+        upstream by ``_validate_session_dict``.
         """
-        tangent_dir, h_length = self._decompose_tangent(tangent_full)
+        origin = np.asarray(record['origin'], dtype=float)
         face_idx = self.geo.find_face(origin)
         normal, u, v = self._build_local_frame(origin, face_idx)
         seg.origin = origin
@@ -1844,33 +1908,105 @@ class GeodesicSplineApp(MidpointShooterApp):
         seg.normal = normal
         seg.u = u
         seg.v = v
+
+        if 'p_a' in record and 'p_b' in record:
+            self._apply_v2_handles(seg, origin, record)
+        else:
+            self._apply_v1_tangent(seg, origin, face_idx,
+                                   np.asarray(record['tangent'], dtype=float))
+
+        seg.update_local_v(self.geo)
+
+    def _apply_v2_handles(self, seg: GeodesicSegment, origin: np.ndarray,
+                          record: dict) -> None:
+        """v2 schema: rebuild path_a / path_b via the same solver
+        ``update_from_a`` / ``update_from_b`` use during drag.
+
+        ``compute_endpoint_from_origin`` requires an origin cache
+        (``prepare_origin``, ~2-5 ms) — the same one the drag handler
+        builds on first move and reuses for subsequent debounces.  We
+        only need it once per node here.
+
+        Each handle is independent: a None entry in the record yields
+        path=None / p=None for that side (used by single-node placeholder
+        splines).  If the solver fails for one side we log and degrade
+        to ``compute_shoot`` along the straight-line direction — better
+        than losing the node entirely.
+        """
+        p_a_rec = record.get('p_a')
+        p_b_rec = record.get('p_b')
+
+        # Origin cache for the solver — built once, reused for both handles.
+        try:
+            origin_cache = self.geo.prepare_origin(origin)
+        except (RuntimeError, ValueError, TypeError) as exc:
+            log.warning("v2 load: prepare_origin failed at %s (%s); falling back to v1 path",
+                        origin.tolist(), exc)
+            origin_cache = None
+
+        def _resolve_handle(p_rec):
+            if p_rec is None:
+                return None, None
+            p_target = np.asarray(p_rec, dtype=float)
+            if origin_cache is None:
+                return None, None
+            try:
+                path = self.geo.compute_endpoint_from_origin(origin_cache, p_target)
+            except (RuntimeError, ValueError, TypeError, IndexError) as exc:
+                log.debug("v2 load: solver failed for handle %s (%s); using straight line",
+                          p_target.tolist(), exc)
+                path = np.array([origin, p_target])
+            if path is None or len(path) < 2:
+                path = np.array([origin, p_target])
+            return path, path[-1]
+
+        seg.path_a, seg.p_a = _resolve_handle(p_a_rec)
+        seg.path_b, seg.p_b = _resolve_handle(p_b_rec)
+
+        # h_length: the editor maintains symmetric arc-length on path_a
+        # / path_b after every drag (_update_symmetric_ray ensures this).
+        # On reload pick whichever is available; if both, average so a
+        # tiny solver asymmetry doesn't bias one side.
+        lengths = []
+        for path in (seg.path_b, seg.path_a):
+            if path is not None and len(path) >= 2:
+                lengths.append(float(np.sum(
+                    np.linalg.norm(np.diff(path, axis=0), axis=1))))
+        seg.h_length = sum(lengths) / len(lengths) if lengths else 0.01
+
+    def _apply_v1_tangent(self, seg: GeodesicSegment, origin: np.ndarray,
+                          face_idx: int, tangent_full: np.ndarray) -> None:
+        """v1 schema: rebuild via compute_shoot ± tangent_dir.
+
+        Loses solver-curving information that may have been baked into
+        the editor state when the user dragged a handle on a curved
+        surface — that's the historical reason v2 was introduced.
+        Kept for backwards compatibility with sessions saved before
+        the format bump.
+        """
+        tangent_dir, h_length = self._decompose_tangent(tangent_full)
         seg.h_length = h_length
         seg.path_b = self.geo.compute_shoot(origin, tangent_dir, h_length, face_idx)
         seg.path_a = self.geo.compute_shoot(origin, -tangent_dir, h_length, face_idx)
         seg.p_b = seg.path_b[-1] if seg.path_b is not None else None
         seg.p_a = seg.path_a[-1] if seg.path_a is not None else None
-        seg.update_local_v(self.geo)
 
-    def _node_from_record(self, origin: np.ndarray,
-                          tangent_full: np.ndarray) -> GeodesicSegment:
-        """Creates a new ``GeodesicSegment`` from a saved (origin, tangent) record."""
+    def _node_from_record(self, record: dict) -> GeodesicSegment:
+        """Creates a new ``GeodesicSegment`` from a serialized node record (v1 or v2)."""
+        origin = np.asarray(record['origin'], dtype=float)
         face_idx = self.geo.find_face(origin)
         normal, u, v = self._build_local_frame(origin, face_idx)
         seg = GeodesicSegment(origin, face_idx, normal, u, v)
         seg.is_active = True
-        self._apply_record_to_node(seg, origin, tangent_full)
+        self._apply_record_to_node(seg, record)
         return seg
 
-    def _rebuild_node_inplace(self, seg: GeodesicSegment,
-                              origin: np.ndarray,
-                              tangent_full: np.ndarray) -> None:
-        """Reconstructs a single ``GeodesicSegment`` in place from the
-        canonical 2-field representation (origin + tangent-with-magnitude).
-
-        Used by the differential undo/redo path to avoid destroying/recreating
-        VTK actors for unchanged nodes.
+    def _rebuild_node_inplace(self, seg: GeodesicSegment, record: dict) -> None:
+        """Reconstructs a single ``GeodesicSegment`` in place from a
+        v1 or v2 serialized record.  Used by the differential undo/redo
+        path to avoid destroying/recreating VTK actors for unchanged nodes.
         """
-        self._apply_record_to_node(seg, origin, tangent_full)
+        self._apply_record_to_node(seg, record)
         seg.update_visuals(self.plotter)
 
     def _init_tangents(self, node: GeodesicSegment, direction: np.ndarray, length: float):
@@ -3497,11 +3633,30 @@ class GeodesicSplineApp(MidpointShooterApp):
         """Saves all splines to a timestamped JSON file (atomic, UTF-8).
 
         Format: ``yyyymmdd_HHMMSS.json`` in the current directory.
-        Each node stores only **2 fields** at full float64 precision:
 
-          - **origin** (x, y, z) -- 3-D position on the surface.
-          - **tangent** (dx, dy, dz) -- 3-D vector whose direction is the
-            shoot direction for path_b and whose magnitude is h_length.
+        **v2 schema** (current).  Each node persists three 3-D points:
+
+          - ``origin`` -- node position on the surface.
+          - ``p_a``    -- handle A endpoint (or ``null`` if not yet set).
+          - ``p_b``    -- handle B endpoint (or ``null`` if not yet set).
+
+        Why these three and not the v1 ``(origin, tangent)`` layout?
+        When the user drags a handle the editor calls
+        ``compute_endpoint_from_origin`` (the EdgeFlipGeodesicSolver
+        path), which curves to land **exactly** on the dragged
+        position.  v1 stored only direction × magnitude, and on reload
+        rebuilt the path with ``compute_shoot`` (a parallel-transport
+        ray that goes straight in the requested direction).  On
+        curved surfaces the ray cannot reproduce the solver's
+        curving, so handles drifted ~0.1-0.2 units away from the user's
+        choice on every save / load cycle.  Storing ``p_a`` / ``p_b``
+        literally and reloading with the same solver call guarantees a
+        bit-for-bit round-trip (within the solver's deterministic
+        precision).
+
+        Backward compatibility: v1 sessions (with ``tangent``) still
+        load via the legacy branch in ``_apply_record_to_node``; new
+        saves are always v2.
 
         Atomicity: the JSON is first written to ``<name>.tmp`` and then
         ``os.replace``-d into place.  A crash mid-write therefore leaves
@@ -3510,7 +3665,7 @@ class GeodesicSplineApp(MidpointShooterApp):
         reported on the HUD instead of being silently swallowed.
         """
         data = {
-            'version': 1,
+            'version': 2,
             'mesh_file': self.mesh_label,
             'splines': [],
         }
@@ -3520,12 +3675,10 @@ class GeodesicSplineApp(MidpointShooterApp):
                 'nodes': [],
             }
             for node in nodes:
-                # 3D tangent with magnitude = shoot direction * h_length
-                tangent_3d = (node.local_v[0] * node.u
-                              + node.local_v[1] * node.v) * node.h_length
                 spline_data['nodes'].append({
                     'origin': node.origin.tolist(),
-                    'tangent': tangent_3d.tolist(),
+                    'p_a': node.p_a.tolist() if node.p_a is not None else None,
+                    'p_b': node.p_b.tolist() if node.p_b is not None else None,
                 })
             data['splines'].append(spline_data)
 
@@ -3609,7 +3762,7 @@ class GeodesicSplineApp(MidpointShooterApp):
             return
 
         version = data.get('version')
-        if version != 1:
+        if version not in (1, 2):
             log.error("unknown JSON version: %s", version)
             self._set_hud(_t("load_failed_version"), 'red', sticky_seconds=4.0)
             self.plotter.render()
@@ -3679,9 +3832,10 @@ class GeodesicSplineApp(MidpointShooterApp):
         for spline_data in data['splines']:
             nodes: list[GeodesicSegment] = []
             for nd in spline_data['nodes']:
-                origin = np.array(nd['origin'], dtype=float)
-                tangent_full = np.array(nd['tangent'], dtype=float)
-                seg = self._node_from_record(origin, tangent_full)
+                # ``nd`` is either a v1 ({origin, tangent}) or v2
+                # ({origin, p_a, p_b}) record — _node_from_record dispatches
+                # on the keys present.
+                seg = self._node_from_record(nd)
                 nodes.append(seg)
                 self.segments.append(seg)
                 seg.update_visuals(self.plotter)
@@ -3909,7 +4063,7 @@ def _cli_main() -> None:
         if json_path is not None:
             with open(json_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            if data.get('version') != 1:
+            if data.get('version') not in (1, 2):
                 log.error("unknown JSON version: %s", data.get('version'))
             else:
                 try:
