@@ -113,8 +113,18 @@ def _read_mesh_VF(mesh_file: str) -> tuple[np.ndarray, np.ndarray]:
 def rebuild_mesh_and_nodes(data: dict):
     """Rebuilds GeodesicMesh and node data from JSON.
 
-    Each node is reconstructed from 2 saved fields: ``origin`` (3-D
-    position) and ``tangent`` (3-D vector whose magnitude is h_length).
+    Two schemas are accepted, dispatched per-node by which keys are
+    present (matches ``geo_splines._apply_record_to_node``):
+
+      • **v2** (preferred): ``{origin, p_a, p_b}`` — handle endpoints
+        as literal 3-D positions.  Reconstructed via the same
+        ``compute_endpoint_from_origin`` (EdgeFlipGeodesicSolver) call
+        the editor uses during drag, so the geodesic on reload is
+        identical to what the user saw on screen at save time.
+      • **v1** (legacy): ``{origin, tangent}`` — direction × h_length.
+        Reconstructed via ``compute_shoot`` ± tangent_dir; loses
+        solver-curving information on curved surfaces (this is the
+        bug v2 was introduced to fix).
 
     Returns ``(geo, splines, splines_closed)`` where *splines* is a list
     of lists of dicts with 'origin', 'face_idx', 'p_a', 'p_b', 'path_a',
@@ -138,26 +148,68 @@ def rebuild_mesh_and_nodes(data: dict):
         V, F = _read_mesh_VF(mesh_file)
     geo = GeodesicMesh(V, F)
 
+    def _build_node_v2(nd, origin):
+        """v2 schema: handles persisted as literal 3-D positions.
+
+        face_idx isn't needed here — ``compute_endpoint_from_origin``
+        works off the origin_cache (the solver's own per-origin
+        topology insertion), not a starting face index.
+        """
+        p_a_rec = nd.get('p_a')
+        p_b_rec = nd.get('p_b')
+        try:
+            cache = geo.prepare_origin(origin)
+        except (RuntimeError, ValueError, TypeError) as exc:
+            log.warning("v2 load: prepare_origin failed at %s (%s); "
+                        "node will have null paths", origin.tolist(), exc)
+            cache = None
+
+        def _resolve(p_rec):
+            if p_rec is None or cache is None:
+                return None, None
+            p_target = np.asarray(p_rec, dtype=float)
+            try:
+                path = geo.compute_endpoint_from_origin(cache, p_target)
+            except (RuntimeError, ValueError, TypeError, IndexError) as exc:
+                log.debug("v2 load: solver failed for handle %s (%s)",
+                          p_target.tolist(), exc)
+                path = np.array([origin, p_target])
+            if path is None or len(path) < 2:
+                path = np.array([origin, p_target])
+            return path, path[-1]
+
+        path_a, p_a = _resolve(p_a_rec)
+        path_b, p_b = _resolve(p_b_rec)
+        return path_a, path_b, p_a, p_b
+
+    def _build_node_v1(nd, origin, face_idx):
+        """v1 schema: tangent vector → compute_shoot ± direction."""
+        tangent_full = np.array(nd['tangent'], dtype=float)
+        h_length = float(np.linalg.norm(tangent_full))
+        if h_length > 1e-15:
+            tangent_dir = tangent_full / h_length
+        else:
+            tangent_dir = np.array([1.0, 0.0, 0.0])
+            h_length = 0.01
+        path_b = geo.compute_shoot(origin, tangent_dir, h_length, face_idx)
+        path_a = geo.compute_shoot(origin, -tangent_dir, h_length, face_idx)
+        p_b = path_b[-1] if path_b is not None else None
+        p_a = path_a[-1] if path_a is not None else None
+        return path_a, path_b, p_a, p_b
+
     splines = []
     splines_closed = []
     for sd in data['splines']:
         nodes = []
         for nd in sd['nodes']:
             origin = np.array(nd['origin'], dtype=float)
-            tangent_full = np.array(nd['tangent'], dtype=float)
-
-            h_length = float(np.linalg.norm(tangent_full))
-            if h_length > 1e-15:
-                tangent_dir = tangent_full / h_length
-            else:
-                tangent_dir = np.array([1.0, 0.0, 0.0])
-                h_length = 0.01
-
             face_idx = geo.find_face(origin)
-            path_b = geo.compute_shoot(origin, tangent_dir, h_length, face_idx)
-            path_a = geo.compute_shoot(origin, -tangent_dir, h_length, face_idx)
-            p_b = path_b[-1] if path_b is not None else None
-            p_a = path_a[-1] if path_a is not None else None
+            # Per-node schema dispatch — same logic as the editor's
+            # _apply_record_to_node.
+            if 'p_a' in nd and 'p_b' in nd:
+                path_a, path_b, p_a, p_b = _build_node_v2(nd, origin)
+            else:
+                path_a, path_b, p_a, p_b = _build_node_v1(nd, origin, face_idx)
 
             nodes.append({
                 'origin': origin, 'face_idx': face_idx,
