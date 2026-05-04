@@ -36,6 +36,7 @@ import logging
 import multiprocessing as mp
 import multiprocessing.shared_memory as _shm
 import os
+import signal
 import sys
 import tempfile
 import weakref
@@ -353,7 +354,27 @@ def _process_initializer(v_shm_name: str, v_shape: tuple, v_dtype: str,
     level: workers stay quiet on normal operation, but real failures
     surface to stderr with module + level prefixes that the parent can
     distinguish from the line noise.
+
+    SIGINT handling
+    ---------------
+    Workers ignore ``SIGINT``.  On Ctrl+C the OS sends SIGINT to the
+    parent **and** every child in the process group.  Without this
+    guard each worker would interrupt its in-flight scipy / Intel-MKL
+    Fortran call and the runtime would dump
+    ``forrtl: error (200): program interrupted`` to stderr — four
+    workers writing concurrently produced the unreadable stack-trace
+    soup the user reported.  Ignoring SIGINT in the children leaves
+    the parent's ``KeyboardInterrupt`` handler the sole graceful-exit
+    path: it calls ``_work_mgr.shutdown()`` which uses
+    ``executor.shutdown(cancel_futures=True)`` →
+    ``TerminateProcess`` on Windows, killing the children at the OS
+    level before any Fortran cleanup can run.
     """
+    # Block SIGINT before anything else — the import of scipy / pp3d
+    # below already pulls in MKL, and we want the SIGINT mask in place
+    # before any Fortran call starts.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
     # Install a stderr logger at WARNING level on the worker side.
     # Child sees its own copy of `log` after spawn; reset handlers so
     # the parent's stderr handler does not leak in via fork on POSIX.

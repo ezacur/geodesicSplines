@@ -260,6 +260,26 @@ def compute_blue(geo, nodes, closed, n_samples):
     return all_pts
 
 
+def _orange_worker_init() -> None:
+    """ProcessPoolExecutor initializer: blocks SIGINT in worker children.
+
+    On Ctrl+C the OS sends SIGINT to the parent and every child in the
+    process group.  Without this guard, each worker would interrupt
+    its in-flight scipy / Intel-MKL Fortran call and the runtime would
+    dump ``forrtl: error (200): program interrupted`` to stderr — with
+    several workers writing concurrently the output became unreadable.
+
+    Ignoring SIGINT in the children leaves the parent's
+    ``KeyboardInterrupt`` handler the sole graceful-exit path:
+    ``with ProcessPoolExecutor() as executor`` triggers
+    ``executor.shutdown(wait=True)`` on context exit, which kills the
+    children at the OS level (``TerminateProcess`` on Windows) without
+    giving Fortran cleanup a chance to run.
+    """
+    import signal as _signal
+    _signal.signal(_signal.SIGINT, _signal.SIG_IGN)
+
+
 def _orange_span_worker(task_data):
     """Worker function to compute a single orange span in a separate process.
 
@@ -412,7 +432,7 @@ def compute_orange(geo, nodes, closed, n_samples, adaptive: bool = True):
     valid_task_indices = [i for i, t in enumerate(tasks) if t is not None]
     valid_tasks = [tasks[i] for i in valid_task_indices]
 
-    with ProcessPoolExecutor() as executor:
+    with ProcessPoolExecutor(initializer=_orange_worker_init) as executor:
         results = list(executor.map(_orange_span_worker, valid_tasks))
 
     # Post-process: same secant chord subdivision the editor applies in
