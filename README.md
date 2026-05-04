@@ -164,6 +164,7 @@ classDiagram
 | r | Rebuild all orange (fully geodesic) curves -- handy after layer toggles, loads, or worker crashes |
 | s | Save splines to timestamped JSON (atomic UTF-8 write) |
 | l | Load splines from JSON (file dialog; schema-validated) |
+| v | Export orange curve to timestamped binary `.vtk` (same output as `spline_export.py --vtk --samples N` with `N = SplineConfig.EXPORT_VTK_SAMPLES`; reuses live cache when `EXPORT_VTK_SAMPLES == GEO_SAMPLES`, otherwise recomputes).  Single-node splines are written as `VTK_VERTEX` landmarks. |
 | e | Export geodesic paths to TXT |
 | w | Toggle wireframe overlay |
 | a | Cycle surface transparency |

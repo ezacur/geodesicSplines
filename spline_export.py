@@ -493,52 +493,82 @@ def write_obj(path, spline_points_list):
             v_offset += len(all_points)
 
 
-def write_vtk(path, spline_points_list):
-    """Writes curve points as a legacy BINARY VTK UnstructuredGrid file."""
+def write_vtk(path, spline_points_list, landmarks=None):
+    """Writes curve points + optional landmarks as a legacy BINARY VTK
+    UnstructuredGrid file.
+
+    *spline_points_list*: list of splines, each a list of (M, 3) span
+    polylines.  Each span is written as M-1 ``VTK_LINE`` (cell type 3)
+    segments.
+
+    *landmarks*: optional list of (3,) points written as ``VTK_VERTEX``
+    (cell type 1) cells — one per landmark.  Used by the editor's 'v'
+    export for splines that have only a single node (interpreted as a
+    user-marked point rather than a curve).  Pre-existing CLI callers
+    that pass only ``spline_points_list`` keep their previous behaviour
+    (no vertex cells written).
+
+    Mixed cell types are valid in legacy VTK UnstructuredGrid; ParaView
+    and other VTK consumers handle the combination natively.
+    """
     import numpy as np
     all_points = []
-    segments = []
-    
+    line_segments: list[tuple[int, int]] = []
+    vertex_cells: list[int] = []
+
     # Flatten spans into individual line segments
     for spans in spline_points_list:
         for span in spans:
             if span is not None and len(span) >= 2:
                 v_offset = len(all_points)
                 all_points.extend(span)
-                # Each span is a polyline, but we export as individual segments
                 for i in range(len(span) - 1):
-                    segments.append((v_offset + i, v_offset + i + 1))
-    
+                    line_segments.append((v_offset + i, v_offset + i + 1))
+
+    # Append landmark points as VTK_VERTEX cells
+    if landmarks:
+        for lm in landmarks:
+            v_offset = len(all_points)
+            all_points.append(np.asarray(lm, dtype=float))
+            vertex_cells.append(v_offset)
+
     if not all_points:
         return
-        
+
+    n_lines = len(line_segments)
+    n_verts = len(vertex_cells)
+    n_cells = n_lines + n_verts
+
     with open(path, 'wb') as f:
         # Header (ASCII part)
         f.write(b"# vtk DataFile Version 3.0\n")
         f.write(b"Geodesic Splines Export\n")
         f.write(b"BINARY\n")
         f.write(b"DATASET UNSTRUCTURED_GRID\n\n")
-        
+
         # Points (Binary Big-Endian)
         f.write(f"POINTS {len(all_points)} double\n".encode('ascii'))
         pts_bin = np.array(all_points, dtype='>f8').tobytes()
         f.write(pts_bin)
         f.write(b"\n")
-            
-        # Cells: N_cells, Total_ints (N_cells * 3 for 2-point lines)
-        n_cells = len(segments)
-        cells_data = []
-        for s in segments:
-            cells_data.extend([2, s[0], s[1]])
-        
+
+        # CELLS section: each cell is laid out as [n_pts, p0, p1, ...].
+        # Lines contribute [2, a, b], vertices contribute [1, p].
+        cells_data: list[int] = []
+        for a, b in line_segments:
+            cells_data.extend([2, a, b])
+        for p in vertex_cells:
+            cells_data.extend([1, p])
+
         f.write(f"CELLS {n_cells} {len(cells_data)}\n".encode('ascii'))
         cells_bin = np.array(cells_data, dtype='>i4').tobytes()
         f.write(cells_bin)
         f.write(b"\n")
-            
-        # Cell Types: 3 is VTK_LINE
+
+        # CELL_TYPES: VTK_LINE = 3, VTK_VERTEX = 1.
         f.write(f"CELL_TYPES {n_cells}\n".encode('ascii'))
-        types_bin = np.array([3] * n_cells, dtype='>i4').tobytes()
+        types_bin = np.array(
+            [3] * n_lines + [1] * n_verts, dtype='>i4').tobytes()
         f.write(types_bin)
         f.write(b"\n")
 

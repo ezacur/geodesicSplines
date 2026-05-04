@@ -455,6 +455,13 @@ class SplineConfig:
     # a solid-curve-with-dimmer-color look.
     GEO_DASHED_WHILE_COMPUTING: bool = True
 
+    # Sample count for the per-key 'v' VTK export (``_on_export_vtk``).
+    # Mirrors the ``--samples`` flag of ``spline_export.py`` — using the
+    # same value here is the parity contract.  If this matches
+    # ``GEO_SAMPLES`` and no orange workers are still active, the live
+    # cache is reused to skip recomputation.
+    EXPORT_VTK_SAMPLES: int = 20
+
     # Interpolation curve (scipy B-spline through nodes, projected to surface).
     # Uses tighter secant subdivision than Bézier layers because the 3D
     # B-spline has no geodesic awareness and can deviate further from the
@@ -1512,6 +1519,7 @@ class GeodesicSplineApp(MidpointShooterApp):
         self.plotter.add_key_event('l', self._on_load)
         self.plotter.add_key_event('t', self._cycle_gizmo_opacity)
         self.plotter.add_key_event('r', self._rebuild_all_orange)
+        self.plotter.add_key_event('v', self._on_export_vtk)
         self.plotter.iren.interactor.AddObserver(
             vtk.vtkCommand.RightButtonPressEvent, self._on_right_press, 1.0)
         # Ctrl+Z / Ctrl+Y — raw VTK observer (PyVista add_key_event
@@ -1533,6 +1541,7 @@ class GeodesicSplineApp(MidpointShooterApp):
         print("  r           : Rebuild orange (all splines)")
         print("  s           : Save splines to JSON")
         print("  l           : Load splines from JSON")
+        print("  v           : Export orange curve to .vtk")
         print("  Ctrl+Z      : Undo     Ctrl+Y      : Redo")
         print("=" * 48 + "\n")
 
@@ -1550,6 +1559,7 @@ class GeodesicSplineApp(MidpointShooterApp):
         "  r           : Rebuild orange\n"
         "  s           : Save JSON\n"
         "  l           : Load JSON\n"
+        "  v           : Export orange .vtk\n"
         "  e           : Export paths\n"
         "  w           : Wireframe\n"
         "  a           : Surface opacity"
@@ -3724,6 +3734,178 @@ class GeodesicSplineApp(MidpointShooterApp):
                 pass
             tmp_path = tmp.name
         os.replace(tmp_path, fname)
+
+    # --- VTK export (key 'v') ---
+
+    def _on_export_vtk(self) -> None:
+        """Press 'v': export the orange (fully-geodesic) curve to a binary
+        legacy ``.vtk`` file (UnstructuredGrid).
+
+        Filename follows the same ``yyyymmdd_HHMMSS`` pattern as JSON
+        save, with ``.vtk`` extension, written to the current working
+        directory.  Functionally equivalent to running::
+
+            python spline_export.py session.json --vtk \\
+                --samples ${EXPORT_VTK_SAMPLES}
+
+        with the same ``LL.vtk`` mesh — the contract is bit-for-bit
+        parity with the CLI tool when both use the same sample count.
+
+        Reuse vs recompute
+        ------------------
+        If ``EXPORT_VTK_SAMPLES == GEO_SAMPLES`` AND the live orange
+        cache contains polylines for every span (no orange workers
+        still active), the live polylines are reused — they are
+        already secant-subdivided and identical to what
+        ``compute_orange`` would produce.  Otherwise the export
+        recomputes via a fresh ``ProcessPoolExecutor`` inside
+        ``spline_export.compute_orange``.
+
+        Per-spline semantics:
+          * 0 nodes → skipped (placeholder break).
+          * 1 node  → exported as a ``VTK_VERTEX`` landmark cell at the
+                       node's origin (user-marked point).
+          * ≥2 nodes → orange de Casteljau samples for each span,
+                       written as ``VTK_LINE`` segments.
+
+        Blocking: this runs synchronously on the main thread.  On
+        large meshes the recompute can take 30-90 seconds; the HUD
+        shows ``EXPORTING VTK ...`` before the work begins so the
+        editor doesn't appear hung.
+        """
+        # spline_export imports lazily — keeps geo_splines start-up
+        # path clean for users who never press 'v'.
+        from spline_export import compute_orange, write_vtk
+
+        fname = datetime.now().strftime('%Y%m%d_%H%M%S') + '.vtk'
+        n_splines = len(self.splines)
+        # Sticky long enough that the message survives any render
+        # batching during the blocking compute.  10 minutes is a generous
+        # ceiling — the next HUD update on completion supersedes it.
+        self._set_hud(
+            f"EXPORTING VTK ({n_splines} splines)...",
+            'orange', sticky_seconds=600.0)
+        self.plotter.render()  # paint the HUD before we block
+
+        n_samples = self.scfg.EXPORT_VTK_SAMPLES
+        # Reuse-from-cache is safe iff (a) the live cache was built
+        # with the same sample count, and (b) no workers are still
+        # producing data.  Active workers may have populated some
+        # spans but not others; rather than mix sources we just
+        # recompute when any worker is in flight.
+        can_reuse_live = (
+            n_samples == self.scfg.GEO_SAMPLES
+            and not self._work_mgr.active_spans
+        )
+
+        try:
+            spline_points_list, landmarks = self._gather_vtk_export_data(
+                n_samples, can_reuse_live)
+            write_vtk(fname, spline_points_list, landmarks=landmarks)
+        except (OSError, RuntimeError, ValueError) as exc:
+            log.error("vtk export failed: %s", exc)
+            self._set_hud(
+                f"VTK EXPORT FAILED: {exc}",
+                'red', sticky_seconds=4.0)
+            self.plotter.render()
+            return
+
+        n_spans = sum(len(s) for s in spline_points_list)
+        n_lm = len(landmarks)
+        self._set_hud(
+            f"VTK EXPORTED -> {fname} ({n_spans} spans, {n_lm} landmarks)",
+            'lime', sticky_seconds=4.0)
+        log.info("vtk export: %d spans + %d landmarks -> %s",
+                 n_spans, n_lm, fname)
+        self.plotter.render()
+
+    def _gather_vtk_export_data(self, n_samples: int, can_reuse_live: bool
+                                ) -> tuple[list[list[np.ndarray]], list[np.ndarray]]:
+        """Builds the (spline_points_list, landmarks) tuple that
+        ``write_vtk`` consumes.
+
+        Iterates ``self.splines`` and dispatches by node count:
+          * 0 → empty list (placeholder, contributes nothing).
+          * 1 → landmark; the inner spans list is empty.
+          * ≥2 → orange spans, either pulled from
+                 ``self._geo_span_cache`` (when ``can_reuse_live``) or
+                 recomputed via ``spline_export.compute_orange``.
+
+        ``compute_orange`` expects each node as a dict with the keys
+        ``origin`` / ``face_idx`` / ``p_a`` / ``p_b`` / ``path_a`` /
+        ``path_b`` — the same shape ``rebuild_mesh_and_nodes`` produces
+        from a JSON.  We synthesize that view from each
+        ``GeodesicSegment`` on the fly without copying the path arrays.
+        """
+        from spline_export import compute_orange  # local import (see _on_export_vtk)
+
+        spline_points_list: list[list[np.ndarray]] = []
+        landmarks: list[np.ndarray] = []
+
+        for sid, nodes in enumerate(self.splines):
+            n_nodes = len(nodes)
+            if n_nodes == 0:
+                spline_points_list.append([])
+                continue
+            if n_nodes == 1:
+                landmarks.append(np.asarray(nodes[0].origin, dtype=float))
+                spline_points_list.append([])
+                continue
+
+            closed = self.splines_closed[sid]
+            spans = self._collect_orange_spans_for_export(
+                sid, nodes, closed, n_samples, can_reuse_live, compute_orange)
+            spline_points_list.append(spans)
+
+        return spline_points_list, landmarks
+
+    def _collect_orange_spans_for_export(
+            self, sid: int, nodes: list[GeodesicSegment], closed: bool,
+            n_samples: int, can_reuse_live: bool, compute_orange) -> list[np.ndarray]:
+        """Returns the list of ``(M, 3)`` polyline arrays for spline *sid*'s
+        orange spans, either reusing live cache data or recomputing.
+
+        The reuse path requires every span of the spline to be already
+        rendered (cache hit + ≥2 points).  If even one span is missing
+        we fall through to the recompute branch — mixing partial live
+        data with a fresh recompute would risk inconsistent secant
+        subdivisions across span boundaries.
+        """
+        n_spans = len(nodes) if closed else len(nodes) - 1
+        if n_spans == 0:
+            return []
+
+        if can_reuse_live:
+            cached_spans: list[np.ndarray] = []
+            all_present = True
+            for i in range(n_spans):
+                entry = self._geo_span_cache.get((sid, i))
+                if entry is None:
+                    all_present = False
+                    break
+                pts = np.asarray(entry[0].points, dtype=float)
+                if len(pts) < 2:
+                    all_present = False
+                    break
+                cached_spans.append(pts)
+            if all_present:
+                return cached_spans
+            log.debug("vtk export: live cache incomplete for spline %d, "
+                      "recomputing", sid)
+
+        # Recompute path.  Synthesize the per-node dict layout
+        # ``compute_orange`` expects (matches rebuild_mesh_and_nodes).
+        nodes_dict = [
+            {
+                'origin': n.origin,
+                'face_idx': n.face_idx,
+                'p_a': n.p_a, 'p_b': n.p_b,
+                'path_a': n.path_a, 'path_b': n.path_b,
+            }
+            for n in nodes
+        ]
+        return compute_orange(self.geo, nodes_dict, closed, n_samples,
+                              adaptive=self.scfg.ADAPTIVE_SAMPLING)
 
     def _on_load(self) -> None:
         """Loads splines from a JSON file, replacing all current splines.
