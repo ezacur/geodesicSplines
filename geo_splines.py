@@ -136,41 +136,14 @@ DEFAULT_MESH_FILENAME: str = "fandisk.obj"
 
 
 # ---------------------------------------------------------------
-# i18n / HUD strings
+# HUD strings
 # ---------------------------------------------------------------
-# All HUD messages and CLI prints route through ``_t(key, **kw)``.
-# Selecting a different locale is a single dict swap; the current
-# language is read from ``GEO_SPLINES_LANG`` (defaults to ``es``).
-_HUD_TEXTS_ES: dict[str, str] = {
-    "ready": "LISTO",
-    "dragging": "ARRASTRANDO {marker}",
-    "snap_vertex": "AJUSTE -> vertice {idx}",
-    "snap_edge": "AJUSTE -> arista {va}-{vb} t={t:.2f}",
-    "refined_exact": "REFINADO (EXACTO)",
-    "node_inserted": "NODO INSERTADO",
-    "node_inserted_interp": "NODO INSERTADO (INTERP)",
-    "loop_closed_break": "BUCLE CERRADO + CORTE",
-    "loop_opened": "BUCLE ABIERTO",
-    "break_removed": "CORTE ELIMINADO",
-    "new_spline_started": "NUEVA SPLINE INICIADA",
-    "nothing_to_undo": "NADA QUE DESHACER",
-    "nothing_to_redo": "NADA QUE REHACER",
-    "undo": "DESHACER",
-    "redo": "REHACER",
-    "saved": "GUARDADO {n} nodos -> {fname}",
-    "save_failed": "ERROR AL GUARDAR: {err}",
-    "loaded": "CARGADO {n} nodos desde {fname}",
-    "load_failed": "ERROR AL CARGAR",
-    "load_failed_version": "ERROR AL CARGAR: version desconocida",
-    "load_failed_format": "ERROR AL CARGAR: formato invalido",
-    "computing_orange": "CALCULANDO NARANJA {done}/{total}",
-    "orange_done": "NARANJA LISTO",
-    "orange_rebuilt": "NARANJA RECALCULADO",
-    "geodesic_fallback": "GEODESICA APROXIMADA span {sid}:{i}",
-    "gizmo_opacity": "OPACIDAD GIZMO {pct}",
-}
-
-_HUD_TEXTS_EN: dict[str, str] = {
+# Centralised string table for HUD messages.  All call sites resolve
+# through ``_t(key, **kw)`` so the wording lives in exactly one place.
+# A previous version of this module shipped a parallel Spanish table
+# selected by ``GEO_SPLINES_LANG``; the project is English-only now,
+# so the i18n dispatch (and its env var) was removed.
+_HUD_TEXTS: dict[str, str] = {
     "ready": "READY",
     "dragging": "DRAGGING {marker}",
     "snap_vertex": "SNAP -> vertex {idx}",
@@ -199,13 +172,16 @@ _HUD_TEXTS_EN: dict[str, str] = {
     "gizmo_opacity": "GIZMO OPACITY {pct}",
 }
 
-_LANG = os.environ.get("GEO_SPLINES_LANG", "es").lower()
-_HUD_TEXTS = _HUD_TEXTS_ES if _LANG.startswith("es") else _HUD_TEXTS_EN
-
 
 def _t(key: str, **kwargs) -> str:
-    """Resolves a HUD string by key with optional ``str.format`` kwargs."""
-    template = _HUD_TEXTS.get(key) or _HUD_TEXTS_EN.get(key) or key
+    """Resolves a HUD string by key with optional ``str.format`` kwargs.
+
+    Returns the template unchanged if ``kwargs`` is empty.  Falls back
+    to the bare key (rather than crashing) when a format placeholder
+    is missing from the supplied kwargs — useful so a typo in the
+    caller doesn't break the HUD update.
+    """
+    template = _HUD_TEXTS.get(key, key)
     if not kwargs:
         return template
     try:
@@ -1219,6 +1195,93 @@ class GeodesicSplineApp(MidpointShooterApp):
         self._snap_indicator_actor.SetVisibility(False)
         self._snap_indicator_buf = np.empty((1, 3), dtype=float)
 
+        # Coordinate-edit preview — shown live while the right-double-
+        # click coordinate dialog is open and the typed input parses
+        # successfully.  Three actors form the preview group:
+        #
+        #   * ``_coord_preview_actor``        — sphere on the surface,
+        #     darker grey, slightly larger.  Marks where the node will
+        #     actually land (the projected point).
+        #   * ``_coord_preview_input_actor``  — sphere at the literal
+        #     typed coordinate, lighter grey, slightly smaller.  Often
+        #     floats above the surface; visually communicates the
+        #     "before projection" position.
+        #   * ``_coord_preview_line_actor``   — thin grey line between
+        #     the two spheres.  Its length is the projection distance
+        #     and gives the user instant feedback on how far off-
+        #     surface their typed point is.
+        #
+        # All three share the same visibility — toggled together by
+        # ``_update_coord_preview`` / ``_hide_coord_preview``.  Depth
+        # priority is in front of every other layer (CURVE_HOVER - 2)
+        # so the preview is visible even on top of the orange curve.
+        self._coord_preview_pd = pv.PolyData(np.zeros((1, 3)))
+        self._coord_preview_actor = self.plotter.add_mesh(
+            self._coord_preview_pd, color='#888888', point_size=11,
+            render_points_as_spheres=True, lighting=False, pickable=False,
+            name="coord_preview")
+        self._set_depth_priority(self._coord_preview_actor,
+                                 self.scfg.DEPTH_CURVE_HOVER - 2)
+        self._coord_preview_actor.SetVisibility(False)
+        self._coord_preview_buf = np.empty((1, 3), dtype=float)
+
+        self._coord_preview_input_pd = pv.PolyData(np.zeros((1, 3)))
+        self._coord_preview_input_actor = self.plotter.add_mesh(
+            self._coord_preview_input_pd, color='#bbbbbb', point_size=8,
+            render_points_as_spheres=True, lighting=False, pickable=False,
+            name="coord_preview_input")
+        self._set_depth_priority(self._coord_preview_input_actor,
+                                 self.scfg.DEPTH_CURVE_HOVER - 2)
+        self._coord_preview_input_actor.SetVisibility(False)
+        self._coord_preview_input_buf = np.empty((1, 3), dtype=float)
+
+        self._coord_preview_line_pd = pv.PolyData()
+        self._coord_preview_line_actor = self.plotter.add_mesh(
+            self._coord_preview_line_pd, color='#888888', line_width=1,
+            lighting=False, pickable=False, name="coord_preview_line")
+        self._set_depth_priority(self._coord_preview_line_actor,
+                                 self.scfg.DEPTH_CURVE_HOVER - 2)
+        self._coord_preview_line_actor.SetVisibility(False)
+
+        # --- Didactic visualization (key 'd') ---
+        # Toggleable preview of the de Casteljau scaffold for the LAST
+        # span of the active spline at t=0.5.  Four geodesic auxiliary
+        # lines, all at the same gray + the global handle opacity (the
+        # one cycled with 't'):
+        #
+        #   index 0: path_12      H_out  -> H_in    (level 1 middle)
+        #   index 1: path_c0      b01    -> b12     (level 2 first)
+        #   index 2: path_c1      b12    -> b23     (level 2 second)
+        #   index 3: path_final   c0     -> c1      (level 3, collapses
+        #                                           to the orange curve
+        #                                           sample at t=0.5)
+        #
+        # On-demand semantics: while invisible the actors stay empty
+        # and ``_compute_didactic`` is not called.  Toggle ON triggers
+        # a fresh compute (~75-125 ms; four ``compute_endpoint_local``
+        # calls).  Drag flips ``_didactic_dirty=True`` and hides the
+        # actors so per-frame cost stays zero.  Consolidation
+        # (``_recompute_spans`` with ``is_dragging=False``) recomputes
+        # if dirty.
+        self._didactic_visible: bool = False
+        self._didactic_dirty: bool = True
+        import gizmo as _gizmo_mod  # local alias for opacity read-back
+        self._didactic_pds: list[pv.PolyData] = []
+        self._didactic_actors: list[vtk.vtkActor] = []
+        for _i in range(4):
+            pd = pv.PolyData()
+            actor = self.plotter.add_mesh(
+                pd, color='#2d6b3a', line_width=1.5,
+                opacity=_gizmo_mod.GIZMO_OPACITY,
+                lighting=False, pickable=False,
+                name=f"didactic_line_{_i}")
+            # In front of the orange curve so the scaffold reads
+            # cleanly on top of the final spline.
+            self._set_depth_priority(actor, self.scfg.DEPTH_ORANGE - 4)
+            actor.SetVisibility(False)
+            self._didactic_pds.append(pd)
+            self._didactic_actors.append(actor)
+
         # --- Hover-curve cache ---
         # ``_collect_visible_curves`` packs every visible polyline into
         # a single (N, 3) buffer for batched screen projection.  Hover
@@ -1397,10 +1460,11 @@ class GeodesicSplineApp(MidpointShooterApp):
 
     def _cycle_gizmo_opacity(self) -> None:
         """Cycles the opacity of all auxiliary visuals (nodes, tangent lines,
-        handle arrows, stitch preview) through 0.2 → 0.4 → 0.7 → 1.0 → 0.2.
+        handle arrows, stitch preview, didactic scaffold) through
+        0.2 → 0.4 → 0.7 → 1.0 → 0.2.
 
         Modifies the module-level ``gizmo.GIZMO_OPACITY`` and refreshes
-        all segment visuals to apply the new value.
+        every actor that reads from it.
         """
         import gizmo
         ticks = [0.2, 0.4, 0.7, 1.0]
@@ -1413,6 +1477,10 @@ class GeodesicSplineApp(MidpointShooterApp):
         # Update stitch preview if visible
         if self._stitch_actor.GetVisibility():
             self._stitch_actor.GetProperty().SetOpacity(nxt)
+        # Update didactic scaffold opacity (lines stay fixed-gray; the
+        # only thing that tracks the gizmo opacity is the alpha).
+        for actor in self._didactic_actors:
+            actor.GetProperty().SetOpacity(nxt)
         self._set_hud(_t("gizmo_opacity", pct=f"{nxt:.0%}"), 'white')
         self.plotter.render()
 
@@ -1490,8 +1558,20 @@ class GeodesicSplineApp(MidpointShooterApp):
             q, cid = self.state.last_drag_q, self.state.last_drag_cid
             seg.is_preview = False
 
+            # Shift+drag of A/B = magnitude-only mode (same dispatch as
+            # the live-preview path in geo_shoot._on_move).  ``exact=True``
+            # would normally route through ``compute_endpoint_from_origin``
+            # to land precisely on the cursor, but for magnitude mode we
+            # use ``compute_shoot`` (a directional ray for a target
+            # arc-length) — the right primitive when the input is "scrub
+            # along this fixed axis".
+            shift_held = bool(
+                self.plotter.iren.interactor.GetShiftKey())
             if self.state.drag_marker == 'p':
                 seg.update_from_p(q, cid, self.geo, exact=True)
+            elif self.state.drag_marker in ('a', 'b') and shift_held:
+                seg.update_magnitude(q, self.state.drag_marker, self.geo,
+                                     exact=True)
             elif self.state.drag_marker == 'a':
                 seg.update_from_a(q, self.geo, exact=True)
             elif self.state.drag_marker == 'b':
@@ -1541,6 +1621,7 @@ class GeodesicSplineApp(MidpointShooterApp):
         self.plotter.add_key_event('t', self._cycle_gizmo_opacity)
         self.plotter.add_key_event('r', self._rebuild_all_orange)
         self.plotter.add_key_event('v', self._on_export_vtk)
+        self.plotter.add_key_event('d', self._toggle_didactic)
         self.plotter.iren.interactor.AddObserver(
             vtk.vtkCommand.RightButtonPressEvent, self._on_right_press, 1.0)
         # Ctrl+Z / Ctrl+Y — raw VTK observer (PyVista add_key_event
@@ -1552,9 +1633,10 @@ class GeodesicSplineApp(MidpointShooterApp):
         # Console help -- ASCII only (Windows codepage 850 / cp1252 friendly).
         print("\n" + "=" * 48)
         print("  GEODESIC SPLINE EDITOR")
-        print("  Dbl-click L : Add node    Dbl-click R : New spline")
+        print("  Dbl-click L : Add node    Dbl-click R : New spline / Edit P coords")
         print("  Drag Red    : Translate   Drag Handle : Tangents")
-        print("  Shift+Drag  : Snap to mesh vertex")
+        print("  Shift+Drag P (red)   : Snap to mesh vertex")
+        print("  Shift+Drag A/B       : Magnitude only (no snap, no rotation)")
         print("  C           : Close/open loop  Backspace : Undo")
         # Delete key removed -- node deletion requires spline-aware reconnection
         print("  b/o/k       : Toggle blue/orange/interp curves")
@@ -1563,15 +1645,18 @@ class GeodesicSplineApp(MidpointShooterApp):
         print("  s           : Save splines to JSON")
         print("  l           : Load splines from JSON")
         print("  v           : Export orange curve to .vtk")
+        print("  d           : Toggle didactic scaffold (last span, t=0.5)")
         print("  Ctrl+Z      : Undo     Ctrl+Y      : Redo")
         print("=" * 48 + "\n")
 
     _HELP_TEXT = (
         "  Dbl-click L : Add node\n"
-        "  Dbl-click R : New spline\n"
+        "  Dbl-click R : New spline /\n"
+        "                Edit P coords\n"
         "  Drag Red    : Translate node\n"
         "  Drag Handle : Tangents\n"
-        "  Shift+Drag  : Snap to vertex\n"
+        "  Shift+Drag P: Snap to vertex\n"
+        "  Shift+Drag A/B: Magnitude\n"
         "  C           : Close/open loop\n"
         "  Backspace   : Undo node\n"
         "  Ctrl+Z / Y  : Undo / Redo\n"
@@ -1581,6 +1666,7 @@ class GeodesicSplineApp(MidpointShooterApp):
         "  s           : Save JSON\n"
         "  l           : Load JSON\n"
         "  v           : Export orange .vtk\n"
+        "  d           : Didactic scaffold\n"
         "  e           : Export paths\n"
         "  w           : Wireframe\n"
         "  a           : Surface opacity"
@@ -2621,12 +2707,47 @@ class GeodesicSplineApp(MidpointShooterApp):
         self.plotter.render()
 
     def _on_right_press(self, obj, event) -> None:
-        """Double-right-click: starts a new spline (break).
+        """Right-button handler with two double-click behaviours.
 
-        Only fires when the current spline has at least one node —
-        prevents consecutive empty splines.
+        Single right-click: ignored (no behaviour bound).
+
+        Double right-click:
+          - **Over a red P marker** → open the coordinate-edit dialog
+            (``_open_coordinates_dialog``).  The user types the desired
+            world-space coordinates; the input is projected to the
+            closest point on the surface and the node is moved there
+            via ``update_from_p`` (parallel-transports the tangent).
+            Right-button is used (not left) precisely so the gesture
+            cannot be confused with the left-button drag-start.
+          - **Over empty surface** → starts a new spline (break),
+            preserving the historical behaviour.  Only fires when the
+            current spline has at least one node so we don't create
+            consecutive empty splines.
         """
-        if self.plotter.iren.interactor.GetRepeatCount() >= 1 and self._active_nodes:
+        if self.plotter.iren.interactor.GetRepeatCount() < 1:
+            return  # only double-click triggers a behaviour
+
+        x, y = self.plotter.iren.get_event_position()
+        hit = self._hit_test_marker(x, y, allowed_tags=('p',))
+        if hit is not None:
+            seg, _tag = hit
+            # Re-entry guard: a fast triple-click could fire two right-press
+            # events while the first dialog's mainloop is still active.
+            # tkinter doesn't recover gracefully from nested mainloops in
+            # the same root, so we just drop subsequent calls.
+            if getattr(self, '_dialog_open', False):
+                return
+            self._dialog_open = True
+            try:
+                parsed = self._open_coordinates_dialog(seg)
+            finally:
+                self._dialog_open = False
+            if parsed is not None:
+                self._move_node_to_coordinates(seg, parsed)
+            return
+
+        # Empty surface → new-spline (break) shortcut
+        if self._active_nodes:
             self._push_undo()
             self.splines.append([])
             self.splines_closed.append(False)
@@ -2634,6 +2755,326 @@ class GeodesicSplineApp(MidpointShooterApp):
             self._refresh_visuals()
             self._set_hud(_t("new_spline_started"), 'lime')
             self.plotter.render()
+
+    # --- Coordinate-edit dialog (right-double-click on P marker) ---
+
+    def _hit_test_marker(self, x: int, y: int,
+                         allowed_tags: tuple[str, ...] | None = None
+                         ) -> tuple[GeodesicSegment, str] | None:
+        """Pure hit-test against the hover cache — no drag side-effects.
+
+        Mirrors the early portion of ``_try_hit_marker`` (rebuild cache
+        if dirty, screen-project the marker positions, run the Numba
+        ``_hover_argmin_sq`` kernel, occlusion check) but stops short
+        of the drag-start logic — we only need to know **which marker**
+        is under the cursor, not to begin a gesture.
+
+        ``allowed_tags`` filters by marker kind (``'p'`` / ``'a'`` /
+        ``'b'``).  Returns ``(seg, tag)`` when a marker passes the pick
+        radius + occlusion checks, else ``None``.
+        """
+        if self._hover_dirty:
+            self._rebuild_hover_cache()
+        if self._hover_n == 0:
+            return None
+        pts_2d = self._to_screen_batch(self._hover_pts_3d[:self._hover_n])
+        best, best_sq = _hover_argmin_sq(
+            pts_2d, self._hover_n, float(x), float(y))
+        if best_sq >= self.cfg.PICK_TOLERANCE_SQ:
+            return None
+        if self._is_marker_occluded(self._hover_pts_3d[best]):
+            return None
+        seg, tag = self._hover_tags[best]
+        if allowed_tags is not None and tag not in allowed_tags:
+            return None
+        return seg, tag
+
+    @staticmethod
+    def _parse_coordinates(text: str) -> tuple[float, float, float] | None:
+        """Parse an ``[x, y, z]`` / ``x, y, z`` / ``x y z`` string into a tuple.
+
+        All three forms are accepted, with arbitrary whitespace and
+        any combination of commas / spaces / square brackets.  The
+        parser is deliberately strict on the *shape* (exactly three
+        numeric tokens) and lenient on formatting: ``[ 1.2,3.4 5.6 ]``
+        parses fine.
+
+        Returns ``None`` on any of these failure modes (used by the
+        dialog's live-validate feedback to colour the entry red and
+        disable the OK button):
+
+          * empty string
+          * non-numeric token
+          * not exactly three tokens
+          * any token is NaN or +/- infinity
+        """
+        s = text.strip()
+        if s.startswith('[') and s.endswith(']'):
+            s = s[1:-1]
+        # Treat both commas and arbitrary whitespace as separators.
+        s = s.replace(',', ' ')
+        parts = s.split()
+        if len(parts) != 3:
+            return None
+        try:
+            x, y, z = (float(p) for p in parts)
+        except ValueError:
+            return None
+        # Reject NaN and +/- inf (find_face / projection don't handle them).
+        for v in (x, y, z):
+            if v != v or abs(v) == float('inf'):
+                return None
+        return (x, y, z)
+
+    def _open_coordinates_dialog(self, seg: GeodesicSegment
+                                 ) -> tuple[float, float, float] | None:
+        """Modal Tk dialog for entering target coordinates with live preview.
+
+        Visual style is intentionally minimal: no header label, a
+        single monospace entry, and right-aligned OK / Cancel buttons
+        below.  Uses ``ttk`` for the buttons (native theme on each
+        platform) and a slightly larger UI font (``Segoe UI 11`` /
+        platform fallback) for legibility.
+
+        Behaviour
+        ---------
+        * Pre-fills the entry with the node's current ``origin`` so a
+          small numerical adjustment is just a few keystrokes.
+        * Live validation on every keystroke via a ``StringVar`` trace:
+            - valid input → entry text black, OK enabled, **preview
+              sphere shown** at the projected surface point.
+            - invalid input → entry text red, OK disabled, **preview
+              sphere hidden**.
+        * Keyboard: ``<Return>`` accepts (only when OK is enabled);
+          ``<Escape>`` and the window-X cancel.
+        * The preview sphere is unconditionally hidden on dialog exit
+          (OK or Cancel) — handled by the surrounding ``finally``.
+
+        Returns the parsed ``(x, y, z)`` tuple on OK, or ``None`` on
+        cancel.  Blocks the main thread for the duration of
+        ``mainloop`` — same modal pattern as ``_on_load``'s file
+        dialog.
+        """
+        import tkinter as tk
+        from tkinter import ttk
+
+        cur = seg.origin
+        initial = f"{cur[0]:.6f}, {cur[1]:.6f}, {cur[2]:.6f}"
+
+        # Pick a UI font that maps to a modern face on each platform.
+        # Tk's default lookup falls back gracefully if the named family
+        # is not installed (Windows ships Segoe UI; macOS and Linux
+        # rebind to their native sans).
+        ui_font = ('Segoe UI', 11)
+        mono_font = ('Consolas', 11)
+
+        root = tk.Tk()
+        root.title("Set node coordinates")
+        try:
+            root.attributes('-topmost', True)
+        except tk.TclError:
+            pass  # platform-dependent, non-fatal
+
+        # ttk styling: clam theme is consistent and modern across OSes.
+        # A custom "Invalid.TEntry" style would be cleaner but tk.Entry
+        # supports direct fg switching, which keeps the live-validate
+        # path simple — so we use tk.Entry for the input and ttk for
+        # the buttons / frames.
+        try:
+            ttk.Style(root).theme_use('clam')
+        except tk.TclError:
+            pass
+
+        result: dict[str, tuple[float, float, float] | None] = {'value': None}
+
+        container = ttk.Frame(root, padding=(18, 16, 18, 14))
+        container.pack(fill='both', expand=True)
+
+        entry_var = tk.StringVar(value=initial)
+        entry = tk.Entry(
+            container, textvariable=entry_var,
+            font=mono_font, fg='black',
+            relief='flat', borderwidth=0,
+            highlightthickness=1,
+            highlightbackground='#cccccc',
+            highlightcolor='#666666',
+        )
+        entry.pack(fill='x', pady=(0, 14), ipady=4)
+        entry.select_range(0, 'end')
+        entry.icursor('end')
+        entry.focus_set()
+
+        btn_frame = ttk.Frame(container)
+        btn_frame.pack(fill='x')
+
+        def _on_ok() -> None:
+            parsed = self._parse_coordinates(entry_var.get())
+            if parsed is not None:
+                result['value'] = parsed
+                root.destroy()
+
+        def _on_cancel() -> None:
+            root.destroy()
+
+        # Right-aligned OK / Cancel.  Pack from the right so the rightmost
+        # button is Cancel (Windows convention).
+        cancel_btn = ttk.Button(btn_frame, text='Cancel', command=_on_cancel)
+        cancel_btn.pack(side='right')
+        ok_btn = ttk.Button(btn_frame, text='OK', command=_on_ok)
+        ok_btn.pack(side='right', padx=(0, 8))
+
+        # Apply the chosen UI font globally to ttk widgets in this dialog.
+        try:
+            ttk.Style(root).configure('TButton', font=ui_font, padding=(12, 4))
+            ttk.Style(root).configure('TFrame', background=root.cget('background'))
+        except tk.TclError:
+            pass
+
+        def _validate(*_args) -> None:
+            parsed = self._parse_coordinates(entry_var.get())
+            if parsed is not None:
+                entry.config(fg='black')
+                ok_btn.state(['!disabled'])
+                self._update_coord_preview(parsed)
+            else:
+                entry.config(fg='#c43030')
+                ok_btn.state(['disabled'])
+                self._hide_coord_preview()
+
+        entry_var.trace_add('write', _validate)
+        _validate()  # initial colour / button state / preview sphere
+
+        # Enter accepts (only when OK is enabled); Escape cancels.
+        def _on_enter(_event) -> None:
+            if 'disabled' not in ok_btn.state():
+                _on_ok()
+
+        root.bind('<Return>', _on_enter)
+        root.bind('<Escape>', lambda _e: _on_cancel())
+        root.protocol('WM_DELETE_WINDOW', _on_cancel)
+
+        try:
+            root.mainloop()
+        finally:
+            # Always clean up the preview sphere — even if mainloop
+            # exits abnormally (uncaught Tk exception, signal).
+            self._hide_coord_preview()
+        return result['value']
+
+    def _update_coord_preview(self, target_xyz: tuple[float, float, float]) -> None:
+        """Project *target_xyz* to the surface and show the 3-actor preview.
+
+        The preview communicates two pieces of information:
+
+          * **Where the node will land** — grey sphere on the surface.
+          * **How far the typed point is off the surface** — second
+            grey sphere at the typed coordinate (often floating above
+            the mesh) plus a thin line between the two.  The line's
+            length is exactly the projection distance.
+
+        Uses the same projection path as ``_move_node_to_coordinates``:
+        ``find_face`` populates ``self.geo._vtk_cp`` with the closest
+        surface point; we snapshot that into the actor PolyData.  The
+        ensuing ``plotter.render`` is necessary because tk's mainloop
+        blocks the editor's normal Master Clock — without an explicit
+        render none of the actors would update until the dialog closes.
+        """
+        input_pt = np.asarray(target_xyz, dtype=float)
+        self.geo.find_face(input_pt)
+        projected = np.array(self.geo._vtk_cp, dtype=float)
+
+        # Projected sphere (on the surface)
+        self._coord_preview_buf[0] = projected
+        self._coord_preview_pd.points = self._coord_preview_buf
+        self._coord_preview_pd.Modified()
+
+        # Input sphere (typed coordinate, may be floating above surface)
+        self._coord_preview_input_buf[0] = input_pt
+        self._coord_preview_input_pd.points = self._coord_preview_input_buf
+        self._coord_preview_input_pd.Modified()
+
+        # Connector line.  ``update_line_inplace`` from gizmo writes
+        # both points and the polyline connectivity into the existing
+        # PolyData without allocating a temporary, matching the rest
+        # of the editor's per-frame rendering style.
+        update_line_inplace(
+            self._coord_preview_line_pd,
+            np.array([input_pt, projected], dtype=float))
+
+        for actor in (self._coord_preview_actor,
+                      self._coord_preview_input_actor,
+                      self._coord_preview_line_actor):
+            if not actor.GetVisibility():
+                actor.SetVisibility(True)
+        self.plotter.render()
+
+    def _hide_coord_preview(self) -> None:
+        """Hide all three preview actors and force a render.
+
+        Idempotent — safe to call when actors are already invisible.
+        Renders only once at the end so we don't pay three paints for
+        what is logically a single state change.
+        """
+        any_visible = False
+        for actor in (self._coord_preview_actor,
+                      self._coord_preview_input_actor,
+                      self._coord_preview_line_actor):
+            if actor.GetVisibility():
+                actor.SetVisibility(False)
+                any_visible = True
+        if any_visible:
+            self.plotter.render()
+
+    def _move_node_to_coordinates(self, seg: GeodesicSegment,
+                                  target_xyz: tuple[float, float, float]) -> None:
+        """Project *target_xyz* onto the surface and move *seg* there.
+
+        The projection uses ``GeodesicMesh.find_face`` which goes through
+        the VTK locator and writes the closest surface point into
+        ``self.geo._vtk_cp`` as a side-effect.  We snapshot that
+        immediately, then re-call ``find_face`` on the snapshot to get
+        the face index that contains it (the original input may be far
+        from the surface and would route through the KDTree fallback).
+
+        The actual move is delegated to ``GeodesicSegment.update_from_p``
+        with ``exact=True`` — same call the drag-of-P consolidation
+        debounce uses, so the tangent is parallel-transported across
+        the new face's normal exactly the same way as a manual drag.
+
+        Records an undo snapshot, recomputes the affected spans, and
+        submits orange workers — symmetric with ``_finalize_release``.
+        """
+        input_pt = np.asarray(target_xyz, dtype=float)
+
+        # Project to the closest surface point.
+        self.geo.find_face(input_pt)
+        projected = np.array(self.geo._vtk_cp, dtype=float).copy()
+        face_idx = self.geo.find_face(projected)
+
+        self._push_undo()
+        # If the node belongs to a different spline than the active one,
+        # switch active first (mirrors _try_hit_marker's behaviour).
+        s_idx = self._spline_for_node(seg)
+        if s_idx != self.active_spline_idx:
+            self.active_spline_idx = s_idx
+            self._refresh_visuals()
+
+        seg.update_from_p(projected, face_idx, self.geo, exact=True)
+        seg.is_preview = False
+        seg.is_dragging = False
+        seg.update_visuals(self.plotter)
+
+        self._hover_dirty = True
+        self._invalidate_stitch_cache()
+        self._recompute_spans(node=seg)
+        self._submit_geodesic_spans(node=seg)
+        self._refresh_visuals()
+
+        self._set_hud(
+            f"NODE MOVED TO [{projected[0]:.4f}, "
+            f"{projected[1]:.4f}, {projected[2]:.4f}]",
+            'lime', sticky_seconds=4.0)
+        self.plotter.render()
 
     def _snap_point_to_edge(self, p: np.ndarray, face_idx: int | None
                             ) -> tuple[np.ndarray | None,
@@ -2711,7 +3152,17 @@ class GeodesicSplineApp(MidpointShooterApp):
             snap_indicator_pt: np.ndarray | None = None
             if dragged:
                 iren = self.plotter.iren.interactor
-                if pick_result[0] is not None:
+                # Vertex / edge snap modifiers only make sense on P
+                # (the node origin) — that's where the user wants to
+                # land on a precise mesh feature.  On A / B handles the
+                # same Shift modifier means "magnitude only" (direction
+                # preserved); snapping the cursor there would
+                # discretise the magnitude scalar and is undesirable.
+                # See ``GeodesicSegment.update_magnitude`` and the
+                # Shift dispatch in ``geo_shoot._on_move`` for the A/B
+                # branch.
+                snap_eligible = (self.state.drag_marker == 'p')
+                if snap_eligible and pick_result[0] is not None:
                     # Shift wins over Ctrl when both are held -- vertex
                     # snap is a strict subset of edge snap (edge endpoints
                     # are vertices), so no disambiguation is needed.
@@ -3261,6 +3712,22 @@ class GeodesicSplineApp(MidpointShooterApp):
         # Interpolation curve tracks node origins — recompute on every call.
         self._recompute_interp_curve(sid, is_dragging=is_dragging)
 
+        # Didactic scaffold (key 'd') — refresh policy:
+        #   * Always invalidate the cache on any recompute, so a node
+        #     edit anywhere in the active spline triggers a rebuild
+        #     the next time the scaffold is visible.
+        #   * If currently dragging, also hide the actors — the
+        #     scaffold cost (~75-125 ms of compute_endpoint_local
+        #     calls) is too high to run per drag-frame.
+        #   * If not dragging and the scaffold is visible, recompute
+        #     immediately so the user sees it match the new geometry.
+        self._didactic_dirty = True
+        if self._didactic_visible:
+            if is_dragging:
+                self._hide_didactic_actors()
+            else:
+                self._compute_didactic()
+
     # --- Interpolation curve (scipy B-spline through nodes, black) ---
 
     def _set_interp_curve(self, sid: int, pts: np.ndarray | None) -> None:
@@ -3519,6 +3986,137 @@ class GeodesicSplineApp(MidpointShooterApp):
             self.active_spline_idx = saved_sid
         self._set_hud(_t("orange_rebuilt"), 'orange')
         self.plotter.render()
+
+    # --- Didactic visualization (key 'd') ---
+
+    def _toggle_didactic(self) -> None:
+        """Press 'd': toggle the de Casteljau scaffold for the last span.
+
+        Activates the four-line preview of the orange curve's de
+        Casteljau construction at t=0.5: path_12 (H_out↔H_in),
+        path_c0 (b01↔b12), path_c1 (b12↔b23), path_final (c0↔c1).
+        See ``_compute_didactic`` for the geometric interpretation
+        and the per-actor docstring in ``__init__``.
+
+        Triggers a synchronous compute on the OFF→ON transition (only
+        if the cache is dirty), so the editor feels frozen for ~75-125
+        ms once.  Subsequent toggles pay only the visibility flip.
+        """
+        self._didactic_visible = not self._didactic_visible
+        if self._didactic_visible:
+            self._compute_didactic()
+            self._set_hud("DIDACTIC ON", 'white', sticky_seconds=1.5)
+        else:
+            self._hide_didactic_actors()
+            self._set_hud("DIDACTIC OFF", 'grey', sticky_seconds=1.5)
+        self.plotter.render()
+
+    def _hide_didactic_actors(self) -> None:
+        """Hide all four didactic line actors (idempotent)."""
+        for actor in self._didactic_actors:
+            if actor.GetVisibility():
+                actor.SetVisibility(False)
+
+    def _compute_didactic(self) -> None:
+        """Build the 4 auxiliary geodesic lines for the active spline's
+        last span at t=0.5.
+
+        "Last span" depends on the spline's open/closed flag:
+          * Open spline of N nodes: span between ``nodes[N-2]`` and
+            ``nodes[N-1]``.
+          * Closed spline: the wrap-around span between ``nodes[N-1]``
+            and ``nodes[0]``.
+
+        When the active spline has fewer than 2 nodes, or the relevant
+        ``path_a`` / ``path_b`` is missing (e.g. the user just inserted
+        a single node), the actors are hidden and a brief HUD note
+        explains why.
+
+        Cost: four ``compute_endpoint_local`` calls (one per geodesic
+        line drawn, plus the level-3 endpoint connecting c0 and c1).
+        Synchronous on the main thread by design — see the on-demand
+        contract in the ``__init__`` block.
+        """
+        sid = self.active_spline_idx
+        if sid < 0 or sid >= len(self.splines):
+            self._hide_didactic_actors()
+            self._didactic_dirty = True
+            return
+        nodes = self.splines[sid]
+        if len(nodes) < 2:
+            self._hide_didactic_actors()
+            self._didactic_dirty = True
+            self._set_hud("DIDACTIC: no last span", 'grey', sticky_seconds=2.0)
+            return
+
+        if self.splines_closed[sid]:
+            n0, n1 = nodes[-1], nodes[0]
+        else:
+            n0, n1 = nodes[-2], nodes[-1]
+
+        if (n0.p_b is None or n1.p_a is None
+                or n0.path_b is None or len(n0.path_b) < 2
+                or n1.path_a is None or len(n1.path_a) < 2):
+            self._hide_didactic_actors()
+            self._didactic_dirty = True
+            return
+
+        H_out, H_in = n0.p_b, n1.p_a
+        path_b = n0.path_b
+        path_a_rev = n1.path_a[::-1]
+
+        # Level 1: middle segment H_out -> H_in.
+        path_12 = self.geo.compute_endpoint_local(H_out, H_in)
+        if path_12 is None or len(path_12) < 2:
+            path_12 = np.array([H_out, H_in])
+
+        cum_b, total_b = GeodesicMesh.compute_path_lengths(path_b)
+        cum_a, total_a = GeodesicMesh.compute_path_lengths(path_a_rev)
+        cum_12, total_12 = GeodesicMesh.compute_path_lengths(path_12)
+
+        t = 0.5
+        b01 = GeodesicMesh.geodesic_lerp(path_b, t, cum_b, total_b)
+        b12 = GeodesicMesh.geodesic_lerp(path_12, t, cum_12, total_12)
+        b23 = GeodesicMesh.geodesic_lerp(path_a_rev, t, cum_a, total_a)
+
+        # Level 2: two chords between consecutive level-1 midpoints.
+        path_c0 = self.geo.compute_endpoint_local(b01, b12)
+        if path_c0 is None or len(path_c0) < 2:
+            path_c0 = np.array([b01, b12])
+        path_c1 = self.geo.compute_endpoint_local(b12, b23)
+        if path_c1 is None or len(path_c1) < 2:
+            path_c1 = np.array([b12, b23])
+
+        cum_c0, total_c0 = GeodesicMesh.compute_path_lengths(path_c0)
+        cum_c1, total_c1 = GeodesicMesh.compute_path_lengths(path_c1)
+        c0 = GeodesicMesh.geodesic_lerp(path_c0, t, cum_c0, total_c0)
+        c1 = GeodesicMesh.geodesic_lerp(path_c1, t, cum_c1, total_c1)
+
+        # Level 3: the chord that, evaluated at t=0.5, IS the orange
+        # curve sample at midpoint.  Drawing it makes the cascade
+        # collapse visually obvious.
+        path_final = self.geo.compute_endpoint_local(c0, c1)
+        if path_final is None or len(path_final) < 2:
+            path_final = np.array([c0, c1])
+
+        for pd, path in zip(self._didactic_pds,
+                            (path_12, path_c0, path_c1, path_final)):
+            update_line_inplace(pd, path)
+
+        # All actors share visibility — flip on at the end so a
+        # mid-compute exception leaves them in a clean state.  Local
+        # import of ``gizmo`` mirrors ``_cycle_gizmo_opacity``: the
+        # only callers that touch ``GIZMO_OPACITY`` are the toggle
+        # path and this compute method, so deferring the import keeps
+        # geo_splines start-up fast.
+        import gizmo
+        for actor in self._didactic_actors:
+            actor.SetVisibility(True)
+            # Keep opacity in sync with the global handle opacity
+            # (cycled via the 't' key inside ``_cycle_gizmo_opacity``).
+            actor.GetProperty().SetOpacity(gizmo.GIZMO_OPACITY)
+
+        self._didactic_dirty = False
 
     def _cancel_geodesic_spans(self, node: GeodesicSegment) -> None:
         """Cancels running workers and hides geodesic actors for spans

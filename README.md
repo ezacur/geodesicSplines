@@ -145,10 +145,11 @@ classDiagram
 | Action | Effect |
 |---|---|
 | Double-click Left | Add node at end of active spline, or insert at curve hover point |
-| Double-click Right | Start a new spline (break) |
+| Double-click Right | On red P marker: open a coordinate-edit dialog (type `[x, y, z]` / `x, y, z` / `x y z`; live validation, Enter accepts when valid, Escape cancels). Coordinates are projected onto the closest surface point and the node is moved there via parallel transport. On empty surface: start a new spline (break). |
 | Drag Red (P) | Translate node on surface (parallel transport preserves tangent) |
 | Drag Blue/Green (A/B) | Adjust tangent direction and length (symmetric ray update) |
-| Shift + Drag | Snap drag target to the nearest mesh vertex (any marker). A gold sphere shows the exact target while held. |
+| Shift + Drag (P) | Snap drag target to the nearest mesh vertex.  A gold sphere shows the exact target while held.  Only applies to the red P marker — Shift on A / B has a different meaning (see below). |
+| Shift + Drag (A / B) | **Magnitude-only mode** for the tangent: preserves direction (no rotation), the opposite handle stays symmetric (C1 continuity preserved).  The cursor is projected onto the dragged handle's tangent direction at the origin (3-D dot product); the magnitude of that projection becomes the new arc-length.  When the cursor crosses the origin (negative projection), the tangent direction flips so the handle visibly tracks the cursor.  **Vertex snap is disabled on A / B**: snapping would discretise the magnitude scalar and defeat the smooth-scrub UX. |
 | Ctrl + Drag | Snap drag target to the nearest edge of the face under the cursor (perpendicular projection, clamped). Gold sphere indicator while held. |
 
 ### Keyboard
@@ -165,16 +166,19 @@ classDiagram
 | s | Save splines to timestamped JSON (atomic UTF-8 write) |
 | l | Load splines from JSON (file dialog; schema-validated) |
 | v | Export orange curve to timestamped binary `.vtk` (same output as `spline_export.py --vtk --samples N` with `N = SplineConfig.EXPORT_VTK_SAMPLES`; reuses live cache when `EXPORT_VTK_SAMPLES == GEO_SAMPLES`, otherwise recomputes).  Single-node splines are written as `VTK_VERTEX` landmarks. |
+| d | Toggle the **didactic scaffold** for the active spline's last span — four dark-green auxiliary geodesic lines that visualise the de Casteljau cascade at `t = 0.5`.  See the dedicated [Didactic Scaffold](#didactic-scaffold-key-d) section below for the full geometric story. |
 | e | Export geodesic paths to TXT |
 | w | Toggle wireframe overlay |
 | a | Cycle surface transparency |
 
-### Localisation and logging
+### Logging
 
-HUD text is localised via `GEO_SPLINES_LANG` (default `es`; set to `en` for English).
-Diagnostic output uses Python `logging` under the `geo_splines` logger.
-Set `GEO_SPLINES_DEBUG=1` to raise the level to `DEBUG` (worker traces,
-snap diagnostics).
+All HUD text and diagnostic output are in English (the project no
+longer ships a localisation table; an earlier `GEO_SPLINES_LANG`
+switch was removed when the codebase consolidated on a single
+language).  Diagnostics route through Python `logging` under the
+`geo_splines` logger.  Set `GEO_SPLINES_DEBUG=1` to raise the level
+to `DEBUG` (worker traces, snap diagnostics, solver fallbacks).
 
 ### Checkboxes
 
@@ -313,6 +317,41 @@ The orange layer has two visual signals that it is still computing:
 Degraded spans (geodesic fell back to a straight line) are painted
 `SPAN_FALLBACK_COLOR` regardless of the computing state — a failure
 signal dominates any progress indicator.
+
+#### Didactic scaffold (key `d`)
+
+A toggleable visualisation of the de Casteljau cascade for the
+active spline's **last span** at parameter `t = 0.5`.  Useful for
+teaching, debugging, or just understanding what the orange curve is
+doing under the hood.  Pressing `d` draws four dark-green geodesic
+auxiliary lines:
+
+| Line | Endpoints | Stage of the cascade |
+|---|---|---|
+| `path_12`    | `H_out ↔ H_in`   | Level 1: middle segment between the two handles. |
+| `path_c0`    | `b01 ↔ b12`      | Level 2: first chord between consecutive level-1 midpoints. |
+| `path_c1`    | `b12 ↔ b23`      | Level 2: second chord. |
+| `path_final` | `c0 ↔ c1`        | Level 3: collapses to the orange curve sample at `t = 0.5`. |
+
+The intermediate points themselves (`b01`, `b12`, `b23`, `c0`, `c1`)
+are computed via geodesic_lerp on the level-N paths but not drawn
+as markers — the lines alone make the structure readable.
+
+"Last span" means:
+- **Open spline** of N nodes: span between `nodes[N-2]` and `nodes[N-1]`.
+- **Closed spline**: the wrap-around span between `nodes[N-1]` and `nodes[0]`.
+- Active spline with **<2 nodes**: a brief HUD message
+  (`DIDACTIC: no last span`) and nothing is drawn.
+
+**On-demand semantics**: while the scaffold is invisible, no compute
+runs.  Toggling ON triggers a synchronous rebuild (~75-125 ms — four
+``compute_endpoint_local`` calls).  Drag invalidates the cache and
+hides the actors so the per-frame cost stays zero.  Consolidation
+(``_recompute_spans`` with ``is_dragging=False``) re-renders the
+scaffold if it is currently visible.
+
+Opacity tracks the global handle opacity (cycled with `t`), so the
+scaffold fades together with the node markers and tangent arrows.
 
 ### Black -- Interpolation B-spline (immediate)
 
@@ -1076,11 +1115,11 @@ A single `render()` per timer tick batches all updates.
 
 ## Save / Load
 
-### JSON Format (version 1)
+### JSON Format (version 2 — current)
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "mesh_file": "mesh.ply",
   "splines": [
     {
@@ -1088,7 +1127,8 @@ A single `render()` per timer tick batches all updates.
       "nodes": [
         {
           "origin": [x, y, z],
-          "tangent": [tx, ty, tz]
+          "p_a":    [ax, ay, az],
+          "p_b":    [bx, by, bz]
         }
       ]
     }
@@ -1096,31 +1136,64 @@ A single `render()` per timer tick batches all updates.
 }
 ```
 
-Each node stores **two fields**:
-- `origin` -- 3D position on the surface.
-- `tangent` -- 3D vector whose direction is the shoot direction and whose
-  magnitude is `h_length`.
+Each node persists three 3-D points: ``origin`` (the node position on
+the surface), ``p_a`` (handle A endpoint), and ``p_b`` (handle B
+endpoint).  Either or both handle entries may be ``null`` for
+placeholder single-node splines that haven't yet had tangents set up.
 
-All derived state (face index, tangent frame, paths, handles) is
-reconstructed on load via `find_face` + `compute_shoot`.
+On load, the editor rebuilds ``path_a`` and ``path_b`` via
+``compute_endpoint_from_origin`` (the EdgeFlipGeodesicSolver) — the
+**same call the editor uses during drag**.  This guarantees a
+bit-for-bit round-trip: a handle dragged to a specific surface point
+appears at exactly the same spot on reload.
 
-The special value `"ICOSAHEDRON"` as `mesh_file` generates the built-in
-demo mesh (12-vertex icosahedron, radius 10).
+### JSON Format (version 1 — legacy)
+
+The original schema stored a single ``tangent`` vector per node
+(direction × ``h_length``) and reconstructed both handles
+symmetrically via ``compute_shoot`` ± ``tangent_dir``.  This worked
+for the symmetric initial state but lost the solver-curving
+information whenever a handle was dragged on a curved surface, so
+reload could shift the handle ~0.1-0.2 units away from the user's
+choice.  v2 was introduced to fix that.
+
+Both versions still load.  ``_validate_session_dict`` dispatches per
+node by which keys are present (``tangent`` → v1 path, ``p_a`` +
+``p_b`` → v2 path), so a session file may even mix the two schemas
+node-by-node.  All new saves and undo / redo snapshots are v2.
+
+The special value ``__builtin__:icosahedron`` (or the legacy plain
+``ICOSAHEDRON``) as ``mesh_file`` generates the built-in demo mesh
+(12-vertex icosahedron, radius 10).
 
 ## CLI Export
 
 ```bash
-python spline_export.py <file.json> <b|o|k> [--samples N]
+python spline_export.py <file.json> <b|o|k> [--samples N] [--obj | --vtk]
 ```
 
-Outputs curve points to stdout in CSV format. Landmarks (node origins)
-are wrapped in NaN sentinels. Breaks between splines are single NaN lines.
+Loads a saved session (v1 or v2 schema) and writes the curve points
+of the chosen layer to disk.  Three output formats:
+
+| Output | Flag | Contents |
+|---|---|---|
+| CSV (default, stdout) | -- | One ``x, y, z`` per line.  Single ``NaN, NaN, NaN`` line breaks the polyline between splines; double ``NaN`` separates landmark records. |
+| Wavefront OBJ | `--obj` | One vertex per sample, one ``f`` line per consecutive pair.  All splines concatenated into a single line strip per spline. |
+| Binary legacy VTK | `--vtk` | UnstructuredGrid with ``VTK_LINE`` (cell type 3) for span samples and ``VTK_VERTEX`` (cell type 1) for single-node landmarks. |
 
 | Layer | Flag | Typical time |
 |---|---|---|
 | Black (interpolation) | `k` | Seconds (fastest) |
 | Blue (semi-geodesic) | `b` | Seconds |
 | Orange (fully geodesic) | `o` | Hours (for many spans) |
+
+The editor's ``v`` shortcut shells out the same orange computation
+in-process, writing a timestamped ``.vtk`` file to the working
+directory — convenient for dumping the live curve without a JSON
+save first.  The sample count is controlled by
+``SplineConfig.EXPORT_VTK_SAMPLES`` (default 20) and the live
+``_geo_span_cache`` is reused when ``EXPORT_VTK_SAMPLES`` matches
+``GEO_SAMPLES``, skipping the recompute.
 
 ## Dependencies
 

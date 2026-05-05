@@ -1275,8 +1275,22 @@ class MidpointShooterApp:
                     start_proc = time.perf_counter()
 
                     self.state.active_seg.is_preview = True
+                    # Shift+drag of A or B = magnitude-only mode.  The
+                    # tangent direction at the origin is preserved; only
+                    # the arc-length scrubs along the cursor's projection
+                    # onto the handle direction.  See
+                    # ``GeodesicSegment.update_magnitude`` for the cursor
+                    # → magnitude mapping and the flip-on-cross-origin
+                    # rule.  Drag of P is unaffected by Shift (Shift
+                    # there means vertex-snap, handled inside the spline
+                    # subclass's _on_move override).
+                    shift_held = bool(
+                        self.plotter.iren.interactor.GetShiftKey())
                     if self.state.drag_marker == 'p':
                         self.state.active_seg.update_from_p(q, cid, self.geo)
+                    elif self.state.drag_marker in ('a', 'b') and shift_held:
+                        self.state.active_seg.update_magnitude(
+                            q, self.state.drag_marker, self.geo)
                     elif self.state.drag_marker == 'a':
                         self.state.active_seg.update_from_a(q, self.geo)
                     elif self.state.drag_marker == 'b':

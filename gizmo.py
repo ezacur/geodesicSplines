@@ -444,6 +444,109 @@ class SegmentData:
             self.path_a, self.p_a = self._update_symmetric_ray(self.path_b, geo, -1.0)
             self.update_local_v(geo)
 
+    def update_magnitude(self, cursor_3d: np.ndarray, drag_marker: str,
+                         geo: GeodesicMesh, exact: bool = False) -> None:
+        """Shift+drag of handle: change tangent magnitude while preserving direction.
+
+        On a curved surface the "direction" of the tangent is the 3-D
+        unit vector ``local_v[0] * u + local_v[1] * v`` at the origin
+        (in the tangent plane); the "magnitude" is the arc-length of
+        ``path_b`` (and equivalently ``path_a`` — they stay symmetric
+        for C1 continuity).  This method scrubs the magnitude without
+        rotating the direction.
+
+        Cursor mapping
+        --------------
+        The cursor's surface position is projected onto the dragged
+        handle's tangent direction at the origin (3-D dot product),
+        giving a signed scalar.  Its absolute value becomes the new
+        magnitude (clamped to a minimum so paths never collapse to
+        zero).  Sign meaning:
+
+          * **>= 0**: the cursor is on the handle's side of the
+            origin → magnitude grows as the user drags away from the
+            origin in the handle's direction.
+          * **< 0**: the cursor has crossed the origin to the
+            opposite side → the handle "flips".  We invert the
+            tangent direction (negate ``local_v``) so the rendered
+            handle visibly tracks the cursor; ``path_a`` and
+            ``path_b`` swap roles in 3-D space, but the symmetric-ray
+            invariant (and thus C1 continuity at the node) is
+            preserved.
+
+        Parameters
+        ----------
+        cursor_3d : (3,) array
+            The cursor's projected surface point this frame.
+        drag_marker : 'a' or 'b'
+            Which handle the user is dragging — only its sign relative
+            to ``local_v`` matters.
+        geo : GeodesicMesh
+        exact : bool
+            False during preview (uses ``fast_mode=True``); True on
+            consolidation (full parallel transport across edges).
+        """
+        # 3-D direction of path_b at the origin.  By construction
+        # ``local_v`` is unit (set by ``update_local_v``) and (u, v)
+        # is orthonormal, so this is already a unit vector — no
+        # renormalisation needed in the common case.  The defensive
+        # check below covers numerical degeneracies (an all-zero
+        # local_v that survived a degenerate path).
+        tangent_3d = (self.local_v[0] * self.u
+                      + self.local_v[1] * self.v)
+        norm = float(np.linalg.norm(tangent_3d))
+        if norm < 1e-12:
+            return  # tangent direction undefined; bail out cleanly
+        tangent_3d = tangent_3d / norm
+
+        # Direction of the dragged handle from the origin (sign-flipped
+        # for handle A).  Projecting the cursor onto THIS axis is what
+        # makes "drag away from origin in the clicked-handle's
+        # direction → grow magnitude" the natural UX.
+        handle_sign = -1.0 if drag_marker == 'a' else +1.0
+        delta = np.asarray(cursor_3d, dtype=float) - self.origin
+        signed_proj = float(np.dot(delta, handle_sign * tangent_3d))
+
+        # Clamp to a small positive minimum.  ``compute_shoot`` with
+        # length=0 returns a zero-length polyline that downstream code
+        # treats as "missing handle"; below 1e-3 the visual marker
+        # would also collide with the origin sphere.
+        new_magnitude = max(abs(signed_proj), 1e-3)
+
+        # Cursor crossed the origin → flip the tangent direction.  We
+        # negate ``local_v`` (the canonical direction state) so that
+        # subsequent operations — save formula, drag of P, even another
+        # Shift+drag — see the new orientation as the baseline.  The
+        # handle that the user clicked on stays "under" the cursor in
+        # screen space because we re-shoot path_a / path_b from the
+        # flipped direction below.
+        if signed_proj < 0:
+            tangent_3d = -tangent_3d
+            self.local_v[0] = -self.local_v[0]
+            self.local_v[1] = -self.local_v[1]
+
+        self.is_preview = AGILE_DRAG and not exact
+        fast = self.is_preview
+
+        self.path_b = geo.compute_shoot(
+            self.origin, tangent_3d, new_magnitude,
+            self.face_idx, fast_mode=fast)
+        self.path_a = geo.compute_shoot(
+            self.origin, -tangent_3d, new_magnitude,
+            self.face_idx, fast_mode=fast)
+
+        if self.path_b is not None and len(self.path_b) > 1:
+            self.p_b = self.path_b[-1]
+        if self.path_a is not None and len(self.path_a) > 1:
+            self.p_a = self.path_a[-1]
+
+        # Keep h_length consistent with the new magnitude.  We
+        # deliberately do NOT call ``update_local_v`` here — that
+        # method derives ``local_v`` from path_b's first segment,
+        # which would silently re-rotate the direction on every
+        # frame and undo the "preserve direction" invariant.
+        self.h_length = new_magnitude
+
     def update_from_p(self, new_p: np.ndarray, new_fi: int, geo: GeodesicMesh, exact: bool = False) -> None:
         """Translation: moves midpoint while preserving shooting direction.
 
