@@ -459,6 +459,13 @@ class SplineConfig:
     # cache is reused to skip recomputation.
     EXPORT_VTK_SAMPLES: int = 20
 
+    # Default parameter value for the didactic scaffold (key 'd').
+    # Visible as the slider's initial position and the value used when
+    # the scaffold is toggled on with the slider not yet created.  0.5
+    # is the canonical "midpoint of the curve" cascade — useful for
+    # most teaching contexts; the user can drag the slider in [0, 1].
+    DIDACTIC_T_DEFAULT: float = 0.5
+
     # Interpolation curve (scipy B-spline through nodes, projected to surface).
     # Uses tighter secant subdivision than Bézier layers because the 3D
     # B-spline has no geodesic awareness and can deviate further from the
@@ -737,11 +744,18 @@ class _SpanWorkManager:
         np.ndarray(V_c.shape, dtype=V_c.dtype, buffer=self._shm_V.buf)[:] = V_c
         np.ndarray(F_c.shape, dtype=F_c.dtype, buffer=self._shm_F.buf)[:] = F_c
 
-        self._executor = ProcessPoolExecutor(
-            max_workers=max_workers,
-            initializer=_process_initializer,
-            initargs=(self._shm_V.name, V_c.shape, str(V_c.dtype),
-                      self._shm_F.name, F_c.shape, str(F_c.dtype)))
+        self._max_workers = max_workers
+        # Init args captured for ``_rebuild_executor``: when a worker
+        # dies abnormally (segfault in pp3d / VTK, OOM kill, etc.)
+        # the entire ``ProcessPoolExecutor`` becomes unusable —
+        # ``submit()`` raises ``BrokenProcessPool`` permanently.
+        # Re-creating the pool is the only recovery path; the V/F
+        # shared memory blocks survive intact, so we just spin up a
+        # fresh executor with the same initializer.
+        self._init_args = (
+            self._shm_V.name, V_c.shape, str(V_c.dtype),
+            self._shm_F.name, F_c.shape, str(F_c.dtype))
+        self._executor = self._build_executor()
 
         # Safety net: if the parent crashes before ``shutdown()`` runs,
         # atexit still fires during interpreter teardown and releases the
@@ -786,6 +800,71 @@ class _SpanWorkManager:
         # Warm up: force all worker processes to start now
         self._warmup_futures = [
             self._executor.submit(int, 0) for _ in range(max_workers)]
+
+    def _build_executor(self) -> ProcessPoolExecutor:
+        """Spins up a fresh ``ProcessPoolExecutor`` with the saved
+        initializer + initargs.
+
+        Used both at construction and by ``_rebuild_executor`` after a
+        ``BrokenProcessPool``.  The shared-memory blocks for V / F are
+        unchanged across rebuilds — only the worker processes are
+        replaced — so the new pool sees the same mesh.
+        """
+        return ProcessPoolExecutor(
+            max_workers=self._max_workers,
+            initializer=_process_initializer,
+            initargs=self._init_args)
+
+    def _rebuild_executor(self) -> None:
+        """Replace a broken executor with a fresh one and clear pending state.
+
+        ``ProcessPoolExecutor`` becomes permanently unusable after any
+        worker dies abnormally (segfault in pp3d / VTK, signal, OOM
+        kill).  All subsequent ``submit()`` calls raise
+        ``BrokenProcessPool``.  This method is the recovery path:
+
+          1. Force-shutdown the broken pool (``cancel_futures=True`` so
+             any pending futures fail fast — they cannot complete on a
+             broken pool anyway).
+          2. Drop all bookkeeping for the orange batch: ``_readers`` /
+             ``_futures`` / ``_points`` / ``active_spans`` /
+             ``done_spans`` / ``dirty_spans`` / counters.  Spans that
+             were mid-flight will simply have to be resubmitted by the
+             caller (the editor's next ``_recompute_spans`` does this
+             automatically for the active spline).
+          3. Build a fresh executor with the same initializer + V / F
+             shared-memory args.
+
+        Called from ``submit_span`` when ``executor.submit`` raises.
+        Idempotent only insofar as a freshly-built executor will not
+        immediately be broken — if pp3d crashes again on the next
+        submit it will re-trigger this path.
+        """
+        log.warning("orange worker pool broken; rebuilding executor")
+        try:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+        except Exception as exc:  # noqa: BLE001 — broken pool teardown
+            log.debug("broken-pool shutdown raised: %s", exc)
+
+        # Drop all per-span state — those readers / futures point at
+        # workers from the dead pool and can never produce results.
+        for r in self._readers.values():
+            try:
+                r.close()
+            except OSError:
+                pass
+        self._readers.clear()
+        self._futures.clear()
+        self._points.clear()
+        self.active_spans.clear()
+        self.dirty_spans.clear()
+        self.done_spans.clear()
+        self.dead_spans.clear()
+        self.degraded_spans.clear()
+        self._batch_submitted = 0
+        self._batch_done = 0
+
+        self._executor = self._build_executor()
 
     @staticmethod
     def _cleanup_at_exit(weak_self) -> None:
@@ -843,10 +922,42 @@ class _SpanWorkManager:
             t_grid = np.linspace(0.0, 1.0, n_samples)
         inner_order = _hierarchical_inner_order(n_samples)
 
-        future = self._executor.submit(
-            _geodesic_decasteljau_worker,
-            span_key, ctrl, path_b.copy(), path_a_rev.copy(),
-            t_grid, inner_order, writer, None)
+        # ``executor.submit`` raises ``BrokenProcessPool`` if a worker
+        # has died abnormally since the last call (segfault in pp3d /
+        # VTK, OOM kill).  The pool is permanently unusable in that
+        # state — we rebuild it once and retry.  If the second submit
+        # also fails the workers are likely dying on a malformed input
+        # we'd just keep retrying; mark the span dead so the editor's
+        # poll-tick clears its (stale) actor and moves on.
+        from concurrent.futures.process import BrokenProcessPool
+        try:
+            future = self._executor.submit(
+                _geodesic_decasteljau_worker,
+                span_key, ctrl, path_b.copy(), path_a_rev.copy(),
+                t_grid, inner_order, writer, None)
+        except BrokenProcessPool:
+            self._rebuild_executor()
+            # ``_rebuild_executor`` cleared self._readers / self._points,
+            # so the bookkeeping we set up just above is gone too.  Re-
+            # establish for this span before the retry.
+            self._readers[span_key] = reader
+            self._points[span_key] = pts
+            try:
+                future = self._executor.submit(
+                    _geodesic_decasteljau_worker,
+                    span_key, ctrl, path_b.copy(), path_a_rev.copy(),
+                    t_grid, inner_order, writer, None)
+            except BrokenProcessPool as exc:
+                log.error("orange worker pool broken twice in a row "
+                          "for span %s: %s — giving up", span_key, exc)
+                try:
+                    reader.close()
+                except OSError:
+                    pass
+                self._readers.pop(span_key, None)
+                self._points.pop(span_key, None)
+                self.dead_spans.add(span_key)
+                return
         self._futures[span_key] = future
         self.active_spans.add(span_key)
         self._batch_submitted += 1
@@ -1257,14 +1368,33 @@ class GeodesicSplineApp(MidpointShooterApp):
         #                                           sample at t=0.5)
         #
         # On-demand semantics: while invisible the actors stay empty
-        # and ``_compute_didactic`` is not called.  Toggle ON triggers
-        # a fresh compute (~75-125 ms; four ``compute_endpoint_local``
-        # calls).  Drag flips ``_didactic_dirty=True`` and hides the
-        # actors so per-frame cost stays zero.  Consolidation
-        # (``_recompute_spans`` with ``is_dragging=False``) recomputes
-        # if dirty.
+        # and ``_compute_didactic`` is not called (``_didactic_dirty``
+        # is set so the next toggle ON triggers a rebuild).  Toggle ON
+        # triggers a fresh exact compute (~75-125 ms; four
+        # ``compute_endpoint_local`` calls).  During node drag the
+        # scaffold updates **live** in fast mode (~5-10 ms via
+        # Euclidean line + ``project_smooth_batch``, the same trick
+        # blue uses for ``path_12`` while dragging); on consolidation
+        # it re-renders with exact geodesics and the lines visibly
+        # snap from the approximation to the truth.  Drags that don't
+        # touch one of the last span's two endpoint nodes are skipped
+        # outright by ``_recompute_spans`` (see the
+        # ``_is_node_in_last_span`` guard).
         self._didactic_visible: bool = False
         self._didactic_dirty: bool = True
+        # Parameter value of the cascade.  The slider widget binds to
+        # this attribute via ``_on_didactic_t_change``; while the
+        # slider doesn't exist yet (first toggle pending), the default
+        # from SplineConfig is used.  Keeping the value on the instance
+        # rather than the slider lets ``_compute_didactic`` work
+        # without needing the widget present.
+        self._didactic_t: float = self.scfg.DIDACTIC_T_DEFAULT
+        # Lazy-created the first time the user toggles 'd' on.  None
+        # means "not yet built".  Lifecycle: build once, enable /
+        # disable per toggle.  Tearing down on toggle-off would force
+        # re-creation each cycle and PyVista's ``add_slider_widget``
+        # is non-trivial.
+        self._didactic_slider = None
         import gizmo as _gizmo_mod  # local alias for opacity read-back
         self._didactic_pds: list[pv.PolyData] = []
         self._didactic_actors: list[vtk.vtkActor] = []
@@ -1281,6 +1411,26 @@ class GeodesicSplineApp(MidpointShooterApp):
             actor.SetVisibility(False)
             self._didactic_pds.append(pd)
             self._didactic_actors.append(actor)
+
+        # Level-3 evaluation point: small dark-green sphere placed at
+        # ``geodesic_lerp(path_final, t)``.  It is the point on the
+        # orange curve at the chosen ``t`` — visualising it on top of
+        # the cascade makes the collapse explicit (the entire scaffold
+        # converges to this single point).  Tracks the same opacity as
+        # the lines so the whole scaffold fades together with the 't'
+        # key.
+        self._didactic_point_pd = pv.PolyData(np.zeros((1, 3)))
+        self._didactic_point_actor = self.plotter.add_mesh(
+            self._didactic_point_pd, color='#1f5232', point_size=10,
+            render_points_as_spheres=True, lighting=False, pickable=False,
+            opacity=_gizmo_mod.GIZMO_OPACITY,
+            name="didactic_point")
+        # Slightly more in-front than the lines (so the sphere reads
+        # crisply on top of path_final at the collapse point).
+        self._set_depth_priority(self._didactic_point_actor,
+                                 self.scfg.DEPTH_ORANGE - 5)
+        self._didactic_point_actor.SetVisibility(False)
+        self._didactic_point_buf = np.empty((1, 3), dtype=float)
 
         # --- Hover-curve cache ---
         # ``_collect_visible_curves`` packs every visible polyline into
@@ -1477,9 +1627,10 @@ class GeodesicSplineApp(MidpointShooterApp):
         # Update stitch preview if visible
         if self._stitch_actor.GetVisibility():
             self._stitch_actor.GetProperty().SetOpacity(nxt)
-        # Update didactic scaffold opacity (lines stay fixed-gray; the
-        # only thing that tracks the gizmo opacity is the alpha).
-        for actor in self._didactic_actors:
+        # Update didactic scaffold opacity (lines stay fixed-color; the
+        # only thing that tracks the gizmo opacity is the alpha).  Also
+        # the level-3 collapse-point sphere shares the same alpha.
+        for actor in (*self._didactic_actors, self._didactic_point_actor):
             actor.GetProperty().SetOpacity(nxt)
         self._set_hud(_t("gizmo_opacity", pct=f"{nxt:.0%}"), 'white')
         self.plotter.render()
@@ -2025,6 +2176,14 @@ class GeodesicSplineApp(MidpointShooterApp):
         seg.normal = normal
         seg.u = u
         seg.v = v
+        # Invalidate the per-node solver cache: the cache (built by
+        # ``GeodesicSegment._update_handle`` on first drag) is keyed
+        # implicitly by the segment's origin — using a stale cache
+        # after origin moves (undo / redo / load) would feed the
+        # solver topology built around the *previous* origin to the
+        # next ``compute_endpoint_from_origin`` call, drifting the
+        # first preview frame post-restore.
+        seg._origin_cache = None
 
         if 'p_a' in record and 'p_b' in record:
             self._apply_v2_handles(seg, origin, record)
@@ -2053,12 +2212,24 @@ class GeodesicSplineApp(MidpointShooterApp):
         p_a_rec = record.get('p_a')
         p_b_rec = record.get('p_b')
 
-        # Origin cache for the solver — built once, reused for both handles.
+        # Origin cache for the solver — built once, reused for both
+        # handles.  If ``prepare_origin`` fails (degenerate face under
+        # the saved origin, near-zero-area triangle), we cannot run
+        # the solver here.  We don't fall back to ``compute_shoot``
+        # automatically because v2 records do not store a tangent
+        # direction — only the two handle endpoints.  Instead the
+        # node loads with ``path_a = path_b = None`` and the editor's
+        # span recomputation will skip its spans (visible as a gap in
+        # the curve at that node).  The user's first drag of a handle
+        # rebuilds the cache from the new mouse position and the node
+        # recovers.
         try:
             origin_cache = self.geo.prepare_origin(origin)
         except (RuntimeError, ValueError, TypeError) as exc:
-            log.warning("v2 load: prepare_origin failed at %s (%s); falling back to v1 path",
-                        origin.tolist(), exc)
+            log.warning(
+                "v2 load: prepare_origin failed at %s (%s); "
+                "node will load with no handles — drag any handle to recover.",
+                origin.tolist(), exc)
             origin_cache = None
 
         def _resolve_handle(p_rec):
@@ -3712,21 +3883,28 @@ class GeodesicSplineApp(MidpointShooterApp):
         # Interpolation curve tracks node origins — recompute on every call.
         self._recompute_interp_curve(sid, is_dragging=is_dragging)
 
-        # Didactic scaffold (key 'd') — refresh policy:
-        #   * Always invalidate the cache on any recompute, so a node
-        #     edit anywhere in the active spline triggers a rebuild
-        #     the next time the scaffold is visible.
-        #   * If currently dragging, also hide the actors — the
-        #     scaffold cost (~75-125 ms of compute_endpoint_local
-        #     calls) is too high to run per drag-frame.
-        #   * If not dragging and the scaffold is visible, recompute
-        #     immediately so the user sees it match the new geometry.
-        self._didactic_dirty = True
+        # Didactic scaffold (key 'd') — interactive refresh:
+        #   * Only recompute when the drag actually affects the LAST
+        #     span (the only one the scaffold visualises).  Drags on
+        #     any other node leave the scaffold geometry unchanged so
+        #     re-running ``_compute_didactic`` would be ~5-10 ms of
+        #     pure waste per frame.  ``node is None`` is the
+        #     full-recompute path (load / undo / structural change)
+        #     and always refreshes.
+        #   * During drag of an affected node: recompute with
+        #     ``fast=True`` (Euclidean lines + ``project_smooth_batch``,
+        #     ~5-10 ms — same approximation blue uses).  The scaffold
+        #     follows the cursor live.
+        #   * On consolidation (``is_dragging=False``): recompute with
+        #     ``fast=False`` (exact geodesics via
+        #     ``compute_endpoint_local``, ~75-125 ms).  The lines
+        #     "snap" from the approximation to the exact geodesic —
+        #     the visible snap is itself a teaching moment.
         if self._didactic_visible:
-            if is_dragging:
-                self._hide_didactic_actors()
-            else:
-                self._compute_didactic()
+            if node is None or self._is_node_in_last_span(node, sid):
+                self._compute_didactic(fast=is_dragging)
+        else:
+            self._didactic_dirty = True
 
     # --- Interpolation curve (scipy B-spline through nodes, black) ---
 
@@ -3993,33 +4171,128 @@ class GeodesicSplineApp(MidpointShooterApp):
         """Press 'd': toggle the de Casteljau scaffold for the last span.
 
         Activates the four-line preview of the orange curve's de
-        Casteljau construction at t=0.5: path_12 (H_out↔H_in),
+        Casteljau construction at parameter ``self._didactic_t``
+        (slider-controlled, default 0.5): path_12 (H_out↔H_in),
         path_c0 (b01↔b12), path_c1 (b12↔b23), path_final (c0↔c1).
         See ``_compute_didactic`` for the geometric interpretation
         and the per-actor docstring in ``__init__``.
 
-        Triggers a synchronous compute on the OFF→ON transition (only
-        if the cache is dirty), so the editor feels frozen for ~75-125
-        ms once.  Subsequent toggles pay only the visibility flip.
+        On the OFF→ON transition we lazy-create the t slider (see
+        ``_ensure_didactic_slider``) and trigger a synchronous
+        compute (only if the cache is dirty) so the editor feels
+        frozen for ~75-125 ms once.  Subsequent toggles only flip
+        actor visibility + the slider's enabled state.
         """
         self._didactic_visible = not self._didactic_visible
         if self._didactic_visible:
+            self._ensure_didactic_slider()
+            self._didactic_slider.SetEnabled(1)
             self._compute_didactic()
             self._set_hud("DIDACTIC ON", 'white', sticky_seconds=1.5)
         else:
             self._hide_didactic_actors()
+            if self._didactic_slider is not None:
+                self._didactic_slider.SetEnabled(0)
             self._set_hud("DIDACTIC OFF", 'grey', sticky_seconds=1.5)
         self.plotter.render()
 
+    def _is_node_in_last_span(self, node: GeodesicSegment, sid: int) -> bool:
+        """True iff ``node`` is one of the two endpoints of the spline's
+        last span (the span the didactic scaffold visualises).
+
+        Match rule mirrors ``_compute_didactic``'s "last span" pick:
+
+          * Open spline of N nodes: ``nodes[N-2]`` and ``nodes[N-1]``.
+          * Closed spline: wrap-around endpoints ``nodes[N-1]`` and
+            ``nodes[0]``.
+
+        Lookups use ``is`` (identity), not ``==``, since
+        ``GeodesicSegment`` instances are referenced by identity
+        throughout the editor.  Returns False on the empty / single-
+        node placeholder cases — the scaffold has no last span there
+        and recomputing would be a no-op.
+        """
+        if sid < 0 or sid >= len(self.splines):
+            return False
+        nodes = self.splines[sid]
+        if len(nodes) < 2:
+            return False
+        if self.splines_closed[sid]:
+            return node is nodes[-1] or node is nodes[0]
+        return node is nodes[-2] or node is nodes[-1]
+
     def _hide_didactic_actors(self) -> None:
-        """Hide all four didactic line actors (idempotent)."""
-        for actor in self._didactic_actors:
+        """Hide all didactic actors — the four cascade lines and the
+        level-3 collapse-point sphere — idempotently.
+        """
+        for actor in (*self._didactic_actors, self._didactic_point_actor):
             if actor.GetVisibility():
                 actor.SetVisibility(False)
 
-    def _compute_didactic(self) -> None:
+    def _cheap_geodesic(self, p0: np.ndarray, p1: np.ndarray,
+                        n_samples: int = 16) -> np.ndarray:
+        """Approximate geodesic from *p0* to *p1*: Euclidean line
+        projected onto the surface.
+
+        This is the same approximation ``hybrid_de_casteljau_curve``
+        uses for the H_out↔H_in segment of the blue curve when it is
+        called with ``path_12=None`` (i.e. during drag).  Cost is one
+        ``project_smooth_batch`` call (Numba-JIT) — sub-millisecond on
+        typical meshes.
+
+        Used by ``_compute_didactic(fast=True)`` to keep the scaffold
+        live during drag.  After release the scaffold re-renders with
+        ``fast=False`` and the lines snap to the exact geodesic — the
+        "snap" itself is informative (it shows the user how far the
+        Euclidean approximation can drift on curved surfaces).
+        """
+        line = np.linspace(p0, p1, n_samples)
+        return self.geo.project_smooth_batch(line)
+
+    def _ensure_didactic_slider(self) -> None:
+        """Lazy-create the t slider for the didactic scaffold.
+
+        PyVista's ``add_slider_widget`` is non-trivial — it builds a
+        ``vtkSliderWidget`` with its own representation, adds the
+        observer, and ties it to the renderer.  Tearing it down on
+        every toggle-off and rebuilding on every toggle-on would be
+        wasteful (and visually flickers on some OpenGL drivers), so
+        we build once, then enable / disable per toggle.
+
+        Position: a horizontal slider in the bottom-left, just above
+        the surface-opacity slider (``y = 0.10`` vs ``0.04``), 15%
+        wide.  Same ``modern`` style for visual consistency.  The
+        ``always`` interaction event makes the cascade refresh
+        continuously while sliding (each tick costs ~75-125 ms; on
+        modern hardware this still feels live).
+        """
+        if self._didactic_slider is not None:
+            return
+        self._didactic_slider = self.plotter.add_slider_widget(
+            self._on_didactic_t_change,
+            [0.0, 1.0], value=self._didactic_t,
+            title="t", pointa=(0.0, 0.10), pointb=(0.15, 0.10),
+            style='modern', fmt="%.2f", interaction_event='always',
+        )
+
+    def _on_didactic_t_change(self, value: float) -> None:
+        """Slider callback: re-run the cascade at the new ``t``.
+
+        The slider fires this on every interaction tick (we passed
+        ``interaction_event='always'``), so the user sees the four
+        auxiliary lines reshape live as they drag.  Cost per call is
+        the same ~75-125 ms as the initial toggle — acceptable on
+        modern hardware; the cascade is a teaching aid, not a hot
+        render path.
+        """
+        self._didactic_t = float(value)
+        if self._didactic_visible:
+            self._compute_didactic()
+            self.plotter.render()
+
+    def _compute_didactic(self, fast: bool = False) -> None:
         """Build the 4 auxiliary geodesic lines for the active spline's
-        last span at t=0.5.
+        last span at parameter ``self._didactic_t``.
 
         "Last span" depends on the spline's open/closed flag:
           * Open spline of N nodes: span between ``nodes[N-2]`` and
@@ -4032,10 +4305,24 @@ class GeodesicSplineApp(MidpointShooterApp):
         a single node), the actors are hidden and a brief HUD note
         explains why.
 
-        Cost: four ``compute_endpoint_local`` calls (one per geodesic
-        line drawn, plus the level-3 endpoint connecting c0 and c1).
-        Synchronous on the main thread by design — see the on-demand
-        contract in the ``__init__`` block.
+        Two compute modes:
+          * ``fast=False`` (default, used on toggle, slider, and
+            consolidation post-drag): four ``compute_endpoint_local``
+            calls — exact geodesics matching what the orange curve
+            uses.  ~75-125 ms total.
+          * ``fast=True`` (used while a node is being dragged):
+            Euclidean line + ``project_smooth_batch`` for each of the
+            four scaffold segments.  ~5-10 ms total — same approximation
+            ``hybrid_de_casteljau_curve`` uses for blue's ``path_12``
+            during drag (see ``_recompute_spans``), so during drag the
+            scaffold is visually consistent with blue.  On debounce
+            release the scaffold re-renders with ``fast=False`` and
+            "snaps" to the exact geodesic — the visible difference
+            between the two passes is itself didactic.
+
+        The cascade as a function of ``t`` is what the slider exposes
+        (callback ``_on_didactic_t_change``); each slider tick re-fires
+        this method.
         """
         sid = self.active_spline_idx
         if sid < 0 or sid >= len(self.splines):
@@ -4065,43 +4352,63 @@ class GeodesicSplineApp(MidpointShooterApp):
         path_b = n0.path_b
         path_a_rev = n1.path_a[::-1]
 
+        # ``_pair_path(p0, p1)`` resolves to either the exact geodesic
+        # (slow, accurate) or a Euclidean line projected onto the
+        # surface (fast, approximate — same trick the blue curve uses
+        # via ``hybrid_de_casteljau_curve``'s ``path_12=None`` branch
+        # during drag).  Closing over ``fast`` here keeps the four
+        # resolution sites below readable.
+        def _pair_path(p0, p1):
+            if fast:
+                return self._cheap_geodesic(p0, p1)
+            path = self.geo.compute_endpoint_local(p0, p1)
+            if path is None or len(path) < 2:
+                return np.array([p0, p1])
+            return path
+
         # Level 1: middle segment H_out -> H_in.
-        path_12 = self.geo.compute_endpoint_local(H_out, H_in)
-        if path_12 is None or len(path_12) < 2:
-            path_12 = np.array([H_out, H_in])
+        path_12 = _pair_path(H_out, H_in)
 
         cum_b, total_b = GeodesicMesh.compute_path_lengths(path_b)
         cum_a, total_a = GeodesicMesh.compute_path_lengths(path_a_rev)
         cum_12, total_12 = GeodesicMesh.compute_path_lengths(path_12)
 
-        t = 0.5
+        # Clamp defensively — the slider should already constrain the
+        # value to [0, 1], but a hand-set ``self._didactic_t`` could
+        # arrive out of range and break geodesic_lerp's path indexing.
+        t = float(np.clip(self._didactic_t, 0.0, 1.0))
         b01 = GeodesicMesh.geodesic_lerp(path_b, t, cum_b, total_b)
         b12 = GeodesicMesh.geodesic_lerp(path_12, t, cum_12, total_12)
         b23 = GeodesicMesh.geodesic_lerp(path_a_rev, t, cum_a, total_a)
 
         # Level 2: two chords between consecutive level-1 midpoints.
-        path_c0 = self.geo.compute_endpoint_local(b01, b12)
-        if path_c0 is None or len(path_c0) < 2:
-            path_c0 = np.array([b01, b12])
-        path_c1 = self.geo.compute_endpoint_local(b12, b23)
-        if path_c1 is None or len(path_c1) < 2:
-            path_c1 = np.array([b12, b23])
+        path_c0 = _pair_path(b01, b12)
+        path_c1 = _pair_path(b12, b23)
 
         cum_c0, total_c0 = GeodesicMesh.compute_path_lengths(path_c0)
         cum_c1, total_c1 = GeodesicMesh.compute_path_lengths(path_c1)
         c0 = GeodesicMesh.geodesic_lerp(path_c0, t, cum_c0, total_c0)
         c1 = GeodesicMesh.geodesic_lerp(path_c1, t, cum_c1, total_c1)
 
-        # Level 3: the chord that, evaluated at t=0.5, IS the orange
-        # curve sample at midpoint.  Drawing it makes the cascade
-        # collapse visually obvious.
-        path_final = self.geo.compute_endpoint_local(c0, c1)
-        if path_final is None or len(path_final) < 2:
-            path_final = np.array([c0, c1])
+        # Level 3: the chord that, evaluated at t, IS the orange curve
+        # sample at parameter t.  Drawing it makes the cascade collapse
+        # visually obvious.
+        path_final = _pair_path(c0, c1)
 
         for pd, path in zip(self._didactic_pds,
                             (path_12, path_c0, path_c1, path_final)):
             update_line_inplace(pd, path)
+
+        # Evaluate the cascade's collapse point — geodesic_lerp on
+        # path_final at the same ``t``.  Place the level-3 marker
+        # sphere there.  This point is, by construction, the orange
+        # curve's sample at parameter ``t``; the marker visually
+        # confirms the orange curve passes through it.
+        cum_f, total_f = GeodesicMesh.compute_path_lengths(path_final)
+        final_pt = GeodesicMesh.geodesic_lerp(path_final, t, cum_f, total_f)
+        self._didactic_point_buf[0] = final_pt
+        self._didactic_point_pd.points = self._didactic_point_buf
+        self._didactic_point_pd.Modified()
 
         # All actors share visibility — flip on at the end so a
         # mid-compute exception leaves them in a clean state.  Local
@@ -4110,11 +4417,12 @@ class GeodesicSplineApp(MidpointShooterApp):
         # path and this compute method, so deferring the import keeps
         # geo_splines start-up fast.
         import gizmo
-        for actor in self._didactic_actors:
+        op = gizmo.GIZMO_OPACITY
+        for actor in (*self._didactic_actors, self._didactic_point_actor):
             actor.SetVisibility(True)
             # Keep opacity in sync with the global handle opacity
             # (cycled via the 't' key inside ``_cycle_gizmo_opacity``).
-            actor.GetProperty().SetOpacity(gizmo.GIZMO_OPACITY)
+            actor.GetProperty().SetOpacity(op)
 
         self._didactic_dirty = False
 
@@ -4669,9 +4977,41 @@ class GeodesicSplineApp(MidpointShooterApp):
         affected by leftover state.  Wraps actor removal in try/except
         via ``safe_remove_actor`` because the plotter may already be
         closed (window X button) when cleanup runs.
+
+        In addition to the per-span / per-spline curve actors handled
+        by ``_clear_all_curve_caches``, the editor owns several
+        single-instance "auxiliary" actors created in ``__init__``:
+        the curve-hover marker, the snap indicator, the stitch
+        preview, the three coord-edit preview actors (input sphere,
+        projected sphere, connector line) and the five didactic
+        scaffold actors (four lines + collapse-point sphere).  In a
+        normal session the plotter window closes and the OS reclaims
+        them, but for repeated-instance flows (notebooks, tests,
+        interactive exploration that creates several editors per
+        process) leaving them dangling leaks references to vtkPolyData
+        + vtkActor on the plotter.  We unregister them explicitly here.
         """
         self._work_mgr.shutdown()
         self._clear_all_curve_caches()
+
+        # Auxiliary single-instance actors — collected as one list so
+        # the iteration is obvious and easy to extend if more are added
+        # later.  ``safe_remove_actor`` already swallows the post-close
+        # ValueError / AttributeError from VTK so this is safe even if
+        # the plotter has already torn down.
+        aux_actors = [
+            self._curve_hover_actor,
+            self._snap_indicator_actor,
+            self._stitch_actor,
+            self._coord_preview_actor,
+            self._coord_preview_input_actor,
+            self._coord_preview_line_actor,
+            self._didactic_point_actor,
+        ]
+        aux_actors.extend(self._didactic_actors)
+        for actor in aux_actors:
+            safe_remove_actor(self.plotter, actor)
+
         # Restore VTK global state to defaults — ``__init__`` flips the
         # mapper resolution to PolygonOffset to keep curves above the
         # surface.  Other applications running in the same interpreter

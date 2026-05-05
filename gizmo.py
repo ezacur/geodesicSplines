@@ -292,7 +292,13 @@ def safe_remove_actor(plotter: pv.Plotter, actor) -> None:
         pass
     try:
         plotter.remove_actor(actor)
-    except (AttributeError, RuntimeError, KeyError):
+    except (AttributeError, RuntimeError, KeyError, ValueError):
+        # ValueError covers ``remove_actor`` on an actor that was never
+        # registered or has already been removed (PyVista raises it
+        # from its own bookkeeping check).  Idempotent removal is
+        # required by ``cleanup()`` which iterates over a static list
+        # of auxiliary actors regardless of whether each one was ever
+        # made visible.
         pass
 
 
