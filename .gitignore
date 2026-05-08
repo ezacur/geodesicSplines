@@ -33,3 +33,16 @@ __pycache__/*.nbc
 
 # Project-specific
 *.autosave.json
+
+# Editor-generated artifacts (sessions, exports, scratch meshes).
+# The session pattern is intentionally narrow — matching the
+# YYYYMMDD_HHMMSS prefix the editor writes — so that example /
+# documentation JSONs (e.g. ``01_demo.json``) are not silently
+# excluded.  Add a literal filename here (or ``geodesic_export_*.txt``
+# style) if a new artifact category is introduced.
+*.vtk
+*.txt
+20[0-9][0-9][0-9][0-9][0-9][0-9]_*.json
+
+# Claude Code workspace metadata
+.claude/

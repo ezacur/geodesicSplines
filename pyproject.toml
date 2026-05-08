@@ -15,8 +15,12 @@ dependencies = [
 
 [project.optional-dependencies]
 jit = ["numba>=0.58"]
+# Ruff version is pinned (and matched in .pre-commit-config.yaml +
+# .github/workflows/ci.yml) so the same version flags the same
+# issues everywhere — no drift between contributor pre-commit, CI,
+# and ad-hoc ``pip install -e .[dev]`` installs.
 dev = [
-    "ruff>=0.6",
+    "ruff~=0.7.0",
     "pytest>=8",
     "mypy>=1.10",
 ]

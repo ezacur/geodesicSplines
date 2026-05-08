@@ -65,8 +65,57 @@ log.setLevel(logging.DEBUG if os.environ.get("GEO_SPLINES_DEBUG") else logging.I
 
 
 def load_json(path: str) -> dict:
-    with open(path, 'r', encoding='utf-8') as f:
-        return json.load(f)
+    """Load *path* as JSON, returning the top-level dict.
+
+    Surfaces friendly diagnostics (and exits with code 2) for the
+    three classes of failure end users actually hit:
+
+      * file missing / unreadable
+      * not valid JSON
+      * top level is not an object
+
+    Also runs the same ``_validate_session_dict`` schema check the
+    interactive editor does, so a JSON the editor rejects can never
+    silently mis-export here.  Cross-tool consistency guarantee.
+    """
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        log.error("session file not found: %s", path)
+        sys.exit(2)
+    except PermissionError as exc:
+        log.error("cannot read %s: %s", path, exc)
+        sys.exit(2)
+    except json.JSONDecodeError as exc:
+        log.error("malformed JSON in %s: %s", path, exc)
+        sys.exit(2)
+    except OSError as exc:
+        log.error("I/O error reading %s: %s", path, exc)
+        sys.exit(2)
+
+    if not isinstance(data, dict):
+        log.error("session JSON must be an object; got %s",
+                  type(data).__name__)
+        sys.exit(2)
+
+    # Validate against the same schema the editor enforces — keeps
+    # CLI / GUI behaviour aligned and rejects hostile / hand-edited
+    # inputs (NaN/Inf coordinates, missing splines, malformed nodes)
+    # with a clear error rather than crashing deep inside the solver.
+    try:
+        from geo_splines import _validate_session_dict as _validate
+    except ImportError:
+        # geo_splines pulls pyvista; if that's unavailable, the rest
+        # of this CLI cannot function either, so re-raise.
+        raise
+    try:
+        _validate(data)
+    except ValueError as exc:
+        log.error("invalid session %s: %s", path, exc)
+        sys.exit(2)
+
+    return data
 
 
 def _read_mesh_VF(mesh_file: str) -> tuple[np.ndarray, np.ndarray]:
@@ -146,7 +195,10 @@ def rebuild_mesh_and_nodes(data: dict):
         F = np.asarray(mesh.faces, dtype=int).reshape(-1, 4)[:, 1:]
     else:
         V, F = _read_mesh_VF(mesh_file)
-    geo = GeodesicMesh(V, F)
+    # CLI exporter never picks: ``compute_blue`` / ``compute_orange``
+    # / ``compute_interp`` only consume KDTree + solver + projection.
+    # Skip locator construction (~250 ms on dense meshes).
+    geo = GeodesicMesh(V, F, build_locator=False)
 
     def _build_node_v2(nd, origin):
         """v2 schema: handles persisted as literal 3-D positions.
@@ -169,7 +221,7 @@ def rebuild_mesh_and_nodes(data: dict):
                 return None, None
             p_target = np.asarray(p_rec, dtype=float)
             try:
-                path = geo.compute_endpoint_from_origin(cache, p_target)
+                path, _ = geo.compute_endpoint_from_origin(cache, p_target)
             except (RuntimeError, ValueError, TypeError, IndexError) as exc:
                 log.debug("v2 load: solver failed for handle %s (%s)",
                           p_target.tolist(), exc)
@@ -222,14 +274,24 @@ def rebuild_mesh_and_nodes(data: dict):
     return geo, splines, splines_closed
 
 
-def compute_blue(geo, nodes, closed, n_samples):
+def compute_blue(geo, nodes, closed, n_samples) -> list[np.ndarray]:
     """Computes semi-geodesic Bézier (blue) curve points for one spline.
 
     Matches the interactive app's consolidated blue: level-1 geodesic lerp
     on all three control segments (including H_out→H_in via
     ``compute_endpoint_local``); levels 2-3 Euclidean + projection.
+
+    Return contract
+    ~~~~~~~~~~~~~~~
+    ``list[np.ndarray]`` — one ``(M_i, 3)`` polyline **per Bézier span**.
+    A spline of N nodes yields ``N - 1`` open or ``N`` closed entries.
+    Returns an empty list when the spline has fewer than 2 nodes.
+
+    Same shape as ``compute_orange``.  ``compute_interp`` is the
+    intentional outlier (one polyline for the whole spline) — see its
+    docstring for why.
     """
-    all_pts = []
+    all_pts: list[np.ndarray] = []
     n_nodes = len(nodes)
     if n_nodes < 2:
         return all_pts
@@ -246,7 +308,7 @@ def compute_blue(geo, nodes, closed, n_samples):
 
         # Geodesic H_out → H_in via local submesh solver
         log.debug("span %d: computing path_12 (H_out -> H_in)", i)
-        path_12 = geo.compute_endpoint_local(n0['p_b'], n1['p_a'])
+        path_12, _ = geo.compute_endpoint_local(n0['p_b'], n1['p_a'])
         if path_12 is None or len(path_12) < 2:
             path_12 = None
 
@@ -260,8 +322,18 @@ def compute_blue(geo, nodes, closed, n_samples):
     return all_pts
 
 
-def _orange_worker_init() -> None:
-    """ProcessPoolExecutor initializer: blocks SIGINT in worker children.
+# Per-worker GeodesicMesh, built ONCE in the initializer and reused
+# by every task running on that worker.  The previous implementation
+# pickled (V, F) into every task tuple — at 240 K faces that's
+# 10-20 MB serialised per span, hammered through the IPC pipe
+# n_spans times.  The initializer pattern picks (V, F) up exactly
+# once per worker process.
+_worker_geo: 'GeodesicMesh | None' = None
+
+
+def _orange_worker_init(v: np.ndarray, f: np.ndarray) -> None:
+    """ProcessPoolExecutor initializer: blocks SIGINT and builds the
+    per-worker ``GeodesicMesh`` once.
 
     On Ctrl+C the OS sends SIGINT to the parent and every child in the
     process group.  Without this guard, each worker would interrupt
@@ -275,9 +347,24 @@ def _orange_worker_init() -> None:
     ``executor.shutdown(wait=True)`` on context exit, which kills the
     children at the OS level (``TerminateProcess`` on Windows) without
     giving Fortran cleanup a chance to run.
+
+    *v* / *f* are required and passed as ``initargs`` from the parent
+    — there is no legitimate caller without them.  Defaults were
+    removed so accidental misuse fails immediately at executor
+    startup with a clear ``TypeError`` rather than producing a worker
+    with ``_worker_geo = None`` and crashing later inside
+    ``_orange_span_worker`` with an opaque ``AttributeError``.
+
+    Workers don't need the VTK locator (only the KDTree + solver),
+    so we pass ``build_locator=False`` to skip the ~250 ms locator
+    construction per worker.
     """
     import signal as _signal
     _signal.signal(_signal.SIGINT, _signal.SIG_IGN)
+
+    global _worker_geo
+    from geodesics import GeodesicMesh as _GM
+    _worker_geo = _GM(v, f, build_locator=False)
 
 
 def _orange_span_worker(task_data):
@@ -303,18 +390,20 @@ def _orange_span_worker(task_data):
     The caller is responsible for the secant-chord subdivision pass
     (the editor runs it post-worker in ``_apply_orange_progress``).
     """
-    (v, f, ctrl, path_b, path_a_rev, t_grid) = task_data
+    (ctrl, path_b, path_a_rev, t_grid) = task_data
 
     # Local imports — needed inside spawn-mode worker children.
     import numpy as np
-    from geodesics import GeodesicMesh
 
-    # GeodesicMesh accepts (V, F) arrays directly.
-    geo = GeodesicMesh(v, f)
+    # Per-worker mesh built once by ``_orange_worker_init`` — we trust
+    # it is present (the initializer is always passed via initargs in
+    # the parent); a missing worker-local mesh is a programmer error
+    # and an AttributeError here is the right diagnostic.
+    geo = _worker_geo
 
     P0, H_out, H_in, P1 = ctrl
 
-    path_12 = geo.compute_endpoint_local(H_out, H_in)
+    path_12, _ = geo.compute_endpoint_local(H_out, H_in)
     if path_12 is None or len(path_12) < 2:
         path_12 = np.array([H_out, H_in])
 
@@ -337,7 +426,7 @@ def _orange_span_worker(task_data):
         b23 = GeodesicMesh.geodesic_lerp(path_a_rev, t, cum_a, total_a)
 
         try:
-            path_c0 = geo.compute_endpoint_local(b01, b12)
+            path_c0, _ = geo.compute_endpoint_local(b01, b12)
         except (RuntimeError, ValueError) as exc:
             log.debug("compute_endpoint_local(b01, b12) failed: %s", exc)
             path_c0 = np.array([b01, b12])
@@ -345,7 +434,7 @@ def _orange_span_worker(task_data):
             path_c0 = np.array([b01, b12])
 
         try:
-            path_c1 = geo.compute_endpoint_local(b12, b23)
+            path_c1, _ = geo.compute_endpoint_local(b12, b23)
         except (RuntimeError, ValueError) as exc:
             log.debug("compute_endpoint_local(b12, b23) failed: %s", exc)
             path_c1 = np.array([b12, b23])
@@ -358,7 +447,7 @@ def _orange_span_worker(task_data):
         c1 = GeodesicMesh.geodesic_lerp(path_c1, t, cum_c1, total_c1)
 
         try:
-            path_f = geo.compute_endpoint_local(c0, c1)
+            path_f, _ = geo.compute_endpoint_local(c0, c1)
         except (RuntimeError, ValueError) as exc:
             log.debug("compute_endpoint_local(c0, c1) failed: %s", exc)
             path_f = np.array([c0, c1])
@@ -371,7 +460,8 @@ def _orange_span_worker(task_data):
     return np.array(span_pts)
 
 
-def compute_orange(geo, nodes, closed, n_samples, adaptive: bool = True):
+def compute_orange(geo, nodes, closed, n_samples,
+                   adaptive: bool = True) -> list[np.ndarray]:
     """Computes fully geodesic (orange) de Casteljau points for one spline.
 
     Mirrors the editor's orange-layer pipeline end-to-end so the export
@@ -387,6 +477,13 @@ def compute_orange(geo, nodes, closed, n_samples, adaptive: bool = True):
          worker's seed logic.
       4. ``subdivide_secant_chords`` post-processing identical to
          ``_apply_orange_progress`` in the editor.
+
+    Return contract
+    ~~~~~~~~~~~~~~~
+    ``list[np.ndarray]`` — one ``(M_i, 3)`` polyline **per Bézier span**.
+    Spans whose endpoints could not be solved are filtered out, so the
+    list length may be less than ``N - 1`` (open) / ``N`` (closed).
+    Same shape as ``compute_blue``.
     """
     n_nodes = len(nodes)
     if n_nodes < 2:
@@ -394,11 +491,6 @@ def compute_orange(geo, nodes, closed, n_samples, adaptive: bool = True):
 
     n_spans = n_nodes if closed else n_nodes - 1
     tasks = []
-
-    # Mesh arrays passed by reference once per task — avoids re-pickling
-    # the large V / F per worker call.
-    v = geo.V
-    f = geo.F
 
     for i in range(n_spans):
         n0 = nodes[i]
@@ -424,7 +516,9 @@ def compute_orange(geo, nodes, closed, n_samples, adaptive: bool = True):
         else:
             t_grid = np.linspace(0.0, 1.0, n_samples)
 
-        tasks.append((v, f, ctrl, path_b, path_a_rev, t_grid))
+        # V / F NOT in the task tuple — sent once via ``initargs``
+        # below.  Saves ~10-20 MB of pickling per span on dense meshes.
+        tasks.append((ctrl, path_b, path_a_rev, t_grid))
 
     log.info("computing %d spans in parallel...", n_spans)
 
@@ -432,7 +526,9 @@ def compute_orange(geo, nodes, closed, n_samples, adaptive: bool = True):
     valid_task_indices = [i for i, t in enumerate(tasks) if t is not None]
     valid_tasks = [tasks[i] for i in valid_task_indices]
 
-    with ProcessPoolExecutor(initializer=_orange_worker_init) as executor:
+    with ProcessPoolExecutor(
+            initializer=_orange_worker_init,
+            initargs=(geo.V, geo.F)) as executor:
         results = list(executor.map(_orange_span_worker, valid_tasks))
 
     # Post-process: same secant chord subdivision the editor applies in
@@ -450,11 +546,20 @@ def compute_orange(geo, nodes, closed, n_samples, adaptive: bool = True):
     return [p for p in all_pts if p is not None]
 
 
-def compute_interp(geo, nodes, closed, n_samples):
+def compute_interp(geo, nodes, closed, n_samples) -> list[np.ndarray]:
     """Computes interpolation B-spline (black) curve points for one spline.
 
     Uses scipy ``splprep``/``splev`` through node origins, projected onto
     the surface.  Fast (~ms), no geodesic awareness — purely node-defined.
+
+    Return contract
+    ~~~~~~~~~~~~~~~
+    ``list[np.ndarray]`` — at most one ``(N, 3)`` polyline covering the
+    **entire spline**.  Unlike ``compute_blue`` / ``compute_orange``,
+    interp is a single fitted curve (not per-span Bezier sampling), so
+    the list always has 0 or 1 element.  Downstream writers iterate
+    "for spans in list, for span in spans" so the shape is compatible
+    even though the semantics differ.
     """
     from scipy.interpolate import splprep, splev
 
@@ -617,12 +722,28 @@ def main():
     parser.add_argument('json_file', help="Path to the splines JSON file")
     parser.add_argument('layer', nargs='?', choices=['b', 'o', 'k'], default='o',
                         help="Curve layer: b=blue(semi-geodesic), o=orange(exact), k=interp(black) (default: o)")
-    parser.add_argument('--samples', type=int, default=60,
-                        help="Minimum samples per span (default: 60)")
-    parser.add_argument('--obj', action='store_true',
-                        help="Export to .obj file (basename.obj)")
-    parser.add_argument('--vtk', action='store_true',
-                        help="Export to binary legacy .vtk file (basename.vtk)")
+
+    def _samples_type(value: str) -> int:
+        # ``int(value)`` itself raises ArgumentTypeError-equivalent if
+        # non-numeric.  We add a lower-bound check: ``< 2`` would feed
+        # ``np.linspace(0, 1, 0)`` or worse to the curve evaluator and
+        # crash with a cryptic shape error far from the input boundary.
+        n = int(value)
+        if n < 2:
+            raise argparse.ArgumentTypeError(
+                f"--samples must be >= 2 (got {n})")
+        return n
+
+    parser.add_argument('--samples', type=_samples_type, default=60,
+                        help="Minimum samples per span (>= 2, default: 60)")
+    # Mutually-exclusive output formats.  Without the group, passing
+    # both ``--obj --vtk`` silently dispatched to ``--obj`` because of
+    # the ``elif`` chain in main() — surprising and undocumented.
+    out_group = parser.add_mutually_exclusive_group()
+    out_group.add_argument('--obj', action='store_true',
+                           help="Export to .obj file (basename.obj)")
+    out_group.add_argument('--vtk', action='store_true',
+                           help="Export to binary legacy .vtk file (basename.vtk)")
     args = parser.parse_args()
 
     data = load_json(args.json_file)

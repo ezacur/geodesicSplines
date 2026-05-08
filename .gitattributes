@@ -1,0 +1,28 @@
+# Normalise line endings repo-wide.
+#
+# Without this, Dropbox + Windows users see ``git status`` show
+# every text file as ``M`` after a fresh clone because the file-
+# system writes CRLF while the working-tree blob was committed as
+# LF.  ``eol=lf`` forces the working tree to LF on checkout so the
+# index and the working copy match byte-for-byte.
+#
+# Binary mesh / model assets are flagged explicitly so git does not
+# attempt EOL conversion on them — silent corruption otherwise.
+
+* text=auto eol=lf
+
+# Source files: text, LF.
+*.py     text eol=lf
+*.toml   text eol=lf
+*.yaml   text eol=lf
+*.yml    text eol=lf
+*.md     text eol=lf
+*.cfg    text eol=lf
+*.txt    text eol=lf
+*.json   text eol=lf
+
+# Binary assets: never EOL-convert.
+*.obj    binary
+*.ply    binary
+*.stl    binary
+*.vtk    binary

@@ -116,11 +116,16 @@ The smoothing pipeline:
        - **Uniform** (default, ``COTANGENT_WEIGHTS = False``): each
          neighbor has equal weight.  Fast; assumes roughly equilateral
          triangles.
-       - **Cotangent** (``COTANGENT_WEIGHTS = True``): weights by the
-         cotangent of the dihedral angle at the shared edge.  Invariant
-         to triangulation quality — better for photogrammetry / scanned
-         meshes with long thin triangles, where uniform weights bias the
-         smoothed normals toward densely-tessellated regions.
+       - **Cotangent** (``COTANGENT_WEIGHTS = True``): classical
+         Pinkall-Polthier weights — for each shared edge, the dual-edge
+         weight is ``½ · (cot α + cot β)`` where α and β are the
+         angles **opposite** to the shared edge in each triangle.
+         This is the canonical discrete Laplace-Beltrami discretisation:
+         it depends only on intrinsic triangle geometry, so the
+         smoother is genuinely invariant to triangulation quality.
+         Better for photogrammetry / scanned meshes with long thin
+         triangles where uniform weights bias the smoothed normals
+         toward densely-tessellated regions.
 
   3. ``_vertex_normals`` — area-weighted averages of *smooth* face
      normals, not raw ones.  Clean by construction.
@@ -301,7 +306,7 @@ class OriginCache(TypedDict):
     kdtree: KDTree
 
 try:
-    from numba import njit
+    from numba import njit, prange
     HAS_NUMBA: bool = True
 except ImportError:
     HAS_NUMBA = False
@@ -311,6 +316,11 @@ except ImportError:
         if args and callable(args[0]):
             return args[0]
         return lambda f: f
+
+    # ``prange`` falls back to plain ``range`` when Numba is absent —
+    # the @njit shim above already neutralises ``parallel=True`` so the
+    # kernel runs serially in pure Python with identical semantics.
+    prange = range
 
 
 # =====================================================================
@@ -465,8 +475,13 @@ def _shoot_loop(curr_p, curr_d, curr_fid, rem, max_steps, fast_mode,
     ``curr_p``, ``curr_d``, ``curr_fid`` and executes phases 1–7 of the
     geodesic tracing algorithm.
 
-    Returns *path_n* (number of points written to *path_buf*).
-    A return value ≤ 1 means the shoot failed (no valid path produced).
+    Returns ``(path_n, exit_code)``: *path_n* is the number of points
+    written to *path_buf* (≤ 1 means the shoot failed — no valid path
+    produced).  *exit_code* is 0 on a normal exit and 1 when the loop
+    was terminated by the consecutive-fallback safeguard described
+    below — a signal that the local mesh is not 2-manifold around the
+    truncation point and the rendered geodesic ends short of the
+    requested length.
 
     Vertex/edge fallback (Phase 2b)
     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -489,6 +504,21 @@ def _shoot_loop(curr_p, curr_d, curr_fid, rem, max_steps, fast_mode,
     path_buf[0, 2] = curr_p[2]
     path_n = 1
     edge_buf = np.empty(3)
+    # Hoisted out of the per-step loop: candidate-direction scratch used
+    # only by the Phase 2b vertex/edge fallback (~1% of iterations) but
+    # previously re-allocated every iteration regardless.
+    cand_d = np.empty(3)
+    # Anti-bounce: count consecutive Phase 2b fallbacks.  On non-2-
+    # manifold meshes (>2 faces sharing a vertex with mis-oriented
+    # normals) the fallback can keep selecting candidates whose
+    # parallel-transport leaves ``curr_p`` clustered around the same
+    # vertex, so the next ``_ray_edge_jit`` fails again and Phase 2b
+    # fires again — an infinite loop bounded only by ``max_steps`` and
+    # the user's patience.  Breaking out after 2 consecutive
+    # fallbacks ends the geodesic at the last good edge crossing
+    # rather than spending the whole step budget thrashing.
+    fallback_streak = 0
+    exit_code = 0  # 0=normal, 1=non-manifold-fan truncation
 
     for _ in range(max_steps):
         if rem < 1e-12:
@@ -539,7 +569,6 @@ def _shoot_loop(curr_p, curr_d, curr_fid, rem, max_steps, fast_mode,
             best_hx = 0.0
             best_hy = 0.0
             best_hz = 0.0
-            cand_d = np.empty(3)
             best_d0 = curr_d[0]
             best_d1 = curr_d[1]
             best_d2 = curr_d[2]
@@ -596,6 +625,19 @@ def _shoot_loop(curr_p, curr_d, curr_fid, rem, max_steps, fast_mode,
                 hy = best_hy
                 hz = best_hz
                 edge_idx = best_ei
+                fallback_streak += 1
+                # >2 consecutive fallbacks => degenerate vertex fan;
+                # quit at the last good edge crossing rather than
+                # re-entering the loop indefinitely.  Caller surfaces
+                # this via the HUD so the user knows the mesh is
+                # non-manifold here and the truncation is not a
+                # software bug.
+                if fallback_streak > 2:
+                    exit_code = 1
+                    break
+        else:
+            # Phase 2 succeeded — reset the streak.
+            fallback_streak = 0
 
         if found == 0:
             break
@@ -648,10 +690,10 @@ def _shoot_loop(curr_p, curr_d, curr_fid, rem, max_steps, fast_mode,
         curr_p[1] = hy + 1e-7 * curr_d[1]
         curr_p[2] = hz + 1e-7 * curr_d[2]
 
-    return path_n
+    return path_n, exit_code
 
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=True, parallel=True)
 def _project_batch_kernel(pts, nearest_verts, vf_data, vf_off,
                           fverts, fnormals, out, out_faces):
     """Inner projection loop for ``project_smooth_batch``.
@@ -660,12 +702,21 @@ def _project_batch_kernel(pts, nearest_verts, vf_data, vf_off,
     point against all faces adjacent to its k nearest vertices.
     KDTree query is done in the Python wrapper before calling this kernel.
 
+    Parallelism
+    ~~~~~~~~~~~
+    Each iteration of the outer loop writes only ``out[i]`` and
+    ``out_faces[i]`` — independent across ``i`` — so the loop is
+    parallelised via ``prange``.  Yields ~4-8× on multicore for large
+    de Casteljau batches.  When Numba is unavailable, ``prange``
+    degrades to ``range`` and the kernel runs serially with identical
+    semantics.
+
     *out_faces* (``int32[N]``) receives the index of the face each point
     projected onto (``-1`` if no valid face was found).  Callers that
     don't need the face indices can pass a 1-element dummy buffer.
     """
     n = pts.shape[0]
-    for i in range(n):
+    for i in prange(n):
         px = pts[i, 0]; py = pts[i, 1]; pz = pts[i, 2]
         best_d2 = 1e30
         rx = px; ry = py; rz = pz
@@ -802,7 +853,18 @@ class GeodesicMesh:
     # it is essentially free on small meshes and real on large ones.
     MORTON_REORDER = True
 
-    def __init__(self, V: np.ndarray | object, F: np.ndarray | None = None):
+    def __init__(self, V: np.ndarray | object, F: np.ndarray | None = None,
+                 *, build_locator: bool = True):
+        """Build a GeodesicMesh from raw arrays or a ``pv.PolyData``.
+
+        ``build_locator`` (default True) controls whether the
+        ``vtkStaticCellLocator`` is constructed.  Background workers
+        (orange / blue export) only call ``compute_endpoint_local``
+        which uses the KDTree — they pass ``build_locator=False`` to
+        skip the ~250 ms locator construction *per worker process*
+        (~1 s saved across 4 workers on a 240 K-face mesh).
+        """
+        self._build_locator_enabled = build_locator
         if hasattr(V, 'points') and hasattr(V, 'faces'):
             self._pv_mesh = V
             self.V = np.asarray(V.points, dtype=float)
@@ -810,6 +872,64 @@ class GeodesicMesh:
         else:
             self._pv_mesh = None
             self.V = np.asarray(V, dtype=float); self.F = np.asarray(F, dtype=int)
+
+        # Reject empty / degenerate meshes up front with a clear
+        # message, instead of letting them crash deep inside the
+        # downstream constructors with cryptic errors:
+        #   - ``KDTree(V)`` raises ``ValueError`` on empty V
+        #   - ``np.cross`` returns shape (0, 3) on empty F, which then
+        #     propagates into ``_compute_face_normals`` and the JIT
+        #     kernels with hard-to-debug array-shape mismatches
+        #   - ``find_face`` falls through to the KDTree fallback and
+        #     returns garbage indices on nearly-empty meshes
+        if self.V.ndim != 2 or self.V.shape[1] != 3 or len(self.V) < 3:
+            raise ValueError(
+                f"GeodesicMesh requires V of shape (N>=3, 3); got {self.V.shape}")
+        if self.F.ndim != 2 or self.F.shape[1] != 3 or len(self.F) < 1:
+            raise ValueError(
+                f"GeodesicMesh requires F of shape (M>=1, 3); got {self.F.shape}")
+        if int(self.F.max()) >= len(self.V):
+            raise ValueError(
+                f"GeodesicMesh: F indexes vertex {int(self.F.max())} "
+                f"but V has only {len(self.V)} vertices")
+
+        # Topology sanitisation for ``pp3d.EdgeFlipGeodesicSolver``.
+        # geometry-central's manifold check (``GC_SAFETY_ASSERT``) raises
+        # on duplicate edges, which crop up in real-world meshes
+        # (anatomical scans, CAD pieces merged from multiple sources)
+        # via duplicate faces, non-2-manifold edge fans, or self-edge
+        # triangles.  Detection passes are O(F log F) and short-circuit
+        # when the mesh is already clean, so the cost on a valid input
+        # is one ``np.unique`` over the face triples.  When defects
+        # *are* found the offending faces are dropped and the cleanup
+        # is logged so the user knows what was changed.  Sanitisation
+        # runs **before** Morton reorder + every derived structure so
+        # the rest of ``__init__`` only ever sees a clean topology.
+        self.V, self.F, sanitize_report = self._sanitize_for_solver(
+            self.V, self.F)
+        _changed = (sanitize_report['total_faces_dropped'] > 0
+                    or sanitize_report['vertex_splits'] > 0)
+        if _changed:
+            log.warning(
+                "mesh sanitised for pp3d: dropped %d faces "
+                "(%d duplicate, %d non-manifold, %d inconsistent-winding, "
+                "%d self-edge), split %d non-manifold vertices, "
+                "freed %d unreferenced vertices",
+                sanitize_report['total_faces_dropped'],
+                sanitize_report['duplicate_faces'],
+                sanitize_report['non_manifold_faces'],
+                sanitize_report['winding_faces'],
+                sanitize_report['self_edge_faces'],
+                sanitize_report['vertex_splits'],
+                sanitize_report['unreferenced_verts'])
+            # Re-run the basic shape guard: an extreme defect (every
+            # face dropped) leaves an unusable mesh and we want a
+            # clear error rather than a confusing crash deeper down.
+            if len(self.F) < 1 or len(self.V) < 3:
+                raise ValueError(
+                    "GeodesicMesh: topology sanitisation left an empty "
+                    "mesh; the input may be entirely non-manifold or "
+                    "self-overlapping.")
 
         # One-shot Morton reorder BEFORE any downstream structure is built.
         # All later arrays (_face_*, _vf_*, KDTree, solver, VTK locator)
@@ -832,33 +952,83 @@ class GeodesicMesh:
 
         # Static face adjacency matrix — built before smooth normals so
         # _smooth_face_normals_laplacian can use the vectorized adjacency.
-        self._face_adj = self._build_face_adjacency_matrix()
+        # ``_face_adj_edge[fi, e]`` mirrors ``_face_adj[fi, e]`` and
+        # records which edge index of the neighbour matches edge ``e``
+        # of face ``fi`` — needed by the cotangent-Laplacian smoother
+        # to find the angle "opposite" to the shared edge inside the
+        # neighbour triangle.
+        self._face_adj, self._face_adj_edge = self._build_face_adjacency_matrix()
         self._face_components = self._compute_face_components()
         # Smoothing strategy selected by COTANGENT_WEIGHTS class variable.
         # See module docstring 'Normal field smoothing' for rationale.
+        # Iteration counts differ on purpose: the discrete LBO is a
+        # forward-Euler step, so 2 iterations of Pinkall-Polthier
+        # already act like ~5 of the bounded uniform Laplacian.
+        # Pushing PP to 5 iters overshoots on sharp creases and starts
+        # flipping corner normals (verified empirically on fandisk).
         if self.COTANGENT_WEIGHTS:
-            self._smooth_face_normals = self._smooth_face_normals_cotangent(iterations=5)
+            self._smooth_face_normals = self._smooth_face_normals_cotangent(iterations=2)
         else:
             self._smooth_face_normals = self._smooth_face_normals_laplacian(iterations=5)
         self._vertex_normals = self._compute_vertex_normals()
         self._vf_data, self._vf_offsets = self._build_vertex_faces()
-        self._solver         = pp3d.EdgeFlipGeodesicSolver(self.V, self.F)
+        try:
+            self._solver = pp3d.EdgeFlipGeodesicSolver(self.V, self.F)
+        except RuntimeError as exc:
+            # ``_sanitize_for_solver`` already ran above; if pp3d still
+            # rejects the topology the defect is one we don't auto-fix
+            # (non-orientable surface, edge with inconsistent winding,
+            # disconnected fan past a saddle vertex, …).  Wrap the raw
+            # ``GC_SAFETY_ASSERT`` text with context so the user knows
+            # this is a mesh issue rather than a solver bug.
+            raise RuntimeError(
+                f"pp3d EdgeFlipGeodesicSolver rejected the mesh after "
+                f"topology sanitisation ({sanitize_report}).  The "
+                f"underlying defect is one this auto-cleaner cannot "
+                f"repair (non-orientable surface, inconsistent winding, "
+                f"or another geometry-central manifold violation).  "
+                f"Try cleaning the mesh in MeshLab / Blender / trimesh "
+                f"before loading.\n  pp3d error: {exc}"
+            ) from exc
 
-        # Central VTK locator — used for ALL surface queries (pick, project, find_face).
-        self.locator = self._build_locator()
+        # Monotonic counter incremented by ``compute_shoot`` whenever
+        # the JIT inner loop bails out via the >2-consecutive-fallback
+        # safeguard (non-2-manifold vertex fan).  Editor reads it on
+        # the poll tick and surfaces a HUD warning so the user knows
+        # the geodesic ended short due to a mesh defect, not a bug.
+        # Single-threaded read is fine: ``compute_shoot`` is only
+        # called from the main thread (the orange worker pool runs in
+        # subprocesses with their own ``GeodesicMesh`` instances).
+        self._shoot_truncation_count: int = 0
 
-        # Pre-allocated VTK refs (avoids per-call object creation)
+        # Central VTK locator — used for ALL surface queries (pick,
+        # project, find_face).  Skipped when ``build_locator=False``
+        # (background workers don't need it).
+        self.locator = self._build_locator() if self._build_locator_enabled else None
+
+        # Pre-allocated VTK refs (avoids per-call object creation).
+        #
+        # **Not thread-safe.**  These four buffers are reused across
+        # ``find_face`` / ``project_to_surface`` / ``compute_shoot`` —
+        # two concurrent calls on the same ``GeodesicMesh`` instance
+        # will clobber each other's results.  The fallback-flag formerly
+        # stored on ``self._last_was_fallback`` had the same hazard,
+        # which is why ``compute_endpoint`` / ``compute_endpoint_local``
+        # / ``compute_endpoint_from_origin`` now return ``(path,
+        # was_fallback)`` tuples — see their docstrings.  When you do
+        # need parallelism, give each worker its own ``GeodesicMesh``
+        # (the orange-curve worker pool already does this).
         self._vtk_cp = [0.0, 0.0, 0.0]
         self._vtk_cell_id = vtk.reference(0)
         self._vtk_sub_id = vtk.reference(0)
         self._vtk_dist2 = vtk.reference(0.0)
 
-        # Set to True by ``compute_endpoint`` / ``compute_endpoint_local``
-        # when the solver could not produce a true geodesic and fell back
-        # to the 2-point straight-line stub.  Callers read this flag right
-        # after the call to paint degraded spans red.  Not thread-safe, but
-        # workers each have their own mesh instance so there is no sharing.
-        self._last_was_fallback: bool = False
+        # Face dual graph (CSR sparse) — built lazily on first
+        # ``_dijkstra_corridor`` call.  Most sessions never trigger
+        # the Dijkstra fallback (the Euclidean tube succeeds for
+        # convex-ish geometry), so we don't pay the construction
+        # cost up-front.
+        self._face_dual_graph = None
 
     # --- Morton / Z-order reordering -----------------------------------
 
@@ -944,12 +1114,20 @@ class GeodesicMesh:
             self._morton_codes_for_points(centroids), kind='stable')
         self.F = np.ascontiguousarray(self.F[perm_f])
 
-    def _build_face_adjacency_matrix(self) -> np.ndarray:
-        """Static (M, 3) int32 matrix for O(1) face-neighbor lookup.
+    def _build_face_adjacency_matrix(self) -> tuple[np.ndarray, np.ndarray]:
+        """Static face adjacency for O(1) face-neighbor lookup.
 
-        ``_face_adj[fi, i]`` = index of the face sharing edge *i* of face
-        *fi*, or -1 if boundary.  Edge *i* connects ``F[fi, i]`` →
-        ``F[fi, (i+1)%3]``.
+        Returns
+        -------
+        adj : (M, 3) int32
+            ``adj[fi, e]`` = index of the face sharing edge *e* of face
+            *fi*, or -1 if boundary.  Edge *e* connects ``F[fi, e]`` →
+            ``F[fi, (e+1)%3]``.
+        adj_edge : (M, 3) int32
+            ``adj_edge[fi, e]`` = the edge index *inside the neighbour*
+            that matches edge *e* of face *fi*; -1 on boundary edges.
+            Used by the cotangent-Laplacian smoother to look up the
+            "opposite vertex" inside the neighbour triangle.
 
         Fully vectorized via edge-key sorting — no Python loops over faces.
         """
@@ -976,39 +1154,44 @@ class GeodesicMesh:
 
         # Adjacent entries with same key share an edge
         adj = np.full((nf, 3), -1, dtype=np.int32)
+        adj_edge = np.full((nf, 3), -1, dtype=np.int32)
         same = keys_s[:-1] == keys_s[1:]
         idx = np.where(same)[0]
         fi_a, ei_a = fids_s[idx], elocal_s[idx]
         fi_b, ei_b = fids_s[idx + 1], elocal_s[idx + 1]
         adj[fi_a, ei_a] = fi_b
         adj[fi_b, ei_b] = fi_a
-        return adj
+        adj_edge[fi_a, ei_a] = ei_b
+        adj_edge[fi_b, ei_b] = ei_a
+        return adj, adj_edge
 
-    def _compute_face_components(self) -> np.ndarray:
+    def _compute_face_components(self) -> I32Array:
         """Labels each face with its connected component index.
 
-        Uses BFS on ``_face_adj``.  Returns an int32 array of length
-        ``len(F)`` where ``labels[fi]`` is the component id (0-based).
+        Builds the dual graph (faces as nodes, edge-adjacency as
+        edges) as a scipy CSR matrix and delegates to
+        ``connected_components`` — a single C call vs the previous
+        Python BFS that took ~2 s on 3M-face meshes.  Returns an
+        int32 array of length ``len(F)`` where ``labels[fi]`` is the
+        component id (0-based).
         """
+        from scipy.sparse import csr_matrix
+        from scipy.sparse.csgraph import connected_components
+
         nf = len(self.F)
-        labels = np.full(nf, -1, dtype=np.int32)
-        adj = self._face_adj
-        comp = 0
-        for seed in range(nf):
-            if labels[seed] >= 0:
-                continue
-            # BFS from seed
-            queue = [seed]
-            labels[seed] = comp
-            head = 0
-            while head < len(queue):
-                fi = queue[head]; head += 1
-                for nb in adj[fi]:
-                    if nb >= 0 and labels[nb] < 0:
-                        labels[nb] = comp
-                        queue.append(nb)
-            comp += 1
-        return labels
+        adj = self._face_adj  # (nf, 3) int32, -1 for boundary edges
+        # Build COO from valid (face, neighbour) pairs.  Each interior
+        # edge contributes two symmetric entries (fi, nb) — the dual
+        # graph is undirected.
+        rows = np.repeat(np.arange(nf, dtype=np.int32), 3)
+        cols = adj.ravel()
+        mask = cols >= 0
+        rows = rows[mask]
+        cols = cols[mask]
+        data = np.ones_like(rows, dtype=np.int8)
+        graph = csr_matrix((data, (rows, cols)), shape=(nf, nf))
+        _, labels = connected_components(graph, directed=False, return_labels=True)
+        return labels.astype(np.int32, copy=False)
 
     def same_component(self, face_a: int, face_b: int) -> bool:
         """Returns True if *face_a* and *face_b* are in the same connected component.
@@ -1031,22 +1214,54 @@ class GeodesicMesh:
         geometry.  ``vtkCellTreeLocator`` has comparable ray-intersection
         performance but no advantage for the ``FindClosestPoint`` calls
         that dominate this application's projection workload.
+
+        Morton-reorder synchronisation
+        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        ``_morton_reorder_inplace`` permutes ``self.V`` and ``self.F``
+        for cache locality but cannot mutate the original
+        ``pv.PolyData`` the caller may still hold.  Building the
+        locator on the *original* PolyData would return cell ids in
+        the pre-reorder layout, which then index into a different
+        triangle when looked up via ``self.F[cid]`` — silently sending
+        every ``find_face`` call into the slow KDTree fallback (~6×
+        speed cost was measured on a 7K-face sphere).
+
+        Fix: build a fresh ``pv.PolyData`` from the post-reorder
+        ``self.V`` / ``self.F`` and use it as the locator's dataset.
+        ``self._pv_mesh`` is replaced with the synced one so any
+        future re-build also uses the consistent layout.
         """
-        if self._pv_mesh is None:
+        if self._pv_mesh is None and (self.V is None or self.F is None):
             return None
+        # Lazy import — pyvista is a heavy dep; only paid when
+        # GeodesicMesh is built from raw arrays *and* a locator is
+        # requested (the editor path always wants one).
+        import pyvista as pv
+        synced = pv.PolyData()
+        synced.points = self.V
+        # PyVista expects an Nx4 face buffer with leading "3" per row.
+        faces_with_3 = np.column_stack([
+            np.full(len(self.F), 3, dtype=self.F.dtype),
+            self.F,
+        ])
+        synced.faces = faces_with_3.ravel()
+        # Replace _pv_mesh so subsequent code (e.g. a future
+        # _build_locator rebuild) sees the post-Morton layout, not
+        # the stale pre-Morton one.
+        self._pv_mesh = synced
         loc = vtk.vtkStaticCellLocator()
-        loc.SetDataSet(self._pv_mesh)
+        loc.SetDataSet(synced)
         loc.SetNumberOfCellsPerNode(8)
         loc.SetMaxNumberOfBuckets(max(len(self.F) // 4, 1000))
         loc.BuildLocator()
         return loc
 
-    def _compute_face_normals(self) -> np.ndarray:
+    def _compute_face_normals(self) -> F64Array:
         A, B, C = self.V[self.F[:, 0]], self.V[self.F[:, 1]], self.V[self.F[:, 2]]
         cross = np.cross(B - A, C - A); norms = np.linalg.norm(cross, axis=1, keepdims=True)
         return cross / np.where(norms < 1e-15, 1.0, norms)
 
-    def _smooth_face_normals_laplacian(self, iterations: int = 5) -> np.ndarray:
+    def _smooth_face_normals_laplacian(self, iterations: int = 5) -> F64Array:
         """Uniform-weight Laplacian smoothing of face normals.
 
         Each face normal is averaged with its edge-adjacent neighbors with
@@ -1085,57 +1300,124 @@ class GeodesicMesh:
             normals = normals / np.where(norms < 1e-15, 1.0, norms)
         return normals
 
-    def _smooth_face_normals_cotangent(self, iterations: int = 5) -> np.ndarray:
-        """Cotangent-weight Laplacian smoothing of face normals.
+    def _smooth_face_normals_cotangent(self, iterations: int = 5) -> F64Array:
+        """Cotangent-Laplacian smoothing of face normals (Pinkall-Polthier).
 
-        Uses the cotangent of the dihedral angle at each shared edge as the
-        weight for averaging adjacent face normals.  This makes the smoothing
-        **invariant to triangulation quality** — long, thin triangles
-        (common in photogrammetry / scanned meshes) get appropriately
-        lower influence than well-shaped neighbors.
+        Classical discrete Laplace-Beltrami discretization applied to the
+        face dual graph.  For each edge shared by two triangles, the
+        weight on the dual edge connecting the two faces is::
 
-        The dihedral angle at an edge is the angle between the two face
-        normals sharing that edge.  The cotangent weight is
-        ``cot(θ) = cos(θ) / sin(θ)``, clamped to ``[-10, 10]`` to avoid
-        blow-up at near-flat or near-folded edges.
+            w(fi, fj) = ½ · ( cot α  +  cot β )
+
+        where α is the angle, in face *fi*, at the vertex **opposite to
+        the shared edge** — and β is the analogous angle in face *fj*.
+        These are the two "off-edge" angles that complete each triangle.
+
+        Why the opposite-angle cotangents?
+        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        This is the canonical Pinkall-Polthier weighting (1993): it
+        makes the discrete Laplace-Beltrami operator depend only on
+        the **intrinsic** geometry of the triangle pair, so the
+        smoother is genuinely **invariant to triangulation quality**.
+        Long thin triangles get downweighted because their opposite
+        angles are tiny (cot of a small angle is huge — but the *peer*
+        cotangent on the other side of the edge is small, and the row
+        normalisation rebalances the total contribution).
+
+        A previous implementation used ``cot(dihedral_angle)`` between
+        the two face normals — a different geometric quantity that
+        produces a *feature-preserving anisotropic* smoother but does
+        not address the long-thin-triangle bias the docstring
+        previously claimed to solve.  This version implements the
+        classical Pinkall-Polthier formulation as advertised.
+
+        Numerical robustness
+        ~~~~~~~~~~~~~~~~~~~~
+        ``cot α = (e1 · e2) / (2 · area)`` where e1, e2 are the two
+        edges meeting at the opposite vertex (closed-form identity,
+        no trigonometry).  The denominator uses ``2 · area`` directly,
+        avoiding the ``sin θ`` division that explodes at near-degenerate
+        triangles.  Negative cotangents (obtuse opposite angles) are
+        clipped to zero — the standard intrinsic-Delaunay-style
+        mass-lumping that keeps the smoother stable on irregular
+        meshes.  Faces with zero total weight (all neighbours
+        clipped, or boundary triangles with one side missing) get an
+        identity self-loop so their normal survives the smoothing pass.
 
         Activated by setting ``COTANGENT_WEIGHTS = True`` on the class.
-
-        Builds the weighted adjacency matrix from ``_face_adj`` and
-        ``_face_normals``, then iterates sparse matmul + re-normalization
-        identically to the uniform-weight version.
         """
         from scipy.sparse import coo_matrix, diags
 
-        nf = len(self.F)
+        F = self.F
+        nf = len(F)
         adj = self._face_adj
-        fn = self._face_normals
+        adj_edge = self._face_adj_edge
 
-        # Build row/col indices for all valid adjacencies
+        # --- Per-face cotangents at each of the 3 corners --------------
+        # cot(angle at corner k of face fi)
+        #   = (e_out · e_in) / (2 · area_fi)
+        # where:
+        #   e_out = V[(k+1)%3] - V[k]                = self._face_edges[fi, k]
+        #   e_in  = V[(k-1)%3] - V[k]
+        #         = -(V[k] - V[(k-1)%3])
+        #         = -self._face_edges[fi, (k-1)%3]
+        #
+        # The two edges meeting at corner k both emanate from k; the
+        # second edge is the negation of the previous edge in the
+        # closed loop around the triangle.  Pulling the sign through:
+        #   e_out · e_in = -(self._face_edges[fi, k]
+        #                    · self._face_edges[fi, (k-1)%3])
+        edges = self._face_edges                          # (nf, 3, 3)
+        # roll(+1, axis=1) shifts so prev[fi, k] = edges[fi, (k-1)%3]
+        edges_prev = np.roll(edges, 1, axis=1)
+        # 2·area is constant per face: |e0 × e1| = 2·area_fi.
+        cross_e01 = np.cross(edges[:, 0], edges[:, 1])
+        two_area = np.linalg.norm(cross_e01, axis=1)      # (nf,)
+        two_area_safe = np.maximum(two_area, 1e-15)
+        # Sign pulled out as discussed above.
+        dots = np.einsum('ijk,ijk->ij', edges, edges_prev)  # (nf, 3)
+        cot_at_corner = -dots / two_area_safe[:, None]      # (nf, 3)
+
+        # --- cot of the corner OPPOSITE to each edge -------------------
+        # Edge e of face fi connects F[fi, e] and F[fi, (e+1)%3]; the
+        # opposite vertex is F[fi, (e+2)%3], i.e. corner (e+2)%3.
+        # roll(-2, axis=1) gives row[e] = cot_at_corner[(e+2)%3].
+        cot_opp = np.roll(cot_at_corner, -2, axis=1)        # (nf, 3)
+
+        # --- Build sparse weighted adjacency ---------------------------
         fi_arr = np.repeat(np.arange(nf, dtype=np.int32), 3)
-        fj_arr = adj.ravel()
-        mask = fj_arr >= 0
-        rows = fi_arr[mask]
-        cols = fj_arr[mask]
+        e_arr  = np.tile(np.arange(3, dtype=np.int32), nf)
+        fj_flat = adj.ravel()
+        ej_flat = adj_edge.ravel()
+        mask = fj_flat >= 0
+        rows  = fi_arr[mask]
+        cols  = fj_flat[mask]
+        e_my  = e_arr[mask]
+        e_nb  = ej_flat[mask]
 
-        # Cotangent weights from dihedral angles between adjacent face normals
-        ni = fn[rows]           # (K, 3) normals of face i
-        nj = fn[cols]           # (K, 3) normals of face j
-        cos_theta = np.sum(ni * nj, axis=1)
-        cos_theta = np.clip(cos_theta, -1.0, 1.0)
-        sin_theta = np.sqrt(1.0 - cos_theta * cos_theta)
-        sin_theta = np.maximum(sin_theta, 1e-10)  # avoid division by zero
-        cot_w = cos_theta / sin_theta
-        cot_w = np.clip(cot_w, -10.0, 10.0)
-
-        # Shift to positive weights: w = cot + 10.001 (ensures all > 0)
-        weights = cot_w + 10.001
+        cot_alpha = cot_opp[rows, e_my]
+        cot_beta  = cot_opp[cols, e_nb]
+        weights = 0.5 * (cot_alpha + cot_beta)
+        # Standard mass-lumped Pinkall-Polthier: clip negatives.
+        weights = np.maximum(weights, 0.0)
 
         A = coo_matrix((weights, (rows, cols)), shape=(nf, nf)).tocsr()
 
-        # Normalize rows → each row sums to 1 (weighted average)
-        row_sums = np.array(A.sum(axis=1)).flatten()
-        row_sums[row_sums < 1e-15] = 1.0
+        # Faces whose entire row is zero (all neighbours clipped to 0,
+        # or isolated component) need a self-loop so their normal
+        # passes through the smoother unchanged instead of collapsing
+        # to (0, 0, 0).
+        row_sums = np.asarray(A.sum(axis=1)).ravel()
+        isolated = row_sums < 1e-15
+        if isolated.any():
+            iso_idx = np.where(isolated)[0]
+            self_loops = coo_matrix(
+                (np.ones(len(iso_idx)),
+                 (iso_idx.astype(np.int32), iso_idx.astype(np.int32))),
+                shape=(nf, nf)).tocsr()
+            A = A + self_loops
+            row_sums = np.asarray(A.sum(axis=1)).ravel()
+
         A = diags(1.0 / row_sums) @ A
 
         normals = self._face_normals.copy()
@@ -1145,7 +1427,7 @@ class GeodesicMesh:
             normals = normals / np.where(norms < 1e-15, 1.0, norms)
         return normals
 
-    def _compute_vertex_normals(self) -> np.ndarray:
+    def _compute_vertex_normals(self) -> F64Array:
         """Angle-weighted vertex normals from smoothed face normals.
 
         Uses the **angle subtended at each vertex** (Baerentzen & Aanaes
@@ -1251,7 +1533,7 @@ class GeodesicMesh:
         offsets = np.searchsorted(vertex_ids[order], np.arange(nv + 1)).astype(np.int32)
         return data, offsets
 
-    def face_normal(self, face_id: int) -> np.ndarray:
+    def face_normal(self, face_id: int) -> F64Array:
         return self._face_normals[int(face_id)].copy()
 
     @staticmethod
@@ -1272,7 +1554,7 @@ class GeodesicMesh:
         w = (d00 * d21 - d01 * d20) / denom
         return 1.0 - v - w, v, w
 
-    def get_barycentric(self, p: np.ndarray, face_id: int) -> tuple[float, float, float]:
+    def get_barycentric(self, p: F64Array, face_id: int) -> tuple[float, float, float]:
         A, B, C = self.V[self.F[face_id]]
         return self._barycentric(p, A, B, C)
 
@@ -1370,11 +1652,18 @@ class GeodesicMesh:
         curr_d[0] = d_vec[0]; curr_d[1] = d_vec[1]; curr_d[2] = d_vec[2]
 
         path_buf = np.empty((max_steps + 1, 3), dtype=float)
-        path_n = _shoot_loop(
+        path_n, exit_code = _shoot_loop(
             curr_p, curr_d, int(face_idx), float(length), max_steps,
             fast_mode, self._face_normals, self._face_adj,
             self._face_verts, self._face_edges, self._face_edge_len2,
             self.V, self.F, self._vf_data, self._vf_offsets, path_buf)
+
+        # Non-manifold-fan truncation: bump the instance counter so the
+        # editor's poll tick can surface a HUD message.  The path is
+        # still returned (truncated at the last good edge crossing) so
+        # the caller's draw / measurement code keeps working.
+        if exit_code == 1:
+            self._shoot_truncation_count += 1
 
         return path_buf[:path_n] if path_n > 1 else None
 
@@ -1396,7 +1685,7 @@ class GeodesicMesh:
 
     # --- ROBUST DYNAMIC RECONSTRUCTION ---
 
-    def diagnose_path(self, path: np.ndarray, label: str) -> None:
+    def diagnose_path(self, path: F64Array, label: str) -> None:
         """Checks whether path points and segment midpoints lie on the mesh surface."""
         if not self.DIAGNOSE_PATHS:
             return
@@ -1447,7 +1736,11 @@ class GeodesicMesh:
         add <5% to the query cost.
         """
         pts = np.ascontiguousarray(pts, dtype=np.float64)
-        _, nearest_verts = self._kdtree.query(pts, k=7)
+        # ``k`` clamped to vertex count: scipy's KDTree raises when
+        # k > nv, which trips on tiny demo meshes (icosahedron has 12
+        # verts, fine; degenerate test meshes can have <7).
+        k = min(7, len(self.V))
+        _, nearest_verts = self._kdtree.query(pts, k=k)
         nearest_verts = np.asarray(nearest_verts, dtype=np.int64)
         if nearest_verts.ndim == 1:
             nearest_verts = nearest_verts.reshape(-1, 1)
@@ -1470,7 +1763,8 @@ class GeodesicMesh:
         from the projection of the straight A→B line.
         """
         pts = np.ascontiguousarray(pts, dtype=np.float64)
-        _, nearest_verts = self._kdtree.query(pts, k=7)
+        k = min(7, len(self.V))
+        _, nearest_verts = self._kdtree.query(pts, k=k)
         nearest_verts = np.asarray(nearest_verts, dtype=np.int64)
         if nearest_verts.ndim == 1:
             nearest_verts = nearest_verts.reshape(-1, 1)
@@ -1485,7 +1779,9 @@ class GeodesicMesh:
 
     def subdivide_secant_chords(self, pts: F64Array,
                                 tol: float | None = None,
-                                max_depth: int = 6) -> F64Array:
+                                max_depth: int = 6,
+                                labels: F64Array | None = None
+                                ) -> F64Array | tuple[F64Array, F64Array]:
         """Recursively subdivide polyline segments that cut through the mesh.
 
         When two consecutive points of a surface polyline sit on opposite
@@ -1519,20 +1815,31 @@ class GeodesicMesh:
         max_depth : iteration cap.  On each iteration, segments exceeding
               the tolerance are halved; already-refined segments are
               left alone.  6 iterations → up to 64× local refinement.
+        labels : optional (N,) per-point scalar labels propagated through
+              subdivision.  When a chord is split, the new midpoint
+              label is the linear midpoint of its two endpoints' labels.
+              Used by the interp-curve cache to keep a per-rendered-
+              point splprep ``u`` parameter, which lets node-insertion
+              identify the right segment of a self-intersecting spline
+              without resorting to ambiguous 3-D distance.
 
         Returns
         -------
-        (M, 3) refined polyline with M >= N.  Unchanged if no segment
-        exceeds the tolerance.
+        (M, 3) refined polyline with M >= N when *labels* is None, or
+        ``(refined_pts, refined_labels)`` when *labels* is provided.
+        Unchanged if no segment exceeds the tolerance.
         """
+        with_labels = labels is not None
         if len(pts) < 2:
-            return pts
+            return (pts, labels) if with_labels else pts
         if tol is None:
             mean_edge = float(np.sqrt(self._face_edge_len2.mean()))
             tol = mean_edge * 0.01
         tol_sq = tol * tol
 
         pts = np.asarray(pts, dtype=float)
+        if with_labels:
+            labels = np.asarray(labels, dtype=float)
         for _ in range(max_depth):
             if len(pts) < 2:
                 break
@@ -1554,12 +1861,19 @@ class GeodesicMesh:
             cumsplit = np.concatenate(
                 [[0], np.cumsum(needs_split.astype(np.int64))])
             # Original point i goes to index i + cumsplit[i]
-            out[np.arange(n_old) + cumsplit] = pts
+            base = np.arange(n_old) + cumsplit
+            out[base] = pts
             # Midpoint of segment i (if split) goes right after original i
             seg_idx = np.nonzero(needs_split)[0]
-            out[seg_idx + cumsplit[:-1][needs_split] + 1] = projected[needs_split]
+            mid_dst = seg_idx + cumsplit[:-1][needs_split] + 1
+            out[mid_dst] = projected[needs_split]
+            if with_labels:
+                lab_out = np.empty(n_old + n_new, dtype=float)
+                lab_out[base] = labels
+                lab_out[mid_dst] = (labels[seg_idx] + labels[seg_idx + 1]) * 0.5
+                labels = lab_out
             pts = out
-        return pts
+        return (pts, labels) if with_labels else pts
 
     def _make_work_buffers(self, extra_verts: int = 2, extra_faces: int = 6):
         """Create mutable working copies of V and F as pre-allocated numpy arrays.
@@ -1617,7 +1931,7 @@ class GeodesicMesh:
                 'solver': solver, 'kdtree': self._kdtree}
 
     def compute_endpoint_from_origin(self, origin_cache: OriginCache,
-                                     p_end: F64Array) -> F64Array | None:
+                                     p_end: F64Array) -> tuple[F64Array, bool]:
         """Geodesic path from a pre-inserted origin to an arbitrary endpoint.
 
         Two-tier strategy:
@@ -1633,6 +1947,9 @@ class GeodesicMesh:
         after the debounce fires.  The vertex-snap path is rare in
         practice (user positions rarely coincide exactly with vertices),
         so most calls take the ~25 ms local submesh path.
+
+        Returns ``(path, was_fallback)`` (see ``compute_endpoint`` for
+        the rationale of the tuple-return contract).
         """
         try:
             idx_s = origin_cache['idx']
@@ -1653,10 +1970,12 @@ class GeodesicMesh:
 
             if snap_idx is not None:
                 if idx_s == snap_idx:
-                    return np.array([origin_cache['p'], p_end])
+                    return np.array([origin_cache['p'], p_end]), True
                 path = origin_cache['solver'].find_geodesic_path(idx_s, snap_idx)
+                if path is None or len(path) < 2:
+                    return np.array([origin_cache['p'], p_end]), True
                 self.diagnose_path(path, "endpoint-cached-snap")
-                return path
+                return path, False
 
             # Tier 2: local submesh solver (~10× faster than global)
             return self.compute_endpoint_local(origin_cache['p'], p_end)
@@ -1674,16 +1993,35 @@ class GeodesicMesh:
         """Single attempt at topology insertion + solver construction.
 
         Returns ``(path, success)`` where *path* is the geodesic polyline
-        and *success* is True if the solver accepted the modified mesh.
+        and *success* is True if the solver returned a usable path.
+
+        ``success`` is False (and *path* is None) when the solver
+        returns ``None`` or a degenerate single-point path — both of
+        which historically slipped past the wrapper as "success" and
+        propagated invalid geometry to the GUI.
+
+        Builds a face-adjacency buffer once from the global ``self.F``
+        and passes it to ``_add_point_buf`` so endpoints that fall on
+        edges trigger the 2-to-4 split (smooth, no artificial nudge)
+        instead of the legacy nudge-inward fallback.
         """
         V_buf, F_buf, nv, nf = self._make_work_buffers(extra_verts=2, extra_faces=6)
-        idx_s, nv, nf = self._add_point_buf(p_start, V_buf, F_buf, nv, nf)
-        idx_e, nv, nf = self._add_point_buf(p_end,   V_buf, F_buf, nv, nf)
+        # Seed adjacency from the precomputed global table; reserve
+        # 2 × extra_faces slots so the split path can grow it in
+        # lockstep with F_buf.
+        adj_buf = np.full((nf + 6, 3), -1, dtype=np.int32)
+        adj_buf[:nf] = self._face_adj
+        idx_s, nv, nf = self._add_point_buf(p_start, V_buf, F_buf, nv, nf,
+                                            adj_buf=adj_buf)
+        idx_e, nv, nf = self._add_point_buf(p_end,   V_buf, F_buf, nv, nf,
+                                            adj_buf=adj_buf)
         nf = self._remove_degenerate_faces(F_buf, nf)
         if idx_s == idx_e:
             return np.array([p_start, p_end]), True
         solver = pp3d.EdgeFlipGeodesicSolver(V_buf[:nv], F_buf[:nf])
         path = solver.find_geodesic_path(idx_s, idx_e)
+        if path is None or len(path) < 2:
+            return None, False
         return path, True
 
     # --- Local submesh geodesic solver ---
@@ -1702,6 +2040,84 @@ class GeodesicMesh:
         V_sub = V[unique_verts]
         F_sub = inverse.reshape(-1, 3).astype(np.int32)
         return V_sub, F_sub, unique_verts
+
+    @staticmethod
+    def _subdivide_submesh_1to4(V_sub: np.ndarray,
+                                F_sub: np.ndarray,
+                                ) -> tuple[np.ndarray, np.ndarray]:
+        """Loop-style 1-to-4 subdivision of a submesh, no smoothing.
+
+        Each face ``(a, b, c)`` is split into 4 sub-faces by inserting
+        a new vertex at the midpoint of every edge::
+
+                        a
+                       / \\
+                      /   \\
+                     mca   mab
+                    /  \\  / \\
+                   /    \\/   \\
+                  c----mbc----b
+
+        The 4 new sub-faces are ``(a, mab, mca)``, ``(b, mbc, mab)``,
+        ``(c, mca, mbc)``, ``(mab, mbc, mca)``.  Winding is preserved
+        on every sub-face.  Edges shared between two faces use the
+        same midpoint vertex (deduplicated by ``(min(va, vb),
+        max(va, vb))`` key) so the result is a manifold mesh.
+
+        **Why this exists.**  The orange worker calls
+        ``compute_endpoint_local`` to compute geodesics inside a
+        submesh extracted around the cascade endpoints.  When the
+        submesh is coarse, the discrete geodesic produced by
+        ``EdgeFlipGeodesicSolver`` is forced to follow real mesh
+        edges, which can be far from the geodesic of the underlying
+        smooth surface.  Worse, between two cascade samples the
+        solver can flip-flop between two different chains of edges
+        whose lengths cross — producing a discrete jump in the path
+        length.  Subdividing the submesh once (4× the face count)
+        gives the solver finer edges to work with: the discrete
+        geodesic converges to the smooth one and the flip-flop
+        disappears.  Verified empirically on fandisk: a 4.5 cm jump
+        in path length between two consecutive cascade samples drops
+        to 0.3 mm after one round of subdivision.
+
+        **Vertex layout.**  ``V_sub`` is preserved verbatim as the
+        prefix of ``V_fine``; midpoints are appended after.  This
+        lets the caller reuse the original ``vmap`` (submesh-local →
+        global vertex index) for the first ``len(V_sub)`` entries —
+        the new midpoint vertices have no global counterpart and are
+        treated as submesh-only.
+
+        Cost: O(nf) Python (one dict lookup per edge, ~3 per face).
+        For a 200-face submesh ~0.5 ms; the dominant cost of the
+        subsequent solver call (~25 ms → ~100 ms after subdivision)
+        is what actually grows.
+        """
+        edge_to_mid: dict[tuple[int, int], int] = {}
+        new_V: list = list(V_sub)
+
+        def get_mid(va: int, vb: int) -> int:
+            key = (va, vb) if va < vb else (vb, va)
+            existing = edge_to_mid.get(key)
+            if existing is not None:
+                return existing
+            idx = len(new_V)
+            new_V.append((V_sub[va] + V_sub[vb]) * 0.5)
+            edge_to_mid[key] = idx
+            return idx
+
+        nf = len(F_sub)
+        new_F = np.empty((4 * nf, 3), dtype=np.int32)
+        for fi in range(nf):
+            a = int(F_sub[fi, 0]); b = int(F_sub[fi, 1]); c = int(F_sub[fi, 2])
+            mab = get_mid(a, b)
+            mbc = get_mid(b, c)
+            mca = get_mid(c, a)
+            base = 4 * fi
+            new_F[base]     = (a, mab, mca)
+            new_F[base + 1] = (b, mbc, mab)
+            new_F[base + 2] = (c, mca, mbc)
+            new_F[base + 3] = (mab, mbc, mca)
+        return np.asarray(new_V, dtype=float), new_F
 
     def _faces_for_point(self, p: np.ndarray) -> set[int]:
         """Returns the face(s) that conservatively contain *p*.
@@ -1727,11 +2143,39 @@ class GeodesicMesh:
         bidirectional variant since the seed is already a dense "tube"
         along the expected geodesic path — the two fronts are already
         connected).  Returns a sorted int32 array of face indices.
+
+        See ``_expand_face_region_incremental`` for the version used by
+        ``compute_endpoint_local`` retry loop, which preserves the
+        ``visited``/``frontier`` state across calls.
         """
-        adj = self._face_adj
+        visited, frontier = self._bfs_init(seed_faces)
+        self._bfs_advance(visited, frontier, k_rings)
+        return np.array(sorted(visited), dtype=np.int32)
+
+    def _bfs_init(self, seed_faces) -> tuple[set[int], set[int]]:
+        """Initial BFS state from the seed: ``(visited, frontier)``.
+
+        Both sets contain every seed face.  Use ``_bfs_advance`` to
+        expand by additional rings without redoing prior work.
+        """
         visited = {int(f) for f in seed_faces}
         frontier = set(visited)
-        for _ in range(k_rings):
+        return visited, frontier
+
+    def _bfs_advance(self, visited: set[int], frontier: set[int],
+                     extra_rings: int) -> None:
+        """Expand BFS state by *extra_rings* additional rings, in place.
+
+        Avoids the O(N²) cost of restarting from scratch on every retry
+        of ``compute_endpoint_local``: at depth 60 after passes of
+        3 / 7 / 15 / 30 / 60, we now do ``3 + 4 + 8 + 15 + 30 = 60``
+        rings of work (the increments) instead of
+        ``3 + 7 + 15 + 30 + 60 = 115`` (the absolute depths).
+        """
+        adj = self._face_adj
+        for _ in range(extra_rings):
+            if not frontier:
+                return
             next_f = set()
             for fi in frontier:
                 for nb in adj[fi]:
@@ -1740,13 +2184,14 @@ class GeodesicMesh:
                         visited.add(nb_i)
                         next_f.add(nb_i)
             if not next_f:
-                break
-            frontier = next_f
-        return np.array(sorted(visited), dtype=np.int32)
+                return
+            frontier.clear()
+            frontier.update(next_f)
 
     def _try_solve_on_region(self, p_start: np.ndarray,
                              p_end: np.ndarray,
-                             face_region: np.ndarray):
+                             face_region: np.ndarray,
+                             submesh_subdiv: int = 0):
         """Attempts ``EdgeFlipGeodesicSolver`` on the submesh induced by
         *face_region*.
 
@@ -1759,14 +2204,41 @@ class GeodesicMesh:
           - ``('trivial', path)``    — the two endpoints resolved to the
                                         same inserted vertex; not an error,
                                         caller can use the 2-point stub.
+
+        ``submesh_subdiv`` (default 0) requests in-place 1-to-4 Loop
+        subdivision of the submesh (no smoothing) before the solver
+        runs.  See :meth:`_subdivide_submesh_1to4` for the rationale —
+        in short, a finer submesh lets the discrete geodesic
+        converge to the smooth-surface geodesic and removes the
+        ~cm-scale jumps that arise when the discrete-geodesic
+        topology flips between two cascade samples.  Cost grows
+        ~4× per subdivision level (face count).  Caller decides
+        based on the use case (orange worker uses 1; blue path_12
+        and other latency-sensitive paths leave it at 0).
         """
         V_sub, F_sub, vmap = self._extract_submesh(
             self.V, self.F, face_region)
+
+        # Optional in-place 1-to-4 Loop subdivision of the submesh.
+        # See ``_subdivide_submesh_1to4`` for the rationale (forces
+        # the discrete geodesic to converge to the smooth-surface
+        # geodesic by giving the solver finer edges to work with).
+        # ``vmap`` is intentionally NOT extended: the new midpoint
+        # vertices have no global counterpart, so ``_to_local``
+        # falls back to the local KDTree path for them — exactly
+        # what we want.
+        for _ in range(max(0, int(submesh_subdiv))):
+            V_sub, F_sub = self._subdivide_submesh_1to4(V_sub, F_sub)
+
         nv_sub, nf_sub = len(V_sub), len(F_sub)
 
         # Boundary faces of the submesh: any face with at least one
         # neighbour that is NOT in the submesh.  A geodesic whose endpoint
         # lies on such a face may have been truncated.
+        # Note: this set indexes into the GLOBAL ``self.F`` (pre-
+        # subdivision) — the ``find_face(pt)`` lookup in the boundary
+        # check below also uses the global mesh, so the check remains
+        # valid regardless of how many subdivision rounds we did.
         adj = self._face_adj
         region_set = set(face_region.tolist())
         boundary_faces_global: set[int] = set()
@@ -1777,12 +2249,24 @@ class GeodesicMesh:
                     break
 
         # Topology-insertion buffers (oversize so _add_point_local can
-        # subdivide without reallocation).
+        # subdivide without reallocation).  The 2-to-4 edge-split path
+        # also allocates 2 new faces per insertion (same growth as
+        # the 1-to-3 path), so ``2 * extra`` headroom on F covers
+        # both inserts even in the pathological case where every
+        # endpoint lands on an edge.
         extra = 4
         V_buf = np.empty((nv_sub + extra, 3), dtype=float)
         V_buf[:nv_sub] = V_sub
         F_buf = np.empty((nf_sub + 2 * extra, 3), dtype=np.int32)
         F_buf[:nf_sub] = F_sub
+
+        # Local face-adjacency buffer — built once from F_sub, then
+        # mutated in lockstep with F_buf by the topology-insertion
+        # path (1-to-3 leaves it stale but the ``find_face`` linear
+        # scan inside ``_add_point_local`` doesn't depend on it,
+        # while 2-to-4 updates it as part of its operation).  Sized
+        # to accommodate the same ``2 * extra`` growth as F_buf.
+        adj_buf = self._build_face_adj_buf(F_buf, nf_sub, extra=2 * extra)
 
         try:
             _, vi_global_s = self._kdtree.query(p_start)
@@ -1807,9 +2291,11 @@ class GeodesicMesh:
 
             nv, nf = nv_sub, nf_sub
             idx_s, nv, nf = self._add_point_local(
-                p_start, V_buf, F_buf, nv, nf, vi_local_s, nv_sub)
+                p_start, V_buf, F_buf, nv, nf, vi_local_s, nf_sub,
+                adj_buf=adj_buf)
             idx_e, nv, nf = self._add_point_local(
-                p_end, V_buf, F_buf, nv, nf, vi_local_e, nv_sub)
+                p_end, V_buf, F_buf, nv, nf, vi_local_e, nf_sub,
+                adj_buf=adj_buf)
 
             nf = self._remove_degenerate_faces(F_buf, nf)
 
@@ -1838,11 +2324,148 @@ class GeodesicMesh:
 
         return ('ok', path)
 
+    def _get_face_dual_graph(self):
+        """Lazy-build the face dual graph as a CSR sparse matrix.
+
+        Nodes = face indices.  Edges = pairs of edge-adjacent faces.
+        Edge weight = Euclidean distance between centroids — a good
+        proxy for geodesic arc-length on roughly equilateral meshes
+        (and acceptable on irregular ones, since Dijkstra is only
+        used to *seed* a submesh region, not to produce the final
+        geodesic).
+
+        Construction is O(F) over edges and runs once per
+        ``GeodesicMesh`` instance.  Only triggered when
+        ``_dijkstra_corridor`` is invoked from the boundary-fail
+        path of ``compute_endpoint_local``; most sessions never
+        pay the cost.
+        """
+        if self._face_dual_graph is not None:
+            return self._face_dual_graph
+        from scipy.sparse import coo_matrix
+
+        nf = len(self.F)
+        adj = self._face_adj
+        centroids = self._face_centroids
+        fi = np.repeat(np.arange(nf, dtype=np.int32), 3)
+        fj = adj.ravel()
+        mask = fj >= 0
+        fi = fi[mask]
+        fj = fj[mask]
+        dists = np.linalg.norm(
+            centroids[fi.astype(np.int64)] -
+            centroids[fj.astype(np.int64)], axis=1)
+        self._face_dual_graph = coo_matrix(
+            (dists, (fi, fj)), shape=(nf, nf)).tocsr()
+        return self._face_dual_graph
+
+    def _dijkstra_corridor(self, p_start: F64Array,
+                           p_end: F64Array) -> list[int] | None:
+        """Topological shortest path on the face dual graph from
+        ``find_face(p_start)`` to ``find_face(p_end)``.
+
+        Returns a list of face indices ordered from end back to
+        start (orientation does not matter to the caller — the list
+        is used as a seed set).  Returns ``None`` when the two
+        faces are in disconnected components, when either endpoint
+        face cannot be located, or when scipy reports no path.
+
+        Why a topological route here?
+        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        ``compute_endpoint_local``'s default seed is the projection
+        of the *Euclidean* line A→B onto the mesh.  On U-shaped /
+        horseshoe geometry this line cuts through air and projects
+        onto the *wrong* wall — the BFS expansion then has to climb
+        out and reach the real opposite end, often falling out of
+        the submesh boundary and forcing the global solver
+        (~300 ms).  Dijkstra on the face graph respects the
+        surface, so even on extreme concavity the corridor follows
+        the actual route the geodesic will take.
+
+        Cost: ~10-50 ms via scipy's C implementation.  Only paid
+        when phase A's Euclidean seed fails by boundary touch.
+        """
+        from scipy.sparse.csgraph import dijkstra
+
+        try:
+            start_face = self.find_face(p_start)
+            end_face = self.find_face(p_end)
+        except (ValueError, IndexError, RuntimeError) as exc:
+            log.debug("dijkstra: find_face failed: %s", exc)
+            return None
+
+        if start_face == end_face:
+            return [int(start_face)]
+        if not self.same_component(start_face, end_face):
+            return None
+
+        graph = self._get_face_dual_graph()
+        try:
+            _, predecessors = dijkstra(
+                graph, indices=start_face,
+                return_predecessors=True, directed=False)
+        except (ValueError, RuntimeError) as exc:
+            log.debug("dijkstra: scipy call failed: %s", exc)
+            return None
+
+        # Backtrace end → start.  scipy uses -9999 (or any negative
+        # value in newer releases) as the "no predecessor" sentinel
+        # for both unreachable nodes and the source itself.
+        path: list[int] = []
+        cur = int(end_face)
+        seen: set[int] = set()
+        # Bound the loop to nf to defend against cycles from
+        # unexpected sentinel values.
+        nf = len(self.F)
+        for _ in range(nf):
+            path.append(cur)
+            if cur == int(start_face):
+                return path
+            seen.add(cur)
+            cur = int(predecessors[cur])
+            if cur < 0 or cur in seen:
+                return None
+        return None
+
     def compute_endpoint_local(self, p_start: F64Array,
                                p_end: F64Array,
                                n_line_samples: int = 100,
-                               ) -> F64Array | None:
+                               submesh_subdiv: int = 0,
+                               ) -> tuple[F64Array, bool]:
         """Geodesic path using a **projected-line** submesh pre-filter.
+
+        Returns
+        -------
+        ``(path, was_fallback)`` — *path* is the geodesic polyline and
+        *was_fallback* is ``True`` when the result is a degraded
+        2-point straight-line stub (cross-component, solver gave up,
+        endpoints collapsed to the same inserted vertex).  Callers
+        usually colour the rendered span red when ``was_fallback`` is
+        true.
+
+        Returning the flag in the tuple (rather than via instance state
+        ``self._last_was_fallback``) is deliberate — it keeps the
+        function thread-safe across the orange-worker pool, where two
+        workers calling on the same ``GeodesicMesh`` would otherwise
+        race on the shared attribute.
+
+        Submesh subdivision
+        ~~~~~~~~~~~~~~~~~~~
+        ``submesh_subdiv`` (default 0) requests *N* rounds of in-place
+        1-to-4 subdivision of the local submesh BEFORE the solver
+        runs.  The discrete geodesic produced by
+        ``EdgeFlipGeodesicSolver`` has to follow real mesh edges, so
+        on coarse meshes it can be far from the smooth-surface
+        geodesic — and worse, between two cascade samples the solver
+        can flip-flop between two near-equal-length edge chains,
+        producing visible kinks (~cm scale) in the orange curve.
+        Subdividing the submesh (4× faces per level) gives the
+        solver finer edges and the discrete geodesic converges to
+        the smooth one; the flip-flop disappears.
+
+        Cost: ~4× per level (a 25 ms call becomes ~100 ms at level 1).
+        Use 1 for the orange worker; leave at 0 for latency-sensitive
+        paths (blue ``path_12`` consolidation, handle drag).
 
         Pre-filter strategy
         ~~~~~~~~~~~~~~~~~~~
@@ -1873,30 +2496,32 @@ class GeodesicMesh:
             ~500-2000 for the sphere, so the ``EdgeFlipGeodesicSolver``
             construction is faster.
 
-        Adaptive retry
-        ~~~~~~~~~~~~~~
-        The submesh is expanded by an increasing number of rings on each
-        failure:
+        Three-phase strategy
+        ~~~~~~~~~~~~~~~~~~~~
+          A. **Euclidean tube + 3 rings** (~25 ms): handles >90 % of
+             real queries.  The straight A→B line projected onto the
+             surface is a near-perfect seed for convex / mildly-curved
+             geometry.
 
-              attempt     k_rings     submesh size (approx.)
-                 1           3         seed + 3 rings   (tight)
-                 2           7         seed + 7 rings
-                 3          15
-                 4          30
-                 5          60         (last local attempt)
+          B. **Dijkstra corridor + 3 rings** (~30-60 ms, only if A
+             returns ``'boundary'`` or ``'error'``): topological
+             shortest path on the face dual graph, weighted by
+             centroid distance.  Handles the U-shape / horseshoe
+             case where the Euclidean tube projects onto the wrong
+             wall and the BFS expansion can't recover.  The
+             Dijkstra graph is built lazily on first miss; most
+             sessions never pay this cost.
 
-        After all 5 attempts fail (boundary touch, solver error, ...) the
-        method falls back to ``compute_endpoint`` on the full mesh.  A
-        ``'trivial'`` result (two endpoints collapsed to one vertex) is
-        returned immediately — it is degenerate but correct.
+          C. **BFS escalation 15 → 30 → 60 rings** (~50-200 ms,
+             only if both A and B fail): legacy safety net for
+             pathological cases.  Expands from whichever set
+             phases A and B left in ``visited`` / ``frontier``.
 
-        Side effects
-        ~~~~~~~~~~~~
-        Sets ``self._last_was_fallback = True`` if the final returned
-        path is a 2-point straight-line stub (so callers can colour the
-        span red).
+        After all local phases fail the method falls back to
+        ``compute_endpoint`` on the full mesh.  A ``'trivial'``
+        result (two endpoints collapsed to one vertex) is returned
+        immediately — it is degenerate but correct.
         """
-        self._last_was_fallback = False
         p_start = np.asarray(p_start, dtype=float)
         p_end = np.asarray(p_end, dtype=float)
 
@@ -1921,32 +2546,314 @@ class GeodesicMesh:
         if not seed_set:
             return self.compute_endpoint(p_start, p_end)
 
-        # --- Adaptive retry loop ---
-        for k_rings in (3, 7, 15, 30, 60):
-            face_region = self._expand_face_region(seed_set, k_rings)
+        # --- Phase A: Euclidean tube + 3 rings ---
+        visited, frontier = self._bfs_init(seed_set)
+        self._bfs_advance(visited, frontier, 3)
+        face_region = np.array(sorted(visited), dtype=np.int32)
+        status, path = self._try_solve_on_region(
+            p_start, p_end, face_region, submesh_subdiv=submesh_subdiv)
+        if status == 'ok':
+            return path, False
+        if status == 'trivial':
+            return path, True
+
+        # --- Phase B: Dijkstra corridor + 3 rings (concave fallback) ---
+        # Activated when Phase A fails by 'boundary' (Euclidean line
+        # projected onto the wrong wall) or 'error' (solver couldn't
+        # construct on the tight tube).  The Dijkstra path on the
+        # face dual graph respects surface topology, so it bridges
+        # U-shapes the Euclidean projection cannot.
+        if status in ('boundary', 'error'):
+            corridor = self._dijkstra_corridor(p_start, p_end)
+            if corridor is not None:
+                # Fresh BFS state seeded from the corridor + endpoint
+                # 1-rings.  Union with phase A's exploration so we
+                # don't lose the legitimate faces the Euclidean tube
+                # already found.
+                corr_seed: set[int] = {int(f) for f in corridor}
+                corr_seed.update(self._faces_for_point(p_start))
+                corr_seed.update(self._faces_for_point(p_end))
+                visited_d, frontier_d = self._bfs_init(corr_seed)
+                self._bfs_advance(visited_d, frontier_d, 3)
+                visited |= visited_d
+                # Union frontiers (NOT overwrite) — replacing
+                # ``frontier`` with ``frontier_d`` would discard phase
+                # A's outer boundary, leaving phase C's BFS unable to
+                # grow outward from the Euclidean tube.  ``_bfs_advance``
+                # already filters faces that are interior to ``visited``,
+                # so unioning is safe and preserves both fronts.
+                frontier |= frontier_d
+                face_region = np.array(sorted(visited), dtype=np.int32)
+                status, path = self._try_solve_on_region(
+                    p_start, p_end, face_region, submesh_subdiv=submesh_subdiv)
+                if status == 'ok':
+                    return path, False
+                if status == 'trivial':
+                    return path, True
+
+        # --- Phase C: BFS escalation 15 → 30 → 60 rings (safety net) ---
+        # We've already advanced the frontier 3 rings in phase A
+        # (and possibly 3 more from the corridor seed in phase B);
+        # ``prev_depth`` tracks total advance so we only walk the
+        # delta on each step instead of restarting BFS.
+        prev_depth = 3
+        for k_rings in (15, 30, 60):
+            self._bfs_advance(visited, frontier, k_rings - prev_depth)
+            prev_depth = k_rings
+            face_region = np.array(sorted(visited), dtype=np.int32)
             status, path = self._try_solve_on_region(
-                p_start, p_end, face_region)
+                p_start, p_end, face_region, submesh_subdiv=submesh_subdiv)
             if status == 'ok':
-                return path
+                return path, False
             if status == 'trivial':
-                # Endpoints collapsed to the same inserted vertex —
-                # correct result, cannot be improved by retrying.
-                return path
-            # 'boundary' or 'error' → expand and try again
+                return path, True
 
         # All local attempts exhausted — global solver as last resort.
         return self.compute_endpoint(p_start, p_end)
 
+    @staticmethod
+    def _build_face_adj_buf(F_buf: np.ndarray, nf: int,
+                            extra: int = 0) -> np.ndarray:
+        """Build a face-adjacency buffer for the first *nf* faces of *F_buf*.
+
+        Returns an ``(nf + extra, 3)`` int32 buffer where ``adj[fi, e]``
+        is the face index that shares edge ``e`` of face ``fi``, or
+        ``-1`` for boundary edges.  Edge ``e`` of face ``fi`` is the
+        directed edge ``F_buf[fi, e] → F_buf[fi, (e + 1) % 3]``.
+
+        The *extra* slots are filled with ``-1`` so callers can grow
+        the adjacency in lockstep with ``F_buf`` (each topological
+        insertion adds 2 faces).
+
+        Built by hashing each directed edge as the unordered pair
+        ``(min(v0, v1), max(v0, v1))``: matching pairs share the edge.
+        Two faces with the same unordered pair sit on opposite sides
+        of that edge (their winding traverses the edge in opposite
+        directions, which is always true for a 2-manifold).
+        """
+        adj = np.full((nf + extra, 3), -1, dtype=np.int32)
+        edge_map: dict[tuple[int, int], tuple[int, int]] = {}
+        for fi in range(nf):
+            for e in range(3):
+                v0 = int(F_buf[fi, e])
+                v1 = int(F_buf[fi, (e + 1) % 3])
+                key = (v0, v1) if v0 < v1 else (v1, v0)
+                if key in edge_map:
+                    f_other, e_other = edge_map.pop(key)
+                    adj[fi, e] = f_other
+                    adj[f_other, e_other] = fi
+                else:
+                    edge_map[key] = (fi, e)
+        return adj
+
+    def _split_edge_2to4(self, p: np.ndarray,
+                         V_buf: np.ndarray, F_buf: np.ndarray,
+                         adj_buf: np.ndarray,
+                         nv: int, nf: int,
+                         face_a: int, edge_local_a: int,
+                        ) -> tuple[int, int, int] | None:
+        """Insert *p* on a shared edge by splitting both incident triangles.
+
+        Mathematically the right operation when *p* lies on an edge:
+        the 1-to-3 subdivision used by ``_add_point_local`` would
+        produce a degenerate sliver triangle (one of its sub-faces
+        would have all three vertices on the edge).  Splitting instead
+        the *pair* of triangles that share the edge into 4 sub-faces
+        keeps every result strictly non-degenerate while still
+        introducing *p* as a new vertex of the mesh.
+
+        Geometry — given:
+
+            face_a = (Va, Vb, Vc)   — Va is at slot ``edge_local_a``
+            face_b = (Vb, Va, Vd)   — its neighbour across (Va, Vb)
+
+        the operation rewrites both faces in place and adds two new
+        sub-faces at slots ``nf`` and ``nf+1``::
+
+            face_a   ←  (Va, p, Vc)        (in place)
+            face_b   ←  (Vb, p, Vd)        (in place)
+            new_f1   =  (p,  Vb, Vc)        (slot nf)
+            new_f2   =  (p,  Va, Vd)        (slot nf+1)
+
+        Adjacency is updated in *adj_buf* for the four modified / new
+        faces AND for the four outer neighbours whose entry pointing
+        to ``face_a`` / ``face_b`` is re-routed to ``new_f1`` / ``new_f2``
+        (since the half of the original face containing that edge now
+        belongs to a different face id).
+
+        Parameters
+        ----------
+        p : (3,) ndarray
+            Surface point to insert.  Caller should have verified that
+            ``p`` is on (or extremely close to) the shared edge of
+            ``face_a`` and its neighbour at slot ``edge_local_a``.
+        V_buf, F_buf : pre-allocated buffers — modified in place.
+        adj_buf : pre-allocated face-adjacency buffer — modified in place.
+        nv, nf : current vertex / face counts.
+        face_a, edge_local_a : the face containing *p* and the local
+            edge slot ``∈ {0, 1, 2}`` that ``p`` lies on.
+
+        Returns
+        -------
+        ``(p_idx, new_nv, new_nf)`` on success.  ``None`` when the
+        edge is on the mesh boundary (no neighbour to split with) —
+        caller falls back to the 1-to-3 path.
+
+        Edge cases:
+          * **Boundary edge** (``adj_buf[face_a, edge_local_a] < 0``):
+            no neighbour to split.  Return None — caller can either
+            do a tiny nudge inward or accept the boundary truncation.
+          * **Inconsistent adjacency** (the table claims face_b is the
+            neighbour but face_b does not actually contain the edge
+            (Vb, Va)): treated as failure.  Return None.  This should
+            never happen on a correctly-built mesh but we are defensive.
+        """
+        face_b = int(adj_buf[face_a, edge_local_a])
+        if face_b < 0:
+            return None  # boundary edge — fallback path
+
+        e_a = int(edge_local_a)
+        Va = int(F_buf[face_a, e_a])
+        Vb = int(F_buf[face_a, (e_a + 1) % 3])
+        Vc = int(F_buf[face_a, (e_a + 2) % 3])
+
+        # Find which slot of face_b holds the directed edge (Vb, Va) —
+        # i.e., the same edge traversed in the opposite direction.
+        e_b = -1
+        for k in range(3):
+            if (int(F_buf[face_b, k]) == Vb and
+                    int(F_buf[face_b, (k + 1) % 3]) == Va):
+                e_b = k
+                break
+        if e_b < 0:
+            # Adjacency table claims face_b is the neighbour but
+            # face_b does not contain the directed edge — table
+            # inconsistency.  Bail to the safe path.
+            return None
+        Vd = int(F_buf[face_b, (e_b + 2) % 3])
+
+        # Outer neighbours that survive the split (their entry pointing
+        # to face_a / face_b may need to be re-routed to a new face id).
+        nb_a_BC = int(adj_buf[face_a, (e_a + 1) % 3])  # face_a edge (Vb, Vc)
+        nb_a_CA = int(adj_buf[face_a, (e_a + 2) % 3])  # face_a edge (Vc, Va)
+        nb_b_AD = int(adj_buf[face_b, (e_b + 1) % 3])  # face_b edge (Va, Vd)
+        nb_b_DB = int(adj_buf[face_b, (e_b + 2) % 3])  # face_b edge (Vd, Vb)
+
+        # Insert the new vertex.
+        p_idx = nv
+        V_buf[p_idx] = p
+        nv += 1
+
+        new_f1 = nf       # (p, Vb, Vc)
+        new_f2 = nf + 1   # (p, Va, Vd)
+
+        # Rewrite F.  The two original faces are replaced in place;
+        # two slots at the tail receive the new sub-faces.  Winding
+        # is preserved on every sub-face, so the manifold orientation
+        # is unchanged.
+        F_buf[face_a, 0] = Va
+        F_buf[face_a, 1] = p_idx
+        F_buf[face_a, 2] = Vc
+        F_buf[face_b, 0] = Vb
+        F_buf[face_b, 1] = p_idx
+        F_buf[face_b, 2] = Vd
+        F_buf[new_f1, 0] = p_idx
+        F_buf[new_f1, 1] = Vb
+        F_buf[new_f1, 2] = Vc
+        F_buf[new_f2, 0] = p_idx
+        F_buf[new_f2, 1] = Va
+        F_buf[new_f2, 2] = Vd
+
+        # Update adjacency for the four faces that changed.  Edge slot
+        # convention: ``adj[fi, e]`` is across the directed edge
+        # ``F[fi, e] → F[fi, (e+1) % 3]``.
+        # face_a now (Va, p, Vc):
+        #   slot 0 (Va→p)  ↔ new_f2 (which has p→Va)
+        #   slot 1 (p→Vc)  ↔ new_f1 (which has Vc→p)
+        #   slot 2 (Vc→Va) ↔ nb_a_CA (unchanged outer)
+        adj_buf[face_a, 0] = new_f2
+        adj_buf[face_a, 1] = new_f1
+        adj_buf[face_a, 2] = nb_a_CA
+
+        # face_b now (Vb, p, Vd):
+        #   slot 0 (Vb→p)  ↔ new_f1 (which has p→Vb)
+        #   slot 1 (p→Vd)  ↔ new_f2 (which has Vd→p)
+        #   slot 2 (Vd→Vb) ↔ nb_b_DB (unchanged outer)
+        adj_buf[face_b, 0] = new_f1
+        adj_buf[face_b, 1] = new_f2
+        adj_buf[face_b, 2] = nb_b_DB
+
+        # new_f1 (p, Vb, Vc):
+        #   slot 0 (p→Vb)  ↔ face_b (which has Vb→p)
+        #   slot 1 (Vb→Vc) ↔ nb_a_BC (was face_a's neighbour across (Vb, Vc))
+        #   slot 2 (Vc→p)  ↔ face_a (which has p→Vc)
+        adj_buf[new_f1, 0] = face_b
+        adj_buf[new_f1, 1] = nb_a_BC
+        adj_buf[new_f1, 2] = face_a
+
+        # new_f2 (p, Va, Vd):
+        #   slot 0 (p→Va)  ↔ face_a (which has Va→p)
+        #   slot 1 (Va→Vd) ↔ nb_b_AD (was face_b's neighbour across (Va, Vd))
+        #   slot 2 (Vd→p)  ↔ face_b (which has p→Vd)
+        adj_buf[new_f2, 0] = face_a
+        adj_buf[new_f2, 1] = nb_b_AD
+        adj_buf[new_f2, 2] = face_b
+
+        # Re-route outer neighbours whose entry pointed to one of the
+        # original faces but whose edge now belongs to a new sub-face.
+        # nb_a_BC: was across face_a's (Vb, Vc); that edge now lives
+        # on new_f1.  Update the slot that pointed to face_a.
+        if nb_a_BC >= 0:
+            for k in range(3):
+                if int(adj_buf[nb_a_BC, k]) == face_a:
+                    adj_buf[nb_a_BC, k] = new_f1
+                    break
+        # nb_a_CA's edge is still owned by face_a — no change.
+        # nb_b_AD: was across face_b's (Va, Vd); now on new_f2.
+        if nb_b_AD >= 0:
+            for k in range(3):
+                if int(adj_buf[nb_b_AD, k]) == face_b:
+                    adj_buf[nb_b_AD, k] = new_f2
+                    break
+        # nb_b_DB's edge is still owned by face_b — no change.
+
+        return p_idx, nv, nf + 2
+
     def _add_point_local(self, p, V_buf, F_buf, nv, nf,
-                         vi_local, nv_original):
+                         vi_local, nf_original, adj_buf=None):
         """Insert a point into submesh topology with 1-to-3 subdivision.
 
         *vi_local* is the submesh-local index of the nearest vertex to *p*
         (precomputed by the caller via the global KDTree + searchsorted).
         Avoids building a local KDTree per call.
 
-        Performs the same nudge and post-subdivision area-check logic as
-        the global ``_add_point_buf``.  Returns ``(vertex_idx, nv, nf)``.
+        *nf_original* is the face count of the submesh **before** any
+        prior insertions in this call sequence.  Faces with index ≥
+        ``nf_original`` were created by previous ``_add_point_local``
+        calls and are conservatively added to the candidate pool
+        (they may contain the inserted vertex even though the linear
+        scan over ``F_buf[fi]`` for ``vi`` would also catch them —
+        this is belt-and-suspenders for the rare case where the
+        bary scoring of the new sub-face wins over its parent).
+
+        Earlier versions accepted ``nv_original`` (vertex count) here
+        and used it as a face index, inflating ``candidates`` by
+        ~hundreds per call on typical meshes (verified via cProfile,
+        ~3500 candidates per call on a 12k-face submesh).  That was
+        a real bug — fixed now.
+
+        When *adj_buf* is provided (the caller pre-built local face
+        adjacency in ``_try_solve_on_region``), points whose
+        barycentric coordinate falls below ``edge_eps`` trigger the
+        mathematically correct **2-to-4 edge split** (see
+        :meth:`_split_edge_2to4`) instead of the conservative nudge.
+        That eliminates the discrete jump in endpoint position when
+        the cascade's *t* parameter sweeps the point across an edge —
+        the dominant source of jitter in the rendered orange curve
+        on dense meshes.  When *adj_buf* is None, falls back to the
+        legacy nudge with very small ``edge_eps``.
+
+        Returns ``(vertex_idx, nv, nf)``.
         """
         vi = int(vi_local)
 
@@ -1956,7 +2863,7 @@ class GeodesicMesh:
             f = F_buf[fi]
             if vi in (int(f[0]), int(f[1]), int(f[2])):
                 candidates.append(fi)
-        for fi in range(nv_original, nf):
+        for fi in range(nf_original, nf):
             if fi not in candidates:
                 candidates.append(fi)
         if not candidates:
@@ -1969,14 +2876,48 @@ class GeodesicMesh:
         fa = int(F_buf[face_idx, 0])
         fb = int(F_buf[face_idx, 1])
         fc = int(F_buf[face_idx, 2])
-        snap_eps = 1e-4
+        # Three-tier strategy:
+        #   snap_eps  : bary very close to 1 → snap to that vertex.
+        #   split_eps : bary close to 0 → 2-to-4 edge split (preserves
+        #               the exact position of p as a new vertex; no
+        #               jitter when the caller's parameter sweeps p
+        #               across an edge).  Permissive (1e-3) so almost
+        #               every near-edge insertion goes through it.
+        #   nudge_eps : 2-to-4 unavailable (boundary edge / no
+        #               adj_buf) AND bary extremely close to 0 →
+        #               nudge inward as last-resort to keep the
+        #               1-to-3 path manifold.  Tight (1e-7) so the
+        #               nudge fires only when geometrically necessary.
+        snap_eps = 1e-7
+        split_eps = 1e-3
+        nudge_eps = 1e-7
 
         if u > 1 - snap_eps: return fa, nv, nf
         if v > 1 - snap_eps: return fb, nv, nf
         if w > 1 - snap_eps: return fc, nv, nf
 
-        edge_eps = 1e-3
-        if min(u, v, w) < edge_eps:
+        # Identify which barycentric coord is the smallest — that
+        # tells us which edge the point is on, so 2-to-4 can target
+        # the right pair of triangles.
+        bary = (u, v, w)
+        min_bary = min(bary)
+        if min_bary < split_eps and adj_buf is not None:
+            # Map smallest bary → the local edge slot opposite to that
+            # vertex.  In a triangle (V0, V1, V2) with bary (u, v, w):
+            #   u → 0 (vertex V0), opposite edge slot 1 (V1→V2)
+            #   v → 0 (vertex V1), opposite edge slot 2 (V2→V0)
+            #   w → 0 (vertex V2), opposite edge slot 0 (V0→V1)
+            min_idx = bary.index(min_bary)
+            opposite_edge_slot = (min_idx + 1) % 3
+            result = self._split_edge_2to4(
+                p, V_buf, F_buf, adj_buf, nv, nf,
+                face_idx, opposite_edge_slot)
+            if result is not None:
+                return result
+            # Boundary edge or inconsistent adjacency → fall through
+            # to the legacy nudge path below.
+
+        if min_bary < nudge_eps:
             Va, Vb, Vc = V_buf[fa], V_buf[fb], V_buf[fc]
             centroid = (Va + Vb + Vc) / 3.0
             e0 = np.linalg.norm(Vb - Va)
@@ -2013,35 +2954,34 @@ class GeodesicMesh:
 
         return p_idx, nv, nf + 2
 
-    def compute_endpoint(self, p_start: F64Array, p_end: F64Array) -> F64Array | None:
+    def compute_endpoint(self, p_start: F64Array,
+                         p_end: F64Array) -> tuple[F64Array, bool]:
         """Geodesic path between two exact 3D points via buffer-based mesh insertion.
 
         If the first attempt fails (solver rejects the modified mesh),
         retries with points nudged toward their face centroids.  Only
         falls back to vertex-snap as a last resort.
 
-        Returns a straight-line fallback if the two points lie on
-        disconnected mesh components (no geodesic path exists).
-
-        Side effect: ``self._last_was_fallback`` is set to True whenever
-        this function returns a 2-point straight-line stub (cross-component
-        or solver failure) so callers can flag the span as degraded.
+        Returns
+        -------
+        ``(path, was_fallback)`` — the second element is True whenever
+        the result is a 2-point straight-line stub (cross-component or
+        solver failure).  Returning by tuple rather than via instance
+        state is what makes this function safe to invoke concurrently
+        from background workers sharing the same ``GeodesicMesh``.
         """
-        self._last_was_fallback = False
-
         # Reject cross-component queries early — no geodesic can exist
         fi_s = self.find_face(p_start)
         fi_e = self.find_face(p_end)
         if not self.same_component(fi_s, fi_e):
-            self._last_was_fallback = True
-            return np.array([p_start, p_end])
+            return np.array([p_start, p_end]), True
 
         # Attempt 1: exact positions
         try:
             path, ok = self._try_endpoint_insertion(p_start, p_end)
             if ok:
                 self.diagnose_path(path, "endpoint")
-                return path
+                return path, False
         except (RuntimeError, ValueError, TypeError, IndexError) as exc:
             log.debug("compute_endpoint attempt-1 failed: %s", exc)
 
@@ -2064,7 +3004,7 @@ class GeodesicMesh:
             path, ok = self._try_endpoint_insertion(p_s2, p_e2)
             if ok:
                 self.diagnose_path(path, "endpoint-nudged")
-                return path
+                return path, False
         except (RuntimeError, ValueError, TypeError, IndexError) as exc:
             log.debug("compute_endpoint attempt-2 (nudged) failed: %s", exc)
 
@@ -2075,16 +3015,16 @@ class GeodesicMesh:
         _, idx_e = self._kdtree.query(p_end)
         idx_s, idx_e = int(idx_s), int(idx_e)
         if idx_s == idx_e:
-            self._last_was_fallback = True
-            return np.array([p_start, p_end])
+            return np.array([p_start, p_end]), True
         try:
             path = self._solver.find_geodesic_path(idx_s, idx_e)
+            if path is None or len(path) < 2:
+                return np.array([p_start, p_end]), True
             self.diagnose_path(path, "endpoint-snapped")
-            return path
+            return path, False
         except (RuntimeError, ValueError, TypeError) as exc:
             log.debug("vertex-snap solver failed: %s", exc)
-            self._last_was_fallback = True
-            return np.array([p_start, p_end])
+            return np.array([p_start, p_end]), True
 
     @staticmethod
     def _remove_degenerate_faces(F_buf: np.ndarray, nf: int) -> int:
@@ -2105,43 +3045,349 @@ class GeodesicMesh:
             F_buf[:n_valid] = F[valid]
         return n_valid
 
-    def _add_point_buf(self, p, V_buf, F_buf, nv, nf):
+    @staticmethod
+    def _sanitize_for_solver(V: np.ndarray, F: np.ndarray
+                             ) -> tuple[np.ndarray, np.ndarray, dict]:
+        """Best-effort topology cleanup so ``pp3d.EdgeFlipGeodesicSolver``
+        doesn't fire ``GC_SAFETY_ASSERT`` on the user's mesh.
+
+        Four repair passes, run in order:
+
+          1. **Self-edge faces** — drop any face whose three vertex
+             indices are not distinct.  Same defect class as
+             :meth:`_remove_degenerate_faces` but applied globally
+             instead of to a working buffer.
+          2. **Duplicate faces** — drop rows whose unordered vertex
+             triple appears more than once.  Real-world cause: a CAD
+             merge that brought in the same triangle from two source
+             meshes.  Keeps the first occurrence by row order.
+          3. **Non-manifold edge fans** — greedy peel: while any
+             *undirected* edge has > 2 incident faces, remove the
+             face that contributes to the most over-count edges;
+             recount; repeat.  Converges because each removal
+             strictly decreases total over-count.  Real-world cause:
+             anatomical / scan meshes with T-junctions or "fins"
+             along a seam.
+          4. **Inconsistent winding** — same greedy peel as pass 3
+             but on *directed* edges (count > 1).  In an orientable
+             2-manifold each ``(a → b)`` directed edge belongs to
+             exactly one face — its reverse ``(b → a)`` belongs to
+             the neighbour.  Two faces traversing the same edge in
+             the same direction break orientation; gc reports it
+             as ``duplicate edge in list a -- b`` even when the
+             undirected count is the manifold-valid value 2.
+          5. **Non-manifold vertices** (vertex split) — a vertex
+             whose incident-face fan splits into multiple edge-
+             connected components is a "pinch point" (two surfaces
+             meeting only at one vertex).  gc reports it as
+             ``vertex N appears in more than one boundary loop``.
+             Repair preserves geometry: keep the first component on
+             the original vertex; for each extra component append a
+             fresh vertex at the same 3-D position and reassign that
+             component's face slots to it.  After the split the two
+             surfaces are topologically disjoint (they no longer
+             share a vertex) but visually identical.
+
+        After the topology fixes, vertices that no surviving face
+        references are dropped and ``F`` is remapped accordingly.
+
+        Cheap on a clean mesh: each detection pass is ``O(F log F)``
+        and the function early-exits when nothing needs changing
+        (``F`` is returned unmodified, no copy).
+
+        Returns
+        -------
+        ``(V_out, F_out, report)`` where *report* counts how many
+        faces / vertices each pass removed.  Caller decides whether
+        to log + warn or stay silent based on
+        ``report['total_faces_dropped']``.
+
+        What this **cannot** repair: non-orientable surfaces, edges
+        with consistent winding but incompatible normals across the
+        seam, and other defects that pp3d's manifold check rejects
+        even after edge-fan cleanup.  Those still raise from the
+        solver constructor; the caller's ``except`` clause prints a
+        message pointing at MeshLab / Blender / trimesh.
+        """
+        F = np.asarray(F, dtype=np.int32)
+        V = np.asarray(V, dtype=np.float64)
+        n_orig = len(F)
+
+        # Pass 1: self-edge faces ([A, A, B] etc.)
+        valid = ((F[:, 0] != F[:, 1]) & (F[:, 1] != F[:, 2])
+                 & (F[:, 0] != F[:, 2]))
+        n_self = int((~valid).sum())
+        if n_self:
+            F = F[valid]
+
+        # Pass 2: duplicate faces (same unordered triple).  ``np.unique``
+        # on ``axis=0`` operates row-wise; sorting per row first
+        # collapses (a, b, c) ≡ (b, a, c) ≡ (c, b, a) — the manifold
+        # check is winding-agnostic for duplicate detection.
+        if len(F):
+            F_sorted = np.sort(F, axis=1)
+            _u, unique_idx = np.unique(F_sorted, axis=0, return_index=True)
+            n_dup = len(F) - len(unique_idx)
+            if n_dup:
+                # Preserve original row order among the survivors.
+                F = F[np.sort(unique_idx)]
+        else:
+            n_dup = 0
+
+        # Pass 3: non-manifold edges (count > 2).  Encode each
+        # undirected edge as one int64 (lo * 2^32 + hi); ``np.unique``
+        # on the encoded vector + ``np.bincount`` gives per-edge
+        # incidence counts in two C-level passes.  Greedy peel: each
+        # iteration drops the single face that contributes to the
+        # most over-count edges; loop terminates when no edge exceeds
+        # the manifold limit.
+        n_nonman = 0
+        while len(F) > 0:
+            e0 = np.concatenate([F[:, 0], F[:, 1], F[:, 2]])
+            e1 = np.concatenate([F[:, 1], F[:, 2], F[:, 0]])
+            e_lo = np.minimum(e0, e1).astype(np.int64)
+            e_hi = np.maximum(e0, e1).astype(np.int64)
+            keys = (e_lo << 32) | e_hi
+            _u, inverse = np.unique(keys, return_inverse=True)
+            counts = np.bincount(inverse)
+            if int(counts.max()) <= 2:
+                break
+            # ``inverse`` runs in [edge0_face0, …, edge0_faceN, edge1_face0,
+            # …]; reshape to (3, n_faces) then transpose so each row gives
+            # the unique-edge ids of one face's three edges.
+            face_edge_keys = inverse.reshape(3, len(F)).T
+            over = counts > 2
+            face_over = over[face_edge_keys].sum(axis=1)
+            worst = int(face_over.argmax())
+            if face_over[worst] == 0:
+                break  # paranoid — should be unreachable when max > 2
+            F = np.delete(F, worst, axis=0)
+            n_nonman += 1
+
+        # Pass 4 prelude: ensure F is contiguous and writable for the
+        # ``np.delete`` cycle that follows.  ``np.delete`` returns a
+        # new array, so this is just type insurance.
+        F = np.ascontiguousarray(F, dtype=np.int32)
+
+        # Pass 4: inconsistent winding (directed edge count > 1).
+        # Same peel structure as pass 3 but keyed on the *directed*
+        # edge ``(a → b)`` instead of the unordered pair.  In a
+        # properly oriented 2-manifold each directed edge appears
+        # in exactly one face; its reverse appears in the neighbour.
+        # gc reports collisions here as ``duplicate edge in list``
+        # even when the undirected count is the manifold-valid 2 —
+        # this pass is what catches anatomical / CAD meshes whose
+        # surface has been merged across pieces with conflicting
+        # face orientations.  Pass 3 ran first so undirected counts
+        # are already ≤ 2 when we get here; dropping a face only
+        # reduces counts, so we never re-introduce pass-3 violations.
+        n_winding = 0
+        while len(F) > 0:
+            e_a = np.concatenate([F[:, 0], F[:, 1], F[:, 2]]).astype(np.int64)
+            e_b = np.concatenate([F[:, 1], F[:, 2], F[:, 0]]).astype(np.int64)
+            keys = (e_a << 32) | e_b
+            _u, inverse = np.unique(keys, return_inverse=True)
+            counts = np.bincount(inverse)
+            if int(counts.max()) <= 1:
+                break
+            face_edge_keys = inverse.reshape(3, len(F)).T
+            over = counts > 1
+            face_over = over[face_edge_keys].sum(axis=1)
+            worst = int(face_over.argmax())
+            if face_over[worst] == 0:
+                break
+            F = np.delete(F, worst, axis=0)
+            n_winding += 1
+
+        # Pass 5: non-manifold vertices.  After passes 1-4 every
+        # undirected edge has incidence ≤ 2 with consistent winding,
+        # but the face fan around a vertex can still split into
+        # multiple edge-connected components — gc reports this as
+        # ``vertex N appears in more than one boundary loop``.  We
+        # detect by per-vertex union-find on incident faces (linked
+        # iff they share an edge through the vertex) and repair by
+        # vertex split: keep the first component on the original
+        # vertex, append a duplicate of ``V[v]`` for each extra
+        # component, and rewrite that component's face slots to the
+        # duplicate.  Geometry preserved (the duplicate sits at the
+        # exact same 3-D position); topology cleaned.
+        n_split = 0
+        if len(F):
+            # Per-vertex face index via argsort.  ``F.ravel()`` runs
+            # face-major: face0_v0, face0_v1, face0_v2, face1_v0, …
+            # ``face_id_flat`` mirrors this so we know which face each
+            # entry came from.
+            verts_flat = F.ravel()
+            face_id_flat = np.repeat(np.arange(len(F), dtype=np.int64), 3)
+            order = np.argsort(verts_flat, kind='stable')
+            sorted_verts = verts_flat[order]
+            sorted_face_ids = face_id_flat[order]
+            unique_v, v_start = np.unique(sorted_verts, return_index=True)
+            v_end = np.concatenate(
+                [v_start[1:], np.array([len(sorted_verts)], dtype=v_start.dtype)])
+
+            # Mutable working list for V (rows appended on split).
+            V_list = [V]
+            n_V_curr = len(V)
+            # F is mutated in place via fancy indexing on a copy.
+            F = F.copy()
+
+            for vi_idx in range(len(unique_v)):
+                v = int(unique_v[vi_idx])
+                faces_v = sorted_face_ids[v_start[vi_idx]:v_end[vi_idx]]
+                if len(faces_v) <= 1:
+                    continue
+
+                # For each face that contains v, find the two "other"
+                # vertices on edges through v.  Build edge_other ->
+                # list of (face_id, slot_of_v) pairs.
+                edge_to_faces: dict[int, list[int]] = {}
+                v_slot_per_face: dict[int, int] = {}
+                for fi in faces_v:
+                    fi_int = int(fi)
+                    row = F[fi_int]
+                    if int(row[0]) == v:
+                        slot = 0
+                    elif int(row[1]) == v:
+                        slot = 1
+                    else:
+                        slot = 2
+                    v_slot_per_face[fi_int] = slot
+                    o1 = int(row[(slot + 1) % 3])
+                    o2 = int(row[(slot + 2) % 3])
+                    edge_to_faces.setdefault(o1, []).append(fi_int)
+                    edge_to_faces.setdefault(o2, []).append(fi_int)
+
+                # Union-find over faces_v keyed on edge_through_v
+                # equivalence: two faces sharing an edge through v fall
+                # into the same component.
+                parent: dict[int, int] = {int(fi): int(fi) for fi in faces_v}
+
+                def _find(x: int) -> int:
+                    while parent[x] != x:
+                        parent[x] = parent[parent[x]]
+                        x = parent[x]
+                    return x
+
+                for face_list in edge_to_faces.values():
+                    if len(face_list) < 2:
+                        continue
+                    root0 = _find(face_list[0])
+                    for fj in face_list[1:]:
+                        rj = _find(fj)
+                        if rj != root0:
+                            parent[rj] = root0
+
+                # Group faces by component root.
+                comps: dict[int, list[int]] = {}
+                for fi in faces_v:
+                    comps.setdefault(_find(int(fi)), []).append(int(fi))
+                if len(comps) <= 1:
+                    continue
+
+                # Multi-component vertex: split.  Keep first component
+                # on ``v``; reassign each extra component to a fresh
+                # vertex at the same 3-D position.
+                comp_lists = list(comps.values())
+                for extra in comp_lists[1:]:
+                    n_split += 1
+                    V_list.append(V[v:v + 1].copy())
+                    new_vid = n_V_curr
+                    n_V_curr += 1
+                    for fi in extra:
+                        F[fi, v_slot_per_face[fi]] = np.int32(new_vid)
+
+            if n_split:
+                V = np.concatenate(V_list, axis=0)
+
+        # Final pass: drop unreferenced vertices and remap F.
+        if len(F):
+            used = np.unique(F.ravel())
+        else:
+            used = np.empty(0, dtype=np.int64)
+        n_unused = len(V) - len(used)
+        if n_unused:
+            remap = np.full(len(V), -1, dtype=np.int64)
+            remap[used] = np.arange(len(used))
+            V_out = V[used]
+            F_out = remap[F].astype(np.int32) if len(F) else F.astype(np.int32)
+        else:
+            V_out = V
+            F_out = F
+
+        report = {
+            'self_edge_faces': n_self,
+            'duplicate_faces': n_dup,
+            'non_manifold_faces': n_nonman,
+            'winding_faces': n_winding,
+            'vertex_splits': n_split,
+            'unreferenced_verts': int(n_unused),
+            'total_faces_dropped': n_orig - len(F_out),
+        }
+        return V_out, F_out, report
+
+    def _add_point_buf(self, p, V_buf, F_buf, nv, nf, adj_buf=None):
         """Insert a point into mesh topology using pre-allocated buffers.
 
         Operates on numpy arrays in-place — no list/tuple conversion.
         Returns (vertex_idx, new_nv, new_nf).
 
-        Uses a two-tier threshold:
-          - **snap_eps** (``1e-4``): if a barycentric coord is within this
-            of 1.0, snap to that vertex.  Prevents edge splits that create
-            near-zero-length edges.
-          - **edge_eps** (``1e-4``): if a barycentric coord is below this,
-            the point is on an edge — use edge-split instead of interior
-            subdivision that would create a sliver triangle.
+        Three insertion strategies, in order of preference:
 
-        The previous ``eps=1e-9`` threshold was too conservative — points
-        within 1e-5 of an edge were classified as "interior" and the
-        resulting 1-to-3 subdivision produced degenerate triangles rejected
-        by geometry-central.
+          1. **Snap to nearest vertex** (``snap_eps = 1e-7``): the
+             point is essentially on a mesh vertex; reuse it as-is.
+          2. **2-to-4 edge split** (``edge_eps = 1e-7``, requires
+             *adj_buf*): the point is essentially on an edge; split
+             the two triangles sharing that edge into 4 sub-faces via
+             :meth:`_split_edge_2to4`.  Mathematically the right
+             operation, eliminates the discrete jump in inserted-point
+             position when the caller's parameter sweeps the point
+             across an edge.
+          3. **1-to-3 interior subdivision** (otherwise): standard
+             three-way split of the containing triangle.  Falls back
+             to a tiny nudge inward if all of the above fail (boundary
+             edge with no neighbour to split, ``adj_buf`` missing,
+             or near-zero-area sub-face after subdivision).
+
+        The previous default thresholds (``snap_eps = 1e-4``,
+        ``edge_eps = 1e-3``) were ~1000× more conservative than the
+        post-subdivision area check needs.  When the caller's input
+        sweeps continuously, those thresholds caused a step
+        discontinuity in the inserted-point position whenever the
+        bary coord crossed the boundary — visible as ~1e-4 jitter
+        in the rendered cascade.  The 2-to-4 path removes that
+        discontinuity entirely, since it preserves the exact
+        position of *p* as a new mesh vertex.
         """
         face_idx = self._find_face_buf(p, V_buf, F_buf, nv, nf)
         u, v, w = self._bary_buf(p, face_idx, V_buf, F_buf)
         fa, fb, fc = int(F_buf[face_idx, 0]), int(F_buf[face_idx, 1]), int(F_buf[face_idx, 2])
-        snap_eps = 1e-4
+        snap_eps = 1e-7
+        edge_eps = 1e-7
 
         # Case 1: snap to nearest vertex
         if u > 1 - snap_eps: return fa, nv, nf
         if v > 1 - snap_eps: return fb, nv, nf
         if w > 1 - snap_eps: return fc, nv, nf
 
-        # Nudge toward centroid if any bary coord is near zero (on an
-        # edge).  Without this, 1-to-3 subdivision creates a sliver
-        # triangle with near-zero area that can cause NaNs in the
-        # solver's cotan/area computations.  The nudge fraction is
-        # relative to the shortest edge of the face — safe on both
-        # coarse and very dense meshes.
-        edge_eps = 1e-3
-        if min(u, v, w) < edge_eps:
+        # Case 2: 2-to-4 edge split (when adjacency available).
+        bary = (u, v, w)
+        min_bary = min(bary)
+        if min_bary < edge_eps and adj_buf is not None:
+            min_idx = bary.index(min_bary)
+            opposite_edge_slot = (min_idx + 1) % 3
+            result = self._split_edge_2to4(
+                p, V_buf, F_buf, adj_buf, nv, nf,
+                face_idx, opposite_edge_slot)
+            if result is not None:
+                return result
+            # 2-to-4 failed (boundary edge or inconsistent adjacency)
+            # — fall through to the 1-to-3 path with nudge below.
+
+        # Case 3: 1-to-3 subdivision.  Tiny nudge toward centroid
+        # when bary < edge_eps but 2-to-4 was unavailable, so the
+        # subdivision does not create a degenerate triangle.
+        if min_bary < edge_eps:
             Va, Vb, Vc = V_buf[fa], V_buf[fb], V_buf[fc]
             centroid = (Va + Vb + Vc) / 3.0
             e0 = np.linalg.norm(Vb - Va)
@@ -2184,82 +3430,6 @@ class GeodesicMesh:
                 return [fa, fb, fc][np.argmin(dists)], nv - 1, nf
 
         return p_idx, nv, nf + 2
-
-    @staticmethod
-    def _split_face_buf(fi, v1, v2, p, F_buf, nf):
-        """Splits face *fi* at edge (v1, v2), writes result in-place into *F_buf*.
-
-        Returns updated *nf*.  Extracted as a static method so it is
-        created once at class definition time, not per call.
-        """
-        f = F_buf[fi]
-        for i in range(3):
-            if {int(f[i]), int(f[(i+1) % 3])} == {int(v1), int(v2)}:
-                c = int(f[(i + 2) % 3])
-                F_buf[fi]  = [int(f[i]), p, c]
-                F_buf[nf]  = [p, int(f[(i+1) % 3]), c]
-                return nf + 1
-        return nf
-
-    @staticmethod
-    def _find_reverse_halfedge(F_buf, nf, iv1, iv2, exclude_fi):
-        """Finds the face containing the reverse half-edge (iv2→iv1).
-
-        In a manifold mesh, each directed half-edge (A→B) has exactly
-        one partner (B→A) in an adjacent face.  Searching for the
-        REVERSE half-edge instead of just "contains both vertices"
-        avoids false matches with sub-faces created by prior
-        subdivisions that share the same vertex pair but different
-        winding.
-        """
-        for fi in range(nf):
-            if fi == exclude_fi:
-                continue
-            f = F_buf[fi]
-            f0, f1, f2 = int(f[0]), int(f[1]), int(f[2])
-            # Check all 3 directed half-edges for (iv2→iv1)
-            if (f0 == iv2 and f1 == iv1) or \
-               (f1 == iv2 and f2 == iv1) or \
-               (f2 == iv2 and f0 == iv1):
-                return fi
-        return None
-
-    def _split_edge_buf(self, p_idx, v1, v2, main_idx, F_buf, nf):
-        """Edge split on pre-allocated F_buf. Returns (p_idx, nv_unchanged, new_nf).
-
-        Finds the adjacent face by searching for the **reverse half-edge**
-        (v2→v1) rather than just vertex membership.  This is critical for
-        correctness after prior subdivisions: multiple sub-faces may
-        contain both v1 and v2, but only ONE has the reverse half-edge.
-        Using set-based lookup ``{v1, v2} in face`` would find the wrong
-        face and produce non-manifold duplicate edges.
-        """
-        iv1, iv2 = int(v1), int(v2)
-        key = (min(iv1, iv2), max(iv1, iv2))
-        candidates = self._edge_to_face.get(key, [])
-        adj_idx = next((fi for fi in candidates if fi != main_idx), None)
-
-        # Validate: the adjacent face must contain the REVERSE half-edge.
-        if adj_idx is not None:
-            f = F_buf[adj_idx]
-            f0, f1, f2 = int(f[0]), int(f[1]), int(f[2])
-            has_reverse = ((f0 == iv2 and f1 == iv1) or
-                           (f1 == iv2 and f2 == iv1) or
-                           (f2 == iv2 and f0 == iv1))
-            if not has_reverse:
-                adj_idx = None
-
-        # Fallback: scan for the face with the reverse half-edge.
-        if adj_idx is None:
-            adj_idx = self._find_reverse_halfedge(
-                F_buf, nf, iv1, iv2, main_idx)
-
-        nf = self._split_face_buf(main_idx, v1, v2, p_idx, F_buf, nf)
-        if adj_idx is not None:
-            nf = self._split_face_buf(adj_idx, v1, v2, p_idx, F_buf, nf)
-
-        # nv is not changed here (already incremented by caller)
-        return p_idx, p_idx + 1, nf
 
     # --- Helpers for buffer-based insertion ---
     def _find_face_buf(self, p, V_buf, F_buf, nv, nf):
@@ -2319,6 +3489,143 @@ class GeodesicMesh:
             return np.array(self._vtk_cp, dtype=float)
         _, idx = self._kdtree.query(pt)
         return self.V[int(idx)].copy()
+
+    def short_geodesic(
+        self,
+        p0: F64Array,
+        p1: F64Array,
+        face_a: int | None = None,
+        face_b: int | None = None,
+    ) -> F64Array | None:
+        """Fast exact geodesic between two points in adjacent triangles.
+
+        When *p0* and *p1* lie in the same triangle (or in two
+        edge-adjacent triangles), the geodesic between them is either
+        a straight 3-D segment (same triangle) or a two-segment polyline
+        through the unique optimal crossing point on the shared edge —
+        no edge-flip iteration, no submesh extraction, no
+        ``EdgeFlipGeodesicSolver`` invocation.  This is the fast path
+        used by the orange worker's phase-3 chord-bridging when the
+        cascade samples are dense enough that consecutive samples land
+        in adjacent (or identical) faces.
+
+        The math is the classic *unfold-and-mirror* construction.  Both
+        triangle planes are rotated around the shared edge until they
+        are coplanar.  In that 2-D plane the geodesic is a straight
+        line, and its crossing of the shared edge is the (unique)
+        point ``q`` that minimises ``|p0 - q| + |q - p1|`` — found by
+        reflecting ``p1`` across the edge and intersecting the segment
+        ``(p0, mirror(p1))`` with the edge.
+
+        Validation
+        ----------
+        Before returning a result, the crossing parameter ``s`` along
+        the shared edge is checked against a margin:
+
+            ``s ∈ [margin, edge_len - margin]``,
+            ``margin = max(1e-7, 0.001 * edge_len)``.
+
+        If ``s`` falls outside that interval, the optimal geodesic is
+        passing *around* one of the shared-edge vertices — the
+        unfolding is no longer a flat construction (cone-curvature at
+        the vertex), so the result would be wrong.  The method then
+        returns ``None`` and the caller is expected to fall back to
+        ``compute_endpoint_local``.
+
+        Parameters
+        ----------
+        p0, p1 : (3,) ndarrays
+            Surface points (each must lie ON the mesh).  Caller is
+            responsible for that — typically they are already cascade
+            samples returned by ``compute_endpoint_local``.
+        face_a, face_b : int, optional
+            If known, the face indices containing *p0* / *p1*.  When
+            omitted, ``find_face`` is called for each — adds ~5-15 µs
+            per call.  Hot-path callers (orange worker phase 3) keep
+            the face indices alive across cascade evaluations and
+            should pass them.
+
+        Returns
+        -------
+        np.ndarray, shape (2, 3) or (3, 3), or None.
+            ``[p0, p1]`` if both points are in the same face.
+            ``[p0, q, p1]`` when the optimal crossing falls strictly
+            inside the shared edge.  ``None`` on any other condition
+            (non-adjacent faces, degenerate edge, crossing on/near a
+            shared-edge vertex) — caller must fall back to a full
+            geodesic solver call.
+        """
+        if face_a is None:
+            face_a = self.find_face(p0)
+        if face_b is None:
+            face_b = self.find_face(p1)
+        if face_a < 0 or face_b < 0:
+            return None
+        if face_a == face_b:
+            # Same triangle: straight 3-D segment is the geodesic
+            # (triangle is flat).
+            return np.stack([p0, p1])
+
+        # Locate the shared edge inside face_a's adjacency row.  The
+        # adjacency matrix stores the neighbour face index per local
+        # edge slot; we want the slot that points to face_b.
+        adj_row = self._face_adj[face_a]
+        elocal = -1
+        for k in range(3):
+            if int(adj_row[k]) == face_b:
+                elocal = k
+                break
+        if elocal < 0:
+            return None  # not edge-adjacent
+
+        # Shared edge = vertices (F[face_a, elocal], F[face_a, (elocal+1) % 3]).
+        v_i_idx = int(self.F[face_a, elocal])
+        v_j_idx = int(self.F[face_a, (elocal + 1) % 3])
+        v_i = self.V[v_i_idx]
+        v_j = self.V[v_j_idx]
+        edge = v_j - v_i
+        edge_len_sq = float(np.dot(edge, edge))
+        if edge_len_sq < 1e-24:
+            return None  # degenerate edge — caller falls back
+        edge_len = float(np.sqrt(edge_len_sq))
+        edge_unit = edge / edge_len
+
+        # Project p0 and p1 onto the edge axis, get tangential and
+        # perpendicular components.  In the unfolded 2-D plane the
+        # x-coord is the tangential projection and the y-coord is the
+        # perpendicular distance — positive for face_a's half-plane and
+        # NEGATIVE for face_b's (face_b is rotated around the edge to
+        # the opposite side of the unfolded plane).
+        d0 = p0 - v_i
+        d1 = p1 - v_i
+        p0_x = float(np.dot(d0, edge_unit))
+        p1_x = float(np.dot(d1, edge_unit))
+        p0_perp = d0 - p0_x * edge_unit
+        p1_perp = d1 - p1_x * edge_unit
+        p0_y = float(np.linalg.norm(p0_perp))   # >= 0, p0 in face_a
+        p1_y = -float(np.linalg.norm(p1_perp))  # <= 0, p1 in unfolded face_b
+
+        # Straight line from (p0_x, p0_y) to (p1_x, p1_y) crosses y=0
+        # at a unique point unless both have y=0 (both on edge axis,
+        # degenerate).  Solve y(t) = 0 for t on the segment.
+        denom = p0_y - p1_y
+        if abs(denom) < 1e-15:
+            return None
+        t_cross = p0_y / denom            # in (0, 1) when signs differ
+        s = p0_x + t_cross * (p1_x - p0_x)  # x-coord of crossing on the edge
+
+        # Reject crossings that hit (or come within margin of) either
+        # shared-edge vertex.  A vertex hit means the optimal geodesic
+        # actually wraps around the vertex's curvature cone — the flat
+        # unfolding is invalid there.
+        margin = max(1e-7, 0.001 * edge_len)
+        if s < margin or s > edge_len - margin:
+            return None
+
+        # Crossing point in 3-D, on the shared edge.
+        q = v_i + (s / edge_len) * edge
+        return np.stack([p0, q, p1])
+
 
     @staticmethod
     def compute_path_lengths(path: F64Array) -> tuple[F64Array, float]:

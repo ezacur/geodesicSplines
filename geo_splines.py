@@ -40,6 +40,7 @@ import signal
 import sys
 import tempfile
 import weakref
+from collections import deque
 from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -50,7 +51,7 @@ import numpy as np
 import pyvista as pv
 import vtk
 
-from geo_shoot import MidpointShooterApp, _hover_argmin_sq, _closest_seg_on_polyline_2d
+from geo_shoot import MidpointShooterApp, _closest_seg_on_polyline_2d
 from geodesics import GeodesicMesh, HAS_NUMBA
 
 
@@ -169,6 +170,7 @@ _HUD_TEXTS: dict[str, str] = {
     "orange_done": "ORANGE DONE",
     "orange_rebuilt": "ORANGE REBUILT",
     "geodesic_fallback": "GEODESIC FALLBACK on span {sid}:{i}",
+    "shoot_truncated": "GEODESIC TRUNCATED at non-manifold vertex (mesh defect)",
     "gizmo_opacity": "GIZMO OPACITY {pct}",
 }
 
@@ -226,13 +228,28 @@ def _validate_session_dict(data: dict) -> None:
     # to mix v1 and v2 records (handy when manually concatenating
     # sessions or migrating piecemeal).  Each record is valid if it
     # has either ``tangent`` (v1) or both ``p_a`` and ``p_b`` (v2).
+    # Cheap finite-check without ``math.isfinite`` so the validator
+    # body is import-free (the test suite loads it via AST extraction
+    # into an empty namespace).  ``x != x`` catches NaN; the inf
+    # comparisons reject ±Infinity (which Python's ``json.load``
+    # otherwise parses silently because the JSON spec extension
+    # ``Infinity`` is enabled by default).
+    _POS_INF = float('inf')
+    _NEG_INF = float('-inf')
+
     def _validate_3vec_or_none(label, v, allow_none):
         if v is None and allow_none:
             return
         if not isinstance(v, (list, tuple)) or len(v) != 3:
             raise ValueError(f"{label} must be a 3-element list")
         for j, x in enumerate(v):
-            if not isinstance(x, (int, float)) or x != x:  # x!=x catches NaN
+            # ``bool`` is a subclass of ``int``; rejecting it explicitly
+            # prevents corrupt JSON like ``"origin": [true, 0, 0]`` from
+            # silently passing validation and crashing in ``find_face``.
+            if (isinstance(x, bool)
+                    or not isinstance(x, (int, float))
+                    or x != x  # NaN
+                    or x == _POS_INF or x == _NEG_INF):
                 raise ValueError(f"{label}[{j}] must be a finite number")
 
     for si, sd in enumerate(splines):
@@ -373,7 +390,17 @@ def _process_initializer(v_shm_name: str, v_shape: tuple, v_dtype: str,
     # mapping can be closed after init without invalidating the mesh.
     # ``copy()`` defends against premature shm.close() on platforms
     # where the slice would otherwise stay attached to the buffer.
-    _process_geo = GeodesicMesh(V.copy(), F.copy())
+    #
+    # ``build_locator=False``: the orange worker only calls
+    # ``compute_endpoint_local`` which uses the KDTree, never the
+    # VTK locator.  Skipping ``_build_locator`` saves ~250 ms of
+    # PyVista + VTK init per worker and — critically on Windows
+    # spawn-mode children — avoids the import-time chain that has
+    # been observed to abort the worker (manifesting as a continuous
+    # stream of "orange worker pipe broken on span (0, 0): WinError
+    # 109" warnings as each respawned worker dies before sending
+    # any results).
+    _process_geo = GeodesicMesh(V.copy(), F.copy(), build_locator=False)
     shm_v.close()
     shm_f.close()
 
@@ -451,6 +478,50 @@ class SplineConfig:
     # that tells the user the curve is still being refined.  Disable for
     # a solid-curve-with-dimmer-color look.
     GEO_DASHED_WHILE_COMPUTING: bool = True
+
+    # Orange post-densification — eliminates the visible mismatch
+    # between the orange polyline and the didactic point trajectory.
+    # Two phases run inside the worker after the GEO_SAMPLES samples
+    # are computed:
+    #   Phase 2 (cascade densification): for every adjacent sample
+    #       pair whose chord deviates beyond ``ORANGE_SUBDIV_TOL_FACTOR``
+    #       of mean edge length, evaluate the cascade at the midpoint
+    #       *t* and insert that point.  Recursive up to
+    #       ``ORANGE_SUBDIV_MAX_DEPTH``.  The deviation criterion is
+    #       selected by ``ORANGE_DEVIATION_MODE``:
+    #         'cascade' → measure |chord_mid − cascade(t_mid)|.  Honest
+    #             metric (deviation from the true curve).  Default.
+    #         'surface' → measure |chord_mid − project(chord_mid)|.
+    #             Cheaper (no extra cascade evaluation per chord) but
+    #             only catches mesh-piercing chords, not curve drift on
+    #             flat regions where the cascade still curls.
+    #   Phase 3 (geodesic chord-bridging): each consecutive sample pair
+    #       in the densified polyline is connected by an exact mesh
+    #       geodesic (``short_geodesic`` if the endpoints are in
+    #       adjacent triangles — fast — else ``compute_endpoint_local``).
+    #       Disabled by ``ORANGE_CHORD_BRIDGING = False``.
+    ORANGE_DEVIATION_MODE: str = 'surface'   # 'cascade' (default) | 'surface'
+    ORANGE_SUBDIV_TOL_FACTOR: float = 0.01   # fraction of mean edge length
+    ORANGE_SUBDIV_MAX_DEPTH: int = 6         # recursion cap for densification
+    ORANGE_CHORD_BRIDGING: bool = True       # phase-3 short-geodesic polyline
+
+    # Submesh subdivision for the orange worker's geodesic solver.
+    # ``compute_endpoint_local`` extracts a small submesh around the
+    # cascade endpoints and runs ``EdgeFlipGeodesicSolver`` on it.  On
+    # coarse meshes the discrete geodesic the solver returns can
+    # diverge from the smooth-surface geodesic — and worse, can flip-
+    # flop between two near-equal-length edge chains as the cascade
+    # parameter sweeps, producing visible kinks (~cm scale) in the
+    # rendered curve.  Subdividing the submesh once (4× faces) gives
+    # the solver finer edges to work with; the discrete geodesic
+    # converges to the smooth one and the flip-flop disappears.
+    # Empirically: a 4.5 cm jump on fandisk drops to 0.3 mm at level 1;
+    # level 2 gives the same answer (already converged).
+    # Cost: ~4× per level (each ``compute_endpoint_local`` call goes
+    # from ~25 ms to ~100 ms at level 1).  Done in background workers
+    # so it does not block UI.  Set to 0 if you find the orange curve
+    # already smooth enough on your meshes and want faster batches.
+    ORANGE_SUBMESH_SUBDIV: int = 0           # 0 = off, 1 = 4× faces, 2 = 16×
 
     # Sample count for the per-key 'v' VTK export (``_on_export_vtk``).
     # Mirrors the ``--samples`` flag of ``spline_export.py`` — using the
@@ -549,6 +620,125 @@ def _hierarchical_inner_order(total: int) -> list[int]:
     return order
 
 
+def _eval_cascade_at_t(
+    geo, t: float,
+    path_b: np.ndarray, cum_b: np.ndarray, total_b: float,
+    path_a_rev: np.ndarray, cum_a: np.ndarray, total_a: float,
+    path_12: np.ndarray, cum_12: np.ndarray, total_12: float,
+    submesh_subdiv: int = 0,
+) -> tuple[np.ndarray, bool]:
+    """Evaluate one full de Casteljau cascade level at parameter *t*.
+
+    Used by the orange worker for both phase-1 (canonical t-grid samples)
+    and phase-2 (densification at midpoint t-values).  Returns
+    ``(point, degraded)`` where ``degraded`` is True if any of the three
+    ``compute_endpoint_local`` calls fell back to a straight-line
+    polyline (component break, solver failure).
+
+    The cascade structure:
+      level 1  →  b01 = lerp(path_b, t)
+                  b12 = lerp(path_12, t)   (path_12 is shared / cached)
+                  b23 = lerp(path_a_rev, t)
+      level 2  →  path_c0 = geodesic(b01, b12)  → c0 = lerp(path_c0, t)
+                  path_c1 = geodesic(b12, b23)  → c1 = lerp(path_c1, t)
+      level 3  →  path_final = geodesic(c0, c1)  → result = lerp(path_final, t)
+
+    *submesh_subdiv* propagates to every ``compute_endpoint_local``
+    call so the discrete geodesic the solver returns converges to
+    the smooth-surface geodesic — see that method's docstring.
+
+    Three ``compute_endpoint_local`` calls per evaluation
+    (~25 ms × 3 = 75 ms typical at ``submesh_subdiv=0``; ~100 ms × 3
+    at level 1).  Worker calls this 31 times in phase 1 (skipping the
+    two endpoints) plus once per densification step in phase 2 — the
+    dominant cost of an orange span.
+    """
+    log_w = logging.getLogger("geo_splines.worker")
+    degraded = False
+
+    b01 = GeodesicMesh.geodesic_lerp(path_b, t, cum_b, total_b)
+    b12 = GeodesicMesh.geodesic_lerp(path_12, t, cum_12, total_12)
+    b23 = GeodesicMesh.geodesic_lerp(path_a_rev, t, cum_a, total_a)
+
+    try:
+        path_c0, fb_c0 = geo.compute_endpoint_local(
+            b01, b12, submesh_subdiv=submesh_subdiv)
+        if fb_c0:
+            degraded = True
+    except (RuntimeError, ValueError, TypeError, IndexError) as exc:
+        log_w.debug("compute_endpoint_local(b01, b12) failed: %s", exc)
+        path_c0, degraded = np.array([b01, b12]), True
+    if path_c0 is None or len(path_c0) < 2:
+        path_c0, degraded = np.array([b01, b12]), True
+
+    try:
+        path_c1, fb_c1 = geo.compute_endpoint_local(
+            b12, b23, submesh_subdiv=submesh_subdiv)
+        if fb_c1:
+            degraded = True
+    except (RuntimeError, ValueError, TypeError, IndexError) as exc:
+        log_w.debug("compute_endpoint_local(b12, b23) failed: %s", exc)
+        path_c1, degraded = np.array([b12, b23]), True
+    if path_c1 is None or len(path_c1) < 2:
+        path_c1, degraded = np.array([b12, b23]), True
+
+    cum_c0, total_c0 = GeodesicMesh.compute_path_lengths(path_c0)
+    cum_c1, total_c1 = GeodesicMesh.compute_path_lengths(path_c1)
+    c0 = GeodesicMesh.geodesic_lerp(path_c0, t, cum_c0, total_c0)
+    c1 = GeodesicMesh.geodesic_lerp(path_c1, t, cum_c1, total_c1)
+
+    try:
+        path_final, fb_f = geo.compute_endpoint_local(
+            c0, c1, submesh_subdiv=submesh_subdiv)
+        if fb_f:
+            degraded = True
+    except (RuntimeError, ValueError, TypeError, IndexError) as exc:
+        log_w.debug("compute_endpoint_local(c0, c1) failed: %s", exc)
+        path_final, degraded = np.array([c0, c1]), True
+    if path_final is None or len(path_final) < 2:
+        path_final, degraded = np.array([c0, c1]), True
+
+    cum_f, total_f = GeodesicMesh.compute_path_lengths(path_final)
+    return GeodesicMesh.geodesic_lerp(path_final, t, cum_f, total_f), degraded
+
+
+def _build_chord_geodesic(
+    geo, p_left: np.ndarray, p_right: np.ndarray,
+    submesh_subdiv: int = 0,
+) -> np.ndarray:
+    """Return a polyline that follows the mesh geodesic from *p_left*
+    to *p_right*.
+
+    Used by the orange worker's phase-3 chord-bridging — once all
+    cascade samples are computed, every pair of consecutive samples
+    is connected by an exact mesh geodesic so the rendered polyline
+    hugs the surface instead of cutting across in straight 3-D
+    chords.
+
+    Tries the cheap fast path first: if both points fall in adjacent
+    triangles, ``short_geodesic`` returns a 2- or 3-point polyline in
+    a few µs (no solver call) — the submesh subdivision flag is
+    irrelevant for this case (the answer is exact regardless).
+    Otherwise falls back to the full ``compute_endpoint_local`` with
+    the requested *submesh_subdiv* level (~25-100 ms).  Last resort,
+    when even the full solver fails (disconnected components,
+    malformed input), is a degenerate two-point Euclidean polyline
+    — at least the geometry can still be rendered, with the degraded
+    flag set elsewhere.
+    """
+    seg = geo.short_geodesic(p_left, p_right)
+    if seg is not None:
+        return seg
+    try:
+        seg, _fb = geo.compute_endpoint_local(
+            p_left, p_right, submesh_subdiv=submesh_subdiv)
+    except (RuntimeError, ValueError, TypeError, IndexError):
+        seg = None
+    if seg is None or len(seg) < 2:
+        return np.stack([p_left, p_right])
+    return seg
+
+
 def _geodesic_decasteljau_worker(
     span_key: SpanKey,
     ctrl: list[np.ndarray],
@@ -557,116 +747,218 @@ def _geodesic_decasteljau_worker(
     t_grid: np.ndarray,
     inner_order: list[int],
     writer,
-    path_12_cached: np.ndarray | None = None,
+    *,
+    deviation_mode: str = 'cascade',
+    subdiv_tol_factor: float = 0.01,
+    subdiv_max_depth: int = 6,
+    chord_bridging: bool = True,
+    submesh_subdiv: int = 0,
 ) -> None:
-    """Background worker: computes fully geodesic de Casteljau points.
+    """Background worker: computes the orange (fully geodesic) curve.
 
     Runs in a ``ProcessPoolExecutor`` child process.  Uses the process-
     local ``_process_geo`` (created by ``_process_initializer``) — no VTK
     objects, no GIL contention with the main thread.
 
-    *t_grid* is the dense linspace in ``[0, 1]`` of length ``n_samples``.
-    *inner_order* is the sequence of indices in ``t_grid`` to compute, in
-    progressive-refinement order (midpoint first, then quarters, then
-    eighths, etc.).  Endpoints (``t_grid[0]`` and ``t_grid[-1]``) are
-    NOT computed by the worker — they coincide with node origins and
-    are pre-seeded by the main thread.
+    Three-phase pipeline
+    ====================
 
-    Each ``('point', span_key, idx, result)`` message carries the
-    **final position** ``idx`` inside the sorted ``t_grid`` array, so the
-    main thread stores results in a sparse buffer and renders in
-    t-order regardless of arrival order.
+    **Phase 1 — canonical samples.**  Evaluates the de Casteljau cascade
+    at every position of *t_grid* (length ``n_samples``, default 33),
+    visiting indices in *inner_order* (hierarchical refinement: midpoint
+    → quarters → eighths …) so the parent can render the curve coarse-
+    to-fine.  Each sample is sent as ``('point', span_key, t, result)``.
+    The two endpoints (idx 0, idx N-1) are NOT computed by the worker —
+    they coincide with node origins and are pre-seeded by the parent.
 
-    *path_12_cached* is kept for backwards compatibility but is typically
-    ``None`` — the worker computes ``path_12`` itself via
-    ``compute_endpoint_local`` (~25 ms).
+    **Phase 2 — cascade densification.**  Walks all consecutive sample
+    pairs, decides which to subdivide using *deviation_mode*, and
+    inserts new cascade samples at the midpoint *t*-value.  Each
+    insertion is sent immediately as ``('point', span_key, t_mid,
+    point)`` — the parent re-sorts on arrival, so the rendered
+    polyline refines progressively in problem regions.  Recursive up
+    to *subdiv_max_depth* levels.  Two criteria are supported:
 
-    Results are sent via *writer* (a ``Connection`` from ``mp.Pipe``).
-    If the pipe is closed by the main thread (span cancelled), the next
-    ``send()`` raises ``BrokenPipeError`` and the worker exits silently.
+      * ``deviation_mode='cascade'`` (default): for each pair, evaluate
+        the cascade at ``t_mid`` and split if
+        ``|chord_midpoint - cascade_eval| > tol``.  Always pays the
+        cascade cost (3 × ``compute_endpoint_local`` per pair) but
+        measures deviation from the *true* curve.
+      * ``deviation_mode='surface'``: project chord midpoint onto the
+        mesh and split if ``|chord_midpoint - projection| > tol``.
+        Cheaper (one ``project_smooth_batch`` per pair), only triggers
+        when the chord pierces the surface — useful as a fallback when
+        ``cascade`` is too slow.  Inserted point is still the cascade
+        evaluation, so geometric quality is identical between modes;
+        only the *decision* of whether to split differs.
+
+    Tolerance: ``tol = mean_edge_length * subdiv_tol_factor``.
+
+    **Phase 3 — chord bridging.**  Once all densification is complete,
+    every consecutive sample pair is connected by an exact mesh
+    geodesic via :func:`_build_chord_geodesic` (``short_geodesic`` fast
+    path, ``compute_endpoint_local`` fallback).  The polyline is sent
+    once as ``('chord_geo', span_key, polyline)``; the parent replaces
+    the actor geometry wholesale.  Skipped when *chord_bridging* is
+    False — in that case the parent renders the t-sorted polyline as
+    Euclidean chords between samples.
+
+    Finally a ``('done', span_key, degraded_any)`` message terminates
+    the worker.  The *degraded_any* flag triggers the red-fallback
+    repaint on the parent if any solver call hit a straight-line path.
+
+    Failure modes
+    -------------
+    Pipe closed (span cancelled): next ``send()`` raises
+    ``BrokenPipeError``; worker exits silently.
+
+    Any other exception: the outer ``except Exception`` (BLE001) is
+    deliberate — we capture the traceback and forward it as
+    ``('error', span_key, repr, traceback)`` so a real diagnostic
+    surfaces in the editor's HUD / stderr instead of the parent's
+    drain loop seeing a mysterious "pipe broken" warning.
     """
-    geo = _process_geo
-    P0, H_out, H_in, P1 = ctrl
-
-    cum_b, total_b = GeodesicMesh.compute_path_lengths(path_b)
-    cum_a, total_a = GeodesicMesh.compute_path_lengths(path_a_rev)
-
-    # Track if ANY of the per-point solver calls fell back to a straight
-    # line.  The flag is transmitted to the main thread once via the
-    # 'done' message so the span can be flagged degraded without one
-    # message per sample.
-    degraded_any = False
-
-    if path_12_cached is not None and len(path_12_cached) >= 2:
-        path_12 = path_12_cached
-    else:
-        path_12 = geo.compute_endpoint_local(H_out, H_in)
-        if path_12 is None or len(path_12) < 2:
-            path_12 = np.array([H_out, H_in])
-            degraded_any = True
-        elif geo._last_was_fallback:
-            degraded_any = True
-    cum_12, total_12 = GeodesicMesh.compute_path_lengths(path_12)
+    import bisect
 
     try:
+        geo = _process_geo
+        P0, H_out, H_in, P1 = ctrl
+
+        cum_b, total_b = GeodesicMesh.compute_path_lengths(path_b)
+        cum_a, total_a = GeodesicMesh.compute_path_lengths(path_a_rev)
+
+        degraded_any = False
+
+        # Cache the level-1 middle path (constant across all t).
+        try:
+            path_12, fb12 = geo.compute_endpoint_local(
+                H_out, H_in, submesh_subdiv=submesh_subdiv)
+        except (RuntimeError, ValueError, TypeError, IndexError) as exc:
+            logging.getLogger("geo_splines.worker").debug(
+                "compute_endpoint_local(H_out, H_in) failed: %s", exc)
+            path_12, fb12 = None, True
+        if path_12 is None or len(path_12) < 2:
+            path_12, degraded_any = np.array([H_out, H_in]), True
+        elif fb12:
+            degraded_any = True
+        cum_12, total_12 = GeodesicMesh.compute_path_lengths(path_12)
+
+        eval_args = (path_b, cum_b, total_b,
+                     path_a_rev, cum_a, total_a,
+                     path_12, cum_12, total_12)
+
+        # ------------------------------------------------------------
+        # Phase 1 — canonical N=GEO_SAMPLES grid
+        # ------------------------------------------------------------
+        # Worker-side sorted polyline state, mirrored on the parent.
+        # Endpoints are seeded so phase-2 chord pairs starting at idx 0
+        # and ending at idx N-1 are well-defined from the first iter.
+        t_list: list[float] = [float(t_grid[0]), float(t_grid[-1])]
+        p_list: list[np.ndarray] = [np.asarray(P0, dtype=float),
+                                    np.asarray(P1, dtype=float)]
+
         for idx in inner_order:
             t = float(t_grid[idx])
-            b01 = GeodesicMesh.geodesic_lerp(path_b, t, cum_b, total_b)
-            b12 = GeodesicMesh.geodesic_lerp(path_12, t, cum_12, total_12)
-            b23 = GeodesicMesh.geodesic_lerp(path_a_rev, t, cum_a, total_a)
-
-            try:
-                path_c0 = geo.compute_endpoint_local(b01, b12)
-                if geo._last_was_fallback:
-                    degraded_any = True
-            except (RuntimeError, ValueError, TypeError, IndexError) as exc:
-                logging.getLogger("geo_splines.worker").debug(
-                    "compute_endpoint_local(b01, b12) failed: %s", exc)
-                path_c0 = np.array([b01, b12])
+            point, deg = _eval_cascade_at_t(geo, t, *eval_args,
+                                            submesh_subdiv=submesh_subdiv)
+            if deg:
                 degraded_any = True
-            if path_c0 is None or len(path_c0) < 2:
-                path_c0 = np.array([b01, b12])
-                degraded_any = True
+            # Insert in t-sorted order on the worker side too — phase 2
+            # walks consecutive pairs and needs them ordered.
+            pos = bisect.bisect_left(t_list, t)
+            t_list.insert(pos, t)
+            p_list.insert(pos, point)
+            writer.send(('point', span_key, t, point))
 
-            try:
-                path_c1 = geo.compute_endpoint_local(b12, b23)
-                if geo._last_was_fallback:
-                    degraded_any = True
-            except (RuntimeError, ValueError, TypeError, IndexError) as exc:
-                logging.getLogger("geo_splines.worker").debug(
-                    "compute_endpoint_local(b12, b23) failed: %s", exc)
-                path_c1 = np.array([b12, b23])
-                degraded_any = True
-            if path_c1 is None or len(path_c1) < 2:
-                path_c1 = np.array([b12, b23])
-                degraded_any = True
+        # ------------------------------------------------------------
+        # Phase 2 — cascade densification
+        # ------------------------------------------------------------
+        mean_edge = float(np.sqrt(geo._face_edge_len2.mean()))
+        tol_sq = (mean_edge * subdiv_tol_factor) ** 2
 
-            cum_c0, total_c0 = GeodesicMesh.compute_path_lengths(path_c0)
-            cum_c1, total_c1 = GeodesicMesh.compute_path_lengths(path_c1)
-            c0 = GeodesicMesh.geodesic_lerp(path_c0, t, cum_c0, total_c0)
-            c1 = GeodesicMesh.geodesic_lerp(path_c1, t, cum_c1, total_c1)
+        for _level in range(subdiv_max_depth):
+            n_pairs = len(t_list) - 1
+            if n_pairs <= 0:
+                break
 
-            try:
-                path_final = geo.compute_endpoint_local(c0, c1)
-                if geo._last_was_fallback:
-                    degraded_any = True
-            except (RuntimeError, ValueError, TypeError, IndexError) as exc:
-                logging.getLogger("geo_splines.worker").debug(
-                    "compute_endpoint_local(c0, c1) failed: %s", exc)
-                path_final = np.array([c0, c1])
-                degraded_any = True
-            if path_final is None or len(path_final) < 2:
-                path_final = np.array([c0, c1])
-                degraded_any = True
+            # Build per-pair midpoints in 3D (chord midpoints) and
+            # decide which need a cascade insertion.
+            pts_arr = np.asarray(p_list)
+            mids = (pts_arr[:-1] + pts_arr[1:]) * 0.5
 
-            cum_f, total_f = GeodesicMesh.compute_path_lengths(path_final)
-            result = GeodesicMesh.geodesic_lerp(path_final, t, cum_f, total_f)
+            # Where to evaluate the cascade.  Done per-pair below; in
+            # 'cascade' mode every pair is evaluated; in 'surface' mode
+            # only the pairs flagged by the projection test.
+            inserts: list[tuple[float, np.ndarray]] = []
 
-            writer.send(('point', span_key, idx, result))
+            if deviation_mode == 'surface':
+                projected = geo.project_smooth_batch(mids)
+                diff = projected - mids
+                dev_sq = np.sum(diff * diff, axis=1)
+                needs_split = dev_sq > tol_sq
+                if not needs_split.any():
+                    break
+                for i in range(n_pairs):
+                    if not needs_split[i]:
+                        continue
+                    t_mid = (t_list[i] + t_list[i + 1]) * 0.5
+                    pt, deg = _eval_cascade_at_t(geo, t_mid, *eval_args,
+                                                 submesh_subdiv=submesh_subdiv)
+                    if deg:
+                        degraded_any = True
+                    inserts.append((t_mid, pt))
+                    writer.send(('point', span_key, t_mid, pt))
+            else:  # 'cascade' (default)
+                any_split = False
+                for i in range(n_pairs):
+                    t_mid = (t_list[i] + t_list[i + 1]) * 0.5
+                    pt, deg = _eval_cascade_at_t(geo, t_mid, *eval_args,
+                                                 submesh_subdiv=submesh_subdiv)
+                    if deg:
+                        degraded_any = True
+                    diff = pt - mids[i]
+                    if float(np.dot(diff, diff)) > tol_sq:
+                        inserts.append((t_mid, pt))
+                        writer.send(('point', span_key, t_mid, pt))
+                        any_split = True
+                if not any_split:
+                    break
+
+            # Merge inserts into the sorted state — bisect each so the
+            # invariant is preserved without a full re-sort.
+            for t_mid, pt in inserts:
+                pos = bisect.bisect_left(t_list, t_mid)
+                t_list.insert(pos, t_mid)
+                p_list.insert(pos, pt)
+
+        # ------------------------------------------------------------
+        # Phase 3 — chord bridging via short / full geodesics
+        # ------------------------------------------------------------
+        if chord_bridging and len(p_list) >= 2:
+            polyline_segs: list[np.ndarray] = []
+            for i in range(len(p_list) - 1):
+                seg = _build_chord_geodesic(geo, p_list[i], p_list[i + 1],
+                                            submesh_subdiv=submesh_subdiv)
+                polyline_segs.append(seg)
+            # Concatenate, dropping the duplicated joint between
+            # consecutive segments so the polyline has no zero-length
+            # segments.
+            full = [polyline_segs[0]]
+            for seg in polyline_segs[1:]:
+                full.append(seg[1:])
+            polyline = np.concatenate(full, axis=0)
+            writer.send(('chord_geo', span_key, polyline))
 
         writer.send(('done', span_key, degraded_any))
     except (BrokenPipeError, OSError):
         pass  # pipe closed — span was cancelled, exit silently
+    except Exception as exc:  # noqa: BLE001 — must surface unknown failures
+        import traceback as _tb
+        tb_str = _tb.format_exc()
+        try:
+            writer.send(('error', span_key, repr(exc), tb_str))
+        except (BrokenPipeError, OSError):
+            pass
     finally:
         writer.close()
 
@@ -797,9 +1089,12 @@ class _SpanWorkManager:
         self._batch_submitted: int = 0
         self._batch_done: int = 0
 
-        # Warm up: force all worker processes to start now
-        self._warmup_futures = [
-            self._executor.submit(int, 0) for _ in range(max_workers)]
+        # Warm up: force all worker processes to start now.  The futures
+        # are intentionally discarded — submitting is enough to spin up
+        # the child processes via ``ProcessPoolExecutor``'s lazy spawn.
+        # Holding them in ``self.`` would just be a zombie attribute.
+        for _ in range(max_workers):
+            self._executor.submit(int, 0)
 
     def _build_executor(self) -> ProcessPoolExecutor:
         """Spins up a fresh ``ProcessPoolExecutor`` with the saved
@@ -881,40 +1176,67 @@ class _SpanWorkManager:
     def submit_span(self, span_key: SpanKey,
                     ctrl: list[np.ndarray], path_b: np.ndarray,
                     path_a_rev: np.ndarray, n_samples: int,
-                    adaptive: bool = False) -> None:
-        """Submits a fully geodesic worker.
+                    adaptive: bool = False,
+                    *,
+                    deviation_mode: str = 'cascade',
+                    subdiv_tol_factor: float = 0.01,
+                    subdiv_max_depth: int = 6,
+                    chord_bridging: bool = True,
+                    submesh_subdiv: int = 0) -> None:
+        """Submits a fully geodesic (orange) worker.
 
-        Sparse-array protocol: the main thread allocates a per-span list
-        of *n_samples* slots pre-seeded with the two endpoints (node
-        origins).  The worker fills the remaining slots in hierarchical
-        refinement order (midpoint first, then quarters, etc.) — each
-        message carries the final index so the renderer can place the
-        point in its sorted t-position regardless of arrival order.
-        The visible curve therefore refines from coarse to fine instead
-        of growing from one end.
+        Per-span state on the parent is a t-sorted ``(t_list, p_list)``
+        pair plus an optional ``polyline`` override:
+
+          * ``t_list``, ``p_list``: the cascade samples, t-sorted.  Phase
+            1 fills it with the canonical *n_samples* grid; phase 2
+            inserts midpoint samples wherever the chord deviates from
+            the true curve beyond *subdiv_tol_factor × mean_edge*.  The
+            rendered polyline at any moment is just ``p_list`` connected
+            by straight chords — it refines coarse-to-fine as worker
+            messages arrive.
+          * ``polyline``: phase-3 chord-bridging output, when
+            *chord_bridging* is True.  Replaces the chord-connected
+            view wholesale once the worker is done — every consecutive
+            sample pair is now joined by an exact mesh geodesic
+            (``short_geodesic`` fast path or ``compute_endpoint_local``
+            fallback) so the rendered curve hugs the surface in
+            problematic regions instead of cutting through.
+
+        Cascade-densification config
+        ----------------------------
+        *deviation_mode*, *subdiv_tol_factor*, *subdiv_max_depth*,
+        *chord_bridging* are forwarded verbatim to the worker — see
+        :func:`_geodesic_decasteljau_worker` for the contract.
+
+        Cancellation-by-pipe
+        --------------------
+        Re-submitting an already-active span replaces it.  We let
+        ``cancel_span`` decrement ``_batch_submitted`` so that the
+        increment below is balanced (otherwise rapid resubmits inflate
+        the HUD numerator forever).
+
+        Cancel-then-new-pipe is also our **ticket / generation system**:
+        the freshly created pipe below is unreachable to the previous
+        worker (its writer end is now dangling), so any stale result
+        it might still produce can never reach this reader.  See the
+        class docstring for the full rationale.
         """
-        # Re-submitting an already-active span replaces it.  We let
-        # ``cancel_span`` decrement ``_batch_submitted`` so that the
-        # increment below is balanced (otherwise rapid resubmits inflate
-        # the HUD numerator forever).
-        #
-        # Cancel-then-new-pipe is also our **ticket / generation system**:
-        # the freshly created pipe below is unreachable to the previous
-        # worker (its writer end is now dangling), so any stale result
-        # it might still produce can never reach this reader.  See the
-        # class docstring for the full rationale.
         self.cancel_span(span_key)
         reader, writer = mp.Pipe(duplex=False)
         self._readers[span_key] = reader
 
-        # Sparse buffer: indices 0..n_samples-1.  Endpoints are known
-        # from ``ctrl[0]`` (P0) and ``ctrl[3]`` (P1); worker fills the
-        # interior.  The list is the rendering source of truth — sort +
-        # compaction happens in ``get_points``.
-        pts = [None] * n_samples
-        pts[0]  = np.asarray(ctrl[0], dtype=float)
-        pts[-1] = np.asarray(ctrl[3], dtype=float)
-        self._points[span_key] = pts
+        # Per-span state — t-sorted polyline buffers + phase-3 override.
+        # Endpoints (P0, P1) are seeded so the very first render is a
+        # straight line between the two node origins, refined as the
+        # worker streams cascade samples in.
+        state = {
+            't_list': [0.0, 1.0],
+            'p_list': [np.asarray(ctrl[0], dtype=float),
+                       np.asarray(ctrl[3], dtype=float)],
+            'polyline': None,
+        }
+        self._points[span_key] = state
 
         if adaptive:
             t_grid = GeodesicMesh.curvature_adaptive_t_vals(ctrl, n_samples)
@@ -930,23 +1252,32 @@ class _SpanWorkManager:
         # we'd just keep retrying; mark the span dead so the editor's
         # poll-tick clears its (stale) actor and moves on.
         from concurrent.futures.process import BrokenProcessPool
+        worker_kwargs = dict(
+            deviation_mode=deviation_mode,
+            subdiv_tol_factor=subdiv_tol_factor,
+            subdiv_max_depth=subdiv_max_depth,
+            chord_bridging=chord_bridging,
+            submesh_subdiv=submesh_subdiv,
+        )
         try:
             future = self._executor.submit(
                 _geodesic_decasteljau_worker,
                 span_key, ctrl, path_b.copy(), path_a_rev.copy(),
-                t_grid, inner_order, writer, None)
+                t_grid, inner_order, writer,
+                **worker_kwargs)
         except BrokenProcessPool:
             self._rebuild_executor()
             # ``_rebuild_executor`` cleared self._readers / self._points,
             # so the bookkeeping we set up just above is gone too.  Re-
             # establish for this span before the retry.
             self._readers[span_key] = reader
-            self._points[span_key] = pts
+            self._points[span_key] = state
             try:
                 future = self._executor.submit(
                     _geodesic_decasteljau_worker,
                     span_key, ctrl, path_b.copy(), path_a_rev.copy(),
-                    t_grid, inner_order, writer, None)
+                    t_grid, inner_order, writer,
+                    **worker_kwargs)
             except BrokenProcessPool as exc:
                 log.error("orange worker pool broken twice in a row "
                           "for span %s: %s — giving up", span_key, exc)
@@ -961,6 +1292,23 @@ class _SpanWorkManager:
         self._futures[span_key] = future
         self.active_spans.add(span_key)
         self._batch_submitted += 1
+
+        # Surface "task itself failed before running" exceptions
+        # (e.g. signature mismatch, pickling error) — without this,
+        # ProcessPoolExecutor swallows them silently into the Future
+        # and the parent only sees a generic "pipe broken" warning
+        # when the writer goes out of scope on the worker side.
+        # Done via add_done_callback so the wait happens on the
+        # executor's bookkeeping thread, never blocking the main
+        # thread; we only act on a non-None exception().
+        def _surface_future_error(fut, _key=span_key):
+            exc = fut.exception()
+            if exc is not None and not isinstance(
+                    exc, (BrokenPipeError, OSError)):
+                log.error(
+                    "orange worker future for span %s raised %s: %s",
+                    _key, type(exc).__name__, exc)
+        future.add_done_callback(_surface_future_error)
 
     def cancel_span(self, span_key: SpanKey) -> None:
         """Closes the pipe for the fully geodesic worker on *span_key*.
@@ -1019,8 +1367,46 @@ class _SpanWorkManager:
             self._batch_submitted = 0
             self._batch_done = 0
 
+    @staticmethod
+    def _insert_sample_sorted(state: dict, t: float, point: np.ndarray) -> None:
+        """Bisect-insert a (t, point) pair into the per-span sorted state.
+
+        State invariant: ``t_list`` strictly ascending, ``p_list``
+        parallel.  Worker phase 1 + phase 2 both call this (they only
+        differ in the *t* values they emit; no special-casing needed).
+        Duplicates within ``1e-12`` are treated as overwrites — defensive
+        against numerical noise on midpoint subdivision.
+        """
+        import bisect as _bisect
+        t_list = state['t_list']
+        p_list = state['p_list']
+        pos = _bisect.bisect_left(t_list, t)
+        if pos < len(t_list) and abs(t_list[pos] - t) < 1e-12:
+            p_list[pos] = point
+            return
+        t_list.insert(pos, t)
+        p_list.insert(pos, point)
+
     def drain_queue(self) -> bool:
-        """Polls all active orange pipes.  Returns True if any results."""
+        """Polls all active orange pipes.  Returns True if any results.
+
+        Message types
+        -------------
+        ``('point', span_key, t, point)``
+            Cascade sample at parameter *t*.  Inserted into the
+            per-span sorted state — phase-1 canonical samples and
+            phase-2 densification midpoints share this message type
+            because both refine the same t-sorted polyline.
+        ``('chord_geo', span_key, polyline)``
+            Phase-3 output: a polyline that connects the cascade
+            samples by exact mesh geodesics.  Replaces the t-sorted
+            chord polyline as the rendering source.
+        ``('done', span_key, degraded_any)``
+            Worker completed.  ``degraded_any`` toggles the red
+            fallback repaint if any solver call hit a straight line.
+        ``('error', span_key, repr, traceback)``
+            Worker raised — span goes dead, traceback is logged.
+        """
         had_results = False
 
         # --- Drain orange (fully geodesic) pipes ---
@@ -1033,14 +1419,27 @@ class _SpanWorkManager:
                     msg = reader.recv()
                     kind = msg[0]
                     if kind == 'point':
-                        _, _, idx, point = msg
-                        pts = self._points.get(span_key)
-                        # Sparse write: ``idx`` is the final t-position,
-                        # not the order of arrival.  Slots already seeded
-                        # with endpoints are never overwritten by the
-                        # worker (inner_order excludes 0 and n_samples-1).
-                        if pts is not None and 0 <= idx < len(pts):
-                            pts[idx] = point
+                        # Worker phase 1 + 2 both emit this — t-keyed
+                        # cascade sample, sorted-insert into state.
+                        _, _, t_val, point = msg
+                        state = self._points.get(span_key)
+                        if state is not None:
+                            # Phase-3 output (when present) supersedes
+                            # the t-sorted polyline; we keep updating
+                            # the sample buffers so a hypothetical
+                            # later re-render path can fall back to
+                            # them, but the visible curve already comes
+                            # from ``polyline``.
+                            self._insert_sample_sorted(state, float(t_val), point)
+                            self.dirty_spans.add(span_key)
+                            had_results = True
+                    elif kind == 'chord_geo':
+                        # Phase-3 polyline override — surface-hugging
+                        # geodesic between every consecutive sample.
+                        _, _, polyline = msg
+                        state = self._points.get(span_key)
+                        if state is not None:
+                            state['polyline'] = np.asarray(polyline, dtype=float)
                             self.dirty_spans.add(span_key)
                             had_results = True
                     elif kind == 'done':
@@ -1066,6 +1465,29 @@ class _SpanWorkManager:
                             log.debug("drain: reader close failed (%s)", exc)
                         self._readers.pop(span_key, None)
                         break
+                    elif kind == 'error':
+                        # Worker caught an unhandled exception and forwarded
+                        # the traceback before exiting.  Surface it loudly
+                        # — without this the parent only sees a generic
+                        # "pipe broken" warning when drain hits EOF.
+                        # Payload: ('error', span_key, repr, traceback_str).
+                        repr_exc = msg[2] if len(msg) > 2 else '?'
+                        tb_str = msg[3] if len(msg) > 3 else ''
+                        log.error(
+                            "orange worker on span %s raised %s\n%s",
+                            span_key, repr_exc, tb_str)
+                        try:
+                            reader.close()
+                        except OSError:
+                            pass
+                        self._readers.pop(span_key, None)
+                        self.dead_spans.add(span_key)
+                        if span_key in self.active_spans:
+                            self.active_spans.discard(span_key)
+                            if self._batch_submitted > 0:
+                                self._batch_submitted -= 1
+                        had_results = True
+                        break
             except (EOFError, OSError) as exc:
                 # Worker died or pipe broken — mark for actor cleanup
                 log.warning("orange worker pipe broken on span %s: %s",
@@ -1080,24 +1502,33 @@ class _SpanWorkManager:
         return had_results
 
     def get_points(self, span_key: SpanKey) -> np.ndarray | None:
-        """Compacts the sparse per-span buffer into a t-sorted polyline.
+        """Returns the renderable polyline for *span_key*, or None.
 
-        The buffer is a list of length ``n_samples`` pre-seeded with the
-        two node-origin endpoints and filled by the worker in
-        hierarchical order.  This method drops the ``None`` slots (not
-        yet computed) and returns only the populated ones, preserving
-        their t-grid order.  Since endpoints are pre-seeded, the result
-        always has at least 2 points from the moment the span is
-        submitted — the initial render is a straight line between the
-        node origins, refined as worker results arrive.
+        Two render sources, picked by precedence:
+
+          1. ``state['polyline']`` — the phase-3 chord-bridged polyline
+             (surface-hugging geodesics between every consecutive
+             cascade sample).  Set once the worker is fully done.
+          2. ``state['p_list']`` — the t-sorted cascade samples
+             connected by straight 3-D chords.  Used during phase 1
+             and phase 2 (progressive refine) and as the final result
+             when ``chord_bridging`` is disabled.
+
+        Since the endpoints (node origins) are seeded by ``submit_span``,
+        the result always has at least 2 points from the moment the
+        span is submitted — the initial render is a straight chord
+        between the node origins, refined as worker results arrive.
         """
-        pts = self._points.get(span_key)
-        if not pts:
+        state = self._points.get(span_key)
+        if state is None:
             return None
-        compact = [p for p in pts if p is not None]
-        if len(compact) < 2:
+        polyline = state.get('polyline')
+        if polyline is not None and len(polyline) >= 2:
+            return polyline
+        p_list = state.get('p_list')
+        if p_list is None or len(p_list) < 2:
             return None
-        return np.asarray(compact, dtype=float)
+        return np.asarray(p_list, dtype=float)
 
     def shutdown(self) -> None:
         """Cancels all workers, shuts down the process pool, and releases
@@ -1178,9 +1609,13 @@ class GeodesicSplineApp(MidpointShooterApp):
         self.splines: list[list[GeodesicSegment]] = [[]]
         self.splines_closed: list[bool] = [False]
         self.active_spline_idx = 0
-        self._undo_stack: list[dict] = []
-        self._redo_stack: list[dict] = []
+        # Bounded undo / redo history.  ``deque(maxlen=...)`` evicts
+        # the oldest entry in O(1) when capacity is reached, vs the
+        # previous ``list.pop(0)`` which was O(n) on every push past
+        # the cap.  Both stacks share the cap.
         self._MAX_UNDO = 50
+        self._undo_stack: deque[dict] = deque(maxlen=self._MAX_UNDO)
+        self._redo_stack: deque[dict] = deque(maxlen=self._MAX_UNDO)
         self._prev_active_spline_idx = 0
         self._span_cache: dict[SpanKey, tuple[pv.PolyData, vtk.vtkActor]] = {}
         # Per-span style key (dragging, degraded) — repaints only fire on change.
@@ -1192,12 +1627,38 @@ class GeodesicSplineApp(MidpointShooterApp):
         self._degraded_spans: set[SpanKey] = set()
         # Interpolation curve: one actor per spline (keyed by spline index)
         self._interp_cache: dict[int, tuple[pv.PolyData, vtk.vtkActor]] = {}
+        # Per-spline pre-allocated origin buffer + content-fingerprint
+        # cache for ``_recompute_interp_curve``.  The buffer avoids
+        # the per-frame ``np.array([n.origin for n in nodes])``
+        # allocation; the fingerprint cache short-circuits the splprep
+        # → splev → project_smooth_batch chain when the origins list
+        # is bit-identical to the previous call (typical between
+        # back-to-back consolidations or when the user hovers without
+        # moving anything).
+        self._interp_origins_buf: dict[int, np.ndarray] = {}
+        self._interp_result_cache: dict[int, tuple] = {}
         self._last_stitch_screen: tuple = (0.0, 0.0)
         self._stitch_origin_cache: dict | None = None  # prepare_origin cache for last node
         self._stitch_origin_node_id: int = -1           # id() of node that owns the cache
-        self._node_to_spline: dict[int, int] = {}  # id(segment) → spline index
+        # node → spline index map.  ``WeakKeyDictionary`` avoids the
+        # ``id()``-recycling hazard a plain ``dict[int, int]`` keyed by
+        # ``id(seg)`` would have: when CPython GC's a deleted segment
+        # and a new one happens to land at the same address, the dict
+        # would silently return the OLD spline index for the new
+        # object.  Weak refs let the entry vanish automatically the
+        # moment the segment is freed.
+        self._node_to_spline: 'weakref.WeakKeyDictionary[GeodesicSegment, int]' = (
+            weakref.WeakKeyDictionary())
         self._pre_drag_spline_idx: int | None = None
         self._last_cam_pos: tuple = (0.0, 0.0, 0.0)  # for arrow scale refresh
+        # Pre-allocated 4×3 scratch for the cubic-Bezier control points
+        # ``[P0, H_out, H_in, P1]`` — reused across every span on every
+        # frame of a drag instead of building a fresh Python list per
+        # iteration.  ``adaptive_samples`` / ``curvature_adaptive_t_vals``
+        # / ``hybrid_de_casteljau_curve`` all accept anything indexable
+        # along axis 0 with shape (3,) per row, so the (4, 3) ndarray
+        # is a drop-in replacement.
+        self._ctrl_scratch = np.empty((4, 3), dtype=float)
         # _work_mgr created after super().__init__ when self.geo is available
 
         super().__init__(mesh_or_path)
@@ -1223,20 +1684,22 @@ class GeodesicSplineApp(MidpointShooterApp):
         vtk.vtkMapper.SetResolveCoincidentTopologyToPolygonOffset()
         vtk.vtkMapper.SetResolveCoincidentTopologyPolygonOffsetParameters(1.0, 1.0)
 
-        self._stitch_pd = pv.PolyData()
-        self._stitch_actor = self.plotter.add_mesh(
-            self._stitch_pd, color='#666666', line_width=1.5,
-            opacity=0.6, lighting=False, pickable=False, name="stitch_preview",
-        )
-        self._set_depth_priority(self._stitch_actor, self.scfg.DEPTH_STITCH)
-
-        self._stitch_actor.SetVisibility(False)
+        self._stitch_pd, self._stitch_actor = self._create_aux_actor(
+            kind='line', color='#666666', line_width=1.5, opacity=0.6,
+            depth=self.scfg.DEPTH_STITCH, name="stitch_preview")
 
         # Orange computation HUD: tracks whether we are in the middle of
         # showing a "computing" message so we can flip to "ORANGE DONE"
         # exactly once per batch.  The numeric progress lives in
         # ``_work_mgr`` (``progress()`` returns ``(done, total)``).
         self._orange_hud_active = False
+        # Snapshot of ``self.geo._shoot_truncation_count`` from the
+        # previous poll tick.  Fresh increments mean ``compute_shoot``
+        # bailed out via the non-2-manifold safeguard since we last
+        # looked; surface that as a HUD warning so the user knows the
+        # geodesic ended short due to a mesh defect.
+        self._shoot_truncation_seen: int = int(
+            getattr(self.geo, '_shoot_truncation_count', 0))
 
         # Curve-layer visibility toggles (horizontal row above opacity slider)
         # Orange starts hidden by default (expensive computation, opt-in).
@@ -1275,16 +1738,19 @@ class GeodesicSplineApp(MidpointShooterApp):
             font_size=7, color='white', shadow=True, name="label_help")
 
         # Reposition widgets on window resize so they stay above the slider.
-        self.plotter.iren.interactor.AddObserver(
-            'ConfigureEvent', self._on_window_resize)
+        # Capture the tag so ``cleanup`` (via the parent's ``_observer_tags``
+        # mechanism) can detach this observer when the same plotter is
+        # reused (notebook / repeated-instance flows) — otherwise dead
+        # GeodesicSplineApp instances stay alive via the observer's strong
+        # reference to ``self._on_window_resize``.
+        _vtki = self.plotter.iren.interactor
+        self._observer_tags.append(
+            (_vtki, _vtki.AddObserver('ConfigureEvent', self._on_window_resize)))
 
         # Curve hover marker — single colored sphere, layer-colored.
-        self._curve_hover_pd = pv.PolyData(np.zeros((1, 3)))
-        self._curve_hover_actor = self.plotter.add_mesh(
-            self._curve_hover_pd, color='white', point_size=9,
-            render_points_as_spheres=True, lighting=False, pickable=False)
-        self._set_depth_priority(self._curve_hover_actor, self.scfg.DEPTH_CURVE_HOVER)
-        self._curve_hover_actor.SetVisibility(False)
+        self._curve_hover_pd, self._curve_hover_actor = self._create_aux_actor(
+            kind='point', color='white', point_size=9,
+            depth=self.scfg.DEPTH_CURVE_HOVER)
         self._curve_hover_pt_buf = np.empty((1, 3), dtype=float)
         # Pre-allocated buffer for batched curve hover projection
         self._curve_hover_3d_buf = np.empty((2048, 3), dtype=float)
@@ -1296,14 +1762,9 @@ class GeodesicSplineApp(MidpointShooterApp):
         # (edge) is held, marking the exact target the drag will land on.
         # Smaller and brighter than the curve-hover marker so it doesn't
         # compete visually but is impossible to miss.
-        self._snap_indicator_pd = pv.PolyData(np.zeros((1, 3)))
-        self._snap_indicator_actor = self.plotter.add_mesh(
-            self._snap_indicator_pd, color='gold', point_size=14,
-            render_points_as_spheres=True, lighting=False, pickable=False,
-            name="snap_indicator")
-        self._set_depth_priority(self._snap_indicator_actor,
-                                 self.scfg.DEPTH_CURVE_HOVER - 1)
-        self._snap_indicator_actor.SetVisibility(False)
+        self._snap_indicator_pd, self._snap_indicator_actor = self._create_aux_actor(
+            kind='point', color='gold', point_size=14,
+            depth=self.scfg.DEPTH_CURVE_HOVER - 1, name="snap_indicator")
         self._snap_indicator_buf = np.empty((1, 3), dtype=float)
 
         # Coordinate-edit preview — shown live while the right-double-
@@ -1326,33 +1787,22 @@ class GeodesicSplineApp(MidpointShooterApp):
         # ``_update_coord_preview`` / ``_hide_coord_preview``.  Depth
         # priority is in front of every other layer (CURVE_HOVER - 2)
         # so the preview is visible even on top of the orange curve.
-        self._coord_preview_pd = pv.PolyData(np.zeros((1, 3)))
-        self._coord_preview_actor = self.plotter.add_mesh(
-            self._coord_preview_pd, color='#888888', point_size=11,
-            render_points_as_spheres=True, lighting=False, pickable=False,
-            name="coord_preview")
-        self._set_depth_priority(self._coord_preview_actor,
-                                 self.scfg.DEPTH_CURVE_HOVER - 2)
-        self._coord_preview_actor.SetVisibility(False)
+        depth_coord = self.scfg.DEPTH_CURVE_HOVER - 2
+        self._coord_preview_pd, self._coord_preview_actor = self._create_aux_actor(
+            kind='point', color='#888888', point_size=11,
+            depth=depth_coord, name="coord_preview")
         self._coord_preview_buf = np.empty((1, 3), dtype=float)
 
-        self._coord_preview_input_pd = pv.PolyData(np.zeros((1, 3)))
-        self._coord_preview_input_actor = self.plotter.add_mesh(
-            self._coord_preview_input_pd, color='#bbbbbb', point_size=8,
-            render_points_as_spheres=True, lighting=False, pickable=False,
-            name="coord_preview_input")
-        self._set_depth_priority(self._coord_preview_input_actor,
-                                 self.scfg.DEPTH_CURVE_HOVER - 2)
-        self._coord_preview_input_actor.SetVisibility(False)
+        (self._coord_preview_input_pd,
+         self._coord_preview_input_actor) = self._create_aux_actor(
+            kind='point', color='#bbbbbb', point_size=8,
+            depth=depth_coord, name="coord_preview_input")
         self._coord_preview_input_buf = np.empty((1, 3), dtype=float)
 
-        self._coord_preview_line_pd = pv.PolyData()
-        self._coord_preview_line_actor = self.plotter.add_mesh(
-            self._coord_preview_line_pd, color='#888888', line_width=1,
-            lighting=False, pickable=False, name="coord_preview_line")
-        self._set_depth_priority(self._coord_preview_line_actor,
-                                 self.scfg.DEPTH_CURVE_HOVER - 2)
-        self._coord_preview_line_actor.SetVisibility(False)
+        (self._coord_preview_line_pd,
+         self._coord_preview_line_actor) = self._create_aux_actor(
+            kind='line', color='#888888', line_width=1,
+            depth=depth_coord, name="coord_preview_line")
 
         # --- Didactic visualization (key 'd') ---
         # Toggleable preview of the de Casteljau scaffold for the LAST
@@ -1382,6 +1832,24 @@ class GeodesicSplineApp(MidpointShooterApp):
         # ``_is_node_in_last_span`` guard).
         self._didactic_visible: bool = False
         self._didactic_dirty: bool = True
+        # Cache of the t-INVARIANT pieces of the cascade (path_12 plus
+        # the cumulative lengths of path_b / path_a / path_12).  These
+        # depend ONLY on the geometry of the last span's two endpoint
+        # nodes — moving the t-slider must NOT trigger a recompute of
+        # path_12 (which would call compute_endpoint_local at ~75 ms
+        # per slider tick, plus a visible jump between the Euclidean
+        # and geodesic approximations).
+        #
+        # Two slots — ``'fast'`` and ``'exact'`` — held simultaneously
+        # so the slider tick path (``fast=True``) and the debounce
+        # consolidation (``fast=False``) each hit their own cached
+        # entry.  An earlier single-slot design alternated and
+        # recomputed path_12 every tick→debounce→tick cycle.
+        # The cache invalidates by object identity: any handle drag
+        # rebuilds n0.path_b / n1.path_a / origins, so ``id(...)`` of
+        # those buffers changes and the next call sees a miss.
+        # None = "no valid cached entry, recompute everything".
+        self._didactic_geo_cache: dict | None = None
         # Parameter value of the cascade.  The slider widget binds to
         # this attribute via ``_on_didactic_t_change``; while the
         # slider doesn't exist yet (first toggle pending), the default
@@ -1398,17 +1866,14 @@ class GeodesicSplineApp(MidpointShooterApp):
         import gizmo as _gizmo_mod  # local alias for opacity read-back
         self._didactic_pds: list[pv.PolyData] = []
         self._didactic_actors: list[vtk.vtkActor] = []
+        # In front of the orange curve so the scaffold reads cleanly
+        # on top of the final spline.
         for _i in range(4):
-            pd = pv.PolyData()
-            actor = self.plotter.add_mesh(
-                pd, color='#2d6b3a', line_width=1.5,
+            pd, actor = self._create_aux_actor(
+                kind='line', color='#2d6b3a', line_width=1.5,
                 opacity=_gizmo_mod.GIZMO_OPACITY,
-                lighting=False, pickable=False,
+                depth=self.scfg.DEPTH_ORANGE - 4,
                 name=f"didactic_line_{_i}")
-            # In front of the orange curve so the scaffold reads
-            # cleanly on top of the final spline.
-            self._set_depth_priority(actor, self.scfg.DEPTH_ORANGE - 4)
-            actor.SetVisibility(False)
             self._didactic_pds.append(pd)
             self._didactic_actors.append(actor)
 
@@ -1419,17 +1884,14 @@ class GeodesicSplineApp(MidpointShooterApp):
         # converges to this single point).  Tracks the same opacity as
         # the lines so the whole scaffold fades together with the 't'
         # key.
-        self._didactic_point_pd = pv.PolyData(np.zeros((1, 3)))
-        self._didactic_point_actor = self.plotter.add_mesh(
-            self._didactic_point_pd, color='#1f5232', point_size=10,
-            render_points_as_spheres=True, lighting=False, pickable=False,
-            opacity=_gizmo_mod.GIZMO_OPACITY,
-            name="didactic_point")
         # Slightly more in-front than the lines (so the sphere reads
         # crisply on top of path_final at the collapse point).
-        self._set_depth_priority(self._didactic_point_actor,
-                                 self.scfg.DEPTH_ORANGE - 5)
-        self._didactic_point_actor.SetVisibility(False)
+        (self._didactic_point_pd,
+         self._didactic_point_actor) = self._create_aux_actor(
+            kind='point', color='#1f5232', point_size=10,
+            opacity=_gizmo_mod.GIZMO_OPACITY,
+            depth=self.scfg.DEPTH_ORANGE - 5,
+            name="didactic_point")
         self._didactic_point_buf = np.empty((1, 3), dtype=float)
 
         # --- Hover-curve cache ---
@@ -1496,6 +1958,22 @@ class GeodesicSplineApp(MidpointShooterApp):
         items: list[_CurveHoverItem] = []
         total_n = 0
 
+        def _ensure_capacity(needed: int) -> None:
+            """Grow ``_curve_hover_3d_buf`` to fit *needed* rows, preserving
+            the contents already written into ``[:total_n]``.  A previous
+            implementation used ``np.empty`` which left those slots
+            uninitialised, producing ghost hover hits when a session
+            crossed the initial 2048-row threshold.
+            """
+            cur_cap = self._curve_hover_3d_buf.shape[0]
+            if needed <= cur_cap:
+                return
+            new_cap = max(needed, cur_cap * 2)
+            new_buf = np.empty((new_cap, 3), dtype=float)
+            if total_n > 0:
+                new_buf[:total_n] = self._curve_hover_3d_buf[:total_n]
+            self._curve_hover_3d_buf = new_buf
+
         layer_caches = []
         if self._layer_visible[LayerKind.BLUE]:
             layer_caches.append((LayerKind.BLUE, self._span_cache))
@@ -1510,9 +1988,7 @@ class GeodesicSplineApp(MidpointShooterApp):
                 if pts_3d is None or len(pts_3d) < 2:
                     continue
                 n = len(pts_3d)
-                if total_n + n > self._curve_hover_3d_buf.shape[0]:
-                    self._curve_hover_3d_buf = np.empty(
-                        ((total_n + n) * 2, 3), dtype=float)
+                _ensure_capacity(total_n + n)
                 self._curve_hover_3d_buf[total_n:total_n + n] = pts_3d
                 items.append(_CurveHoverItem(layer, sid, i, total_n, n, pts_3d))
                 total_n += n
@@ -1528,9 +2004,7 @@ class GeodesicSplineApp(MidpointShooterApp):
                 if pts_3d is None or len(pts_3d) < 2:
                     continue
                 n = len(pts_3d)
-                if total_n + n > self._curve_hover_3d_buf.shape[0]:
-                    self._curve_hover_3d_buf = np.empty(
-                        ((total_n + n) * 2, 3), dtype=float)
+                _ensure_capacity(total_n + n)
                 self._curve_hover_3d_buf[total_n:total_n + n] = pts_3d
                 items.append(_CurveHoverItem(
                     LayerKind.INTERP, sid, None, total_n, n, pts_3d))
@@ -1773,55 +2247,65 @@ class GeodesicSplineApp(MidpointShooterApp):
         self.plotter.add_key_event('r', self._rebuild_all_orange)
         self.plotter.add_key_event('v', self._on_export_vtk)
         self.plotter.add_key_event('d', self._toggle_didactic)
-        self.plotter.iren.interactor.AddObserver(
-            vtk.vtkCommand.RightButtonPressEvent, self._on_right_press, 1.0)
+        # Capture the tags into the parent's ``_observer_tags`` list
+        # so ``cleanup()`` detaches them.  Without this the lambdas /
+        # bound methods keep ``self`` alive after the window is closed.
+        _vtki = self.plotter.iren.interactor
+        self._observer_tags.append((_vtki, _vtki.AddObserver(
+            vtk.vtkCommand.RightButtonPressEvent, self._on_right_press, 1.0)))
         # Ctrl+Z / Ctrl+Y — raw VTK observer (PyVista add_key_event
         # does not support modifier keys).
-        self.plotter.iren.interactor.AddObserver(
-            'KeyPressEvent', self._on_key_press_ctrl, 1.0)
+        self._observer_tags.append((_vtki, _vtki.AddObserver(
+            'KeyPressEvent', self._on_key_press_ctrl, 1.0)))
+
+    # Single source of truth for the editor's keybinding help.  Used
+    # both by the on-screen panel (``_HELP_TEXT``, narrow column) and
+    # by ``_print_help`` for the console banner.  Adding a new shortcut
+    # only requires adding one row here.
+    _HELP_ROWS: tuple[tuple[str, str], ...] = (
+        ("Dbl-click L",     "Add node"),
+        ("Dbl-click R",     "New spline / Edit P coords"),
+        ("Drag Red",        "Translate node"),
+        ("Drag Handle",     "Tangents"),
+        ("Shift+Drag P",    "Snap to mesh vertex"),
+        ("Shift+Drag A/B",  "Magnitude only (no snap, no rotation)"),
+        ("C",               "Close/open loop"),
+        ("Backspace",       "Undo node"),
+        ("Ctrl+Z / Ctrl+Y", "Undo / Redo"),
+        ("b/o/k",           "Toggle blue/orange/interp curves"),
+        ("t",               "Cycle gizmo opacity (20/40/70/100%)"),
+        ("r",               "Rebuild orange (all splines)"),
+        ("s",               "Save splines to JSON"),
+        ("l",               "Load splines from JSON"),
+        ("v",               "Export orange curve to .vtk"),
+        ("d",               "Toggle didactic scaffold (t=0.5)"),
+        ("e",               "Export paths"),
+        ("w",               "Wireframe"),
+        ("a",               "Surface opacity"),
+    )
 
     def _print_help(self) -> None:
         # Console help -- ASCII only (Windows codepage 850 / cp1252 friendly).
-        print("\n" + "=" * 48)
+        print("\n" + "=" * 60)
         print("  GEODESIC SPLINE EDITOR")
-        print("  Dbl-click L : Add node    Dbl-click R : New spline / Edit P coords")
-        print("  Drag Red    : Translate   Drag Handle : Tangents")
-        print("  Shift+Drag P (red)   : Snap to mesh vertex")
-        print("  Shift+Drag A/B       : Magnitude only (no snap, no rotation)")
-        print("  C           : Close/open loop  Backspace : Undo")
-        # Delete key removed -- node deletion requires spline-aware reconnection
-        print("  b/o/k       : Toggle blue/orange/interp curves")
-        print("  t           : Cycle gizmo opacity (20/40/70/100%)")
-        print("  r           : Rebuild orange (all splines)")
-        print("  s           : Save splines to JSON")
-        print("  l           : Load splines from JSON")
-        print("  v           : Export orange curve to .vtk")
-        print("  d           : Toggle didactic scaffold (last span, t=0.5)")
-        print("  Ctrl+Z      : Undo     Ctrl+Y      : Redo")
-        print("=" * 48 + "\n")
+        for key, desc in self._HELP_ROWS:
+            print(f"  {key:<16}: {desc}")
+        print("=" * 60 + "\n")
 
-    _HELP_TEXT = (
-        "  Dbl-click L : Add node\n"
-        "  Dbl-click R : New spline /\n"
-        "                Edit P coords\n"
-        "  Drag Red    : Translate node\n"
-        "  Drag Handle : Tangents\n"
-        "  Shift+Drag P: Snap to vertex\n"
-        "  Shift+Drag A/B: Magnitude\n"
-        "  C           : Close/open loop\n"
-        "  Backspace   : Undo node\n"
-        "  Ctrl+Z / Y  : Undo / Redo\n"
-        "  b/o/k       : Toggle curves\n"
-        "  t           : Gizmo opacity\n"
-        "  r           : Rebuild orange\n"
-        "  s           : Save JSON\n"
-        "  l           : Load JSON\n"
-        "  v           : Export orange .vtk\n"
-        "  d           : Didactic scaffold\n"
-        "  e           : Export paths\n"
-        "  w           : Wireframe\n"
-        "  a           : Surface opacity"
-    )
+    @classmethod
+    def _build_help_text(cls) -> str:
+        """Builds the on-screen narrow-column help string from
+        ``_HELP_ROWS``.  Wraps long descriptions onto a continuation
+        line so the panel stays inside the 28-char column."""
+        col = 14  # key column width inside the panel
+        lines: list[str] = []
+        for key, desc in cls._HELP_ROWS:
+            lines.append(f"  {key:<{col}}: {desc}")
+        return "\n".join(lines)
+
+    @property
+    def _HELP_TEXT(self) -> str:  # noqa: N802 — preserved name for compat
+        return self._build_help_text()
 
     def _on_window_resize(self, obj, event) -> None:
         """Repositions checkbox widgets, help button, and slider after
@@ -1906,32 +2390,33 @@ class GeodesicSplineApp(MidpointShooterApp):
     def _spline_for_node(self, seg: GeodesicSegment) -> int:
         """Returns the spline index that owns *seg*.
 
-        O(1) via the ``_node_to_spline`` cache.  Falls back to the
-        currently-active spline when the cache is stale (logs a debug
-        message — visible only when ``GEO_SPLINES_DEBUG=1`` so the user
-        is not spammed during normal use).  A stale entry is repaired on
-        the next ``_rebuild_node_index`` call, which every mutation
-        already triggers.
+        O(1) via the ``_node_to_spline`` ``WeakKeyDictionary``.  Falls
+        back to the currently-active spline when the cache is stale
+        (logs a debug message — visible only when
+        ``GEO_SPLINES_DEBUG=1`` so the user is not spammed during
+        normal use).  A stale entry is repaired on the next
+        ``_rebuild_node_index`` call, which every mutation already
+        triggers.
         """
-        sid = self._node_to_spline.get(id(seg))
+        sid = self._node_to_spline.get(seg)
         if sid is not None:
             return sid
-        log.debug("_spline_for_node: id(%d) missing from cache, "
+        log.debug("_spline_for_node: segment missing from cache, "
                   "falling back to active spline %d",
-                  id(seg), self.active_spline_idx)
+                  self.active_spline_idx)
         return self.active_spline_idx
 
     def _rebuild_node_index(self) -> None:
-        """Rebuilds the ``id(segment) → spline_index`` lookup dict.
+        """Rebuilds the ``segment → spline_index`` lookup dict.
 
         Called after any structural change (node add/remove, spline
         add/remove) to keep the O(1) lookup in ``_spline_for_node`` correct.
         """
-        self._node_to_spline = {
-            id(node): s_idx
+        self._node_to_spline = weakref.WeakKeyDictionary({
+            node: s_idx
             for s_idx, nodes in enumerate(self.splines)
             for node in nodes
-        }
+        })
 
     def _build_local_frame(self, pt: np.ndarray, cid: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Builds an orthonormal tangent frame ``(normal, u, v)`` at *pt* on face *cid*."""
@@ -1980,9 +2465,9 @@ class GeodesicSplineApp(MidpointShooterApp):
         close, break, drag start, load).  The snapshot captures the state
         *before* the mutation so that Ctrl+Z restores it.
         """
+        # ``deque.append`` with ``maxlen`` evicts the oldest entry
+        # automatically — no manual cap check needed.
         self._undo_stack.append(self._snapshot())
-        if len(self._undo_stack) > self._MAX_UNDO:
-            self._undo_stack.pop(0)
         self._redo_stack.clear()
 
     def _on_undo_ctrl_z(self) -> None:
@@ -2103,15 +2588,16 @@ class GeodesicSplineApp(MidpointShooterApp):
 
         # Recompute spans only for splines with changed nodes
         if changed_splines:
-            saved_sid = self.active_spline_idx
             for sid in changed_splines:
-                self.active_spline_idx = sid
-                self._recompute_spans()
-                self._submit_geodesic_spans()
-            self.active_spline_idx = saved_sid
+                self._recompute_spans(sid=sid)
+                self._submit_geodesic_spans(sid=sid)
 
         self.active_spline_idx = self._clamp_spline_idx(active)
         self._prev_active_spline_idx = self.active_spline_idx
+        # Differential restore swaps node arrays in place — the
+        # didactic cache's keyed buffers are now stale.  Drop it so
+        # the next ``_compute_didactic`` rebuilds.
+        self._didactic_geo_cache = None
         self._refresh_visuals()
 
     def _clamp_spline_idx(self, idx: int) -> int:
@@ -2239,7 +2725,8 @@ class GeodesicSplineApp(MidpointShooterApp):
             if origin_cache is None:
                 return None, None
             try:
-                path = self.geo.compute_endpoint_from_origin(origin_cache, p_target)
+                path, _ = self.geo.compute_endpoint_from_origin(
+                    origin_cache, p_target)
             except (RuntimeError, ValueError, TypeError, IndexError) as exc:
                 log.debug("v2 load: solver failed for handle %s (%s); using straight line",
                           p_target.tolist(), exc)
@@ -2323,21 +2810,10 @@ class GeodesicSplineApp(MidpointShooterApp):
         the same squared-distance, vectorized screen-projection path —
         no per-marker VTK coordinate calls, no ``np.linalg.norm``.
         """
-        if self._hover_dirty:
-            self._rebuild_hover_cache()
-        if self._hover_n == 0:
+        hit = self._closest_marker_under_cursor(x, y)
+        if hit is None:
             return False
-        pts_2d = self._to_screen_batch(self._hover_pts_3d[:self._hover_n])
-        best, best_sq = _hover_argmin_sq(pts_2d, self._hover_n,
-                                         float(x), float(y))
-        if best_sq >= self.cfg.PICK_TOLERANCE_SQ:
-            return False
-
-        # Occlusion check: skip if hidden by mesh
-        if self._is_marker_occluded(self._hover_pts_3d[best]):
-            return False
-
-        seg, tag = self._hover_tags[best]
+        seg, tag = hit
         s_idx = self._spline_for_node(seg)
         self._push_undo()
         # Save the pre-drag active spline so _finalize_release can restore
@@ -2380,6 +2856,12 @@ class GeodesicSplineApp(MidpointShooterApp):
             k: v for k, v in self._span_drag_state.items() if k[0] != sid}
         # Span set for this spline changed — invalidate hover cache.
         self._hover_curve_dirty = True
+        # If the cleared spline is the active one, the didactic
+        # scaffold's last-span identity may have shifted; drop the
+        # cache so the next ``_compute_didactic`` rebuilds against
+        # the new node objects.
+        if sid == self.active_spline_idx:
+            self._didactic_geo_cache = None
 
     def _insert_node_from_interp(self, info: dict, sid: int,
                                 nodes: list, closed: bool) -> None:
@@ -2387,25 +2869,22 @@ class GeodesicSplineApp(MidpointShooterApp):
 
         Unlike the Bezier layers, the interp curve has no span structure
         -- it is a single polyline per spline.  The insertion index is
-        determined by the **arc-length fraction** along the interp
-        polyline:
+        determined by the **splprep parameter** ``u`` along the curve:
 
-          1. Compute the cumulative arc-length along the displayed
-             polyline up to the hover point.
-          2. For each node origin, find its closest vertex on the
-             polyline and its arc-length fraction.
-          3. The hover fraction falls between two consecutive node
-             fractions -> insert between those two nodes.
+          1. Each input origin's ``u`` is known directly from
+             ``splprep`` (cached as ``u_at_nodes`` in
+             ``_interp_result_cache``); no 3-D search needed.
+          2. The hovered segment of the rendered polyline carries a
+             per-point ``u`` (cached as ``u_per_pt``) propagated through
+             secant subdivision; the hover ``u`` is the linear
+             interpolation of the segment's endpoint ``u`` values.
+          3. Insertion goes into the unique node-gap whose ``u``
+             interval contains the hover ``u``.
 
-        This is more reliable than picking the nearest origin in
-        Euclidean space, but it is **not bullet-proof on splines that
-        self-intersect within roughly one inter-node distance**: when
-        two distant arc-length neighbours are closer in 3-D than the
-        node spacing, the closest-vertex step in (2) can attribute a
-        node to the wrong arm of the loop.  Falling back to nearest
-        origin in that case (the path under ``insert_pos is None``
-        below) keeps the insertion functional even when the heuristic
-        loses the right gap.
+        ``u`` is parametric and strictly monotonic, so this is robust
+        on self-intersecting splines where 3-D nearest-vertex search
+        previously mis-attributed a node to the wrong arm of a loop
+        (the limitation called out in the legacy implementation).
 
         The tangent direction comes from the polyline segment at the
         hover point, projected onto the surface tangent plane at the
@@ -2418,65 +2897,52 @@ class GeodesicSplineApp(MidpointShooterApp):
         n_nodes = len(nodes)
         entry = self._interp_cache.get(sid)
         origins = np.array([n.origin for n in nodes], dtype=float)
+        result_cached = self._interp_result_cache.get(sid)
 
-        # --- Compute insertion position via arc-length fraction ---
+        # --- Compute insertion position via splprep ``u`` parameter ---
         insert_pos = None
         if (entry is not None and entry[0].points is not None
-                and len(entry[0].points) >= 2 and n_nodes >= 2):
-            pts_3d = np.asarray(entry[0].points)
-            # Cumulative arc-length along the polyline
-            diffs = np.diff(pts_3d, axis=0)
-            seg_lens = np.linalg.norm(diffs, axis=1)
-            cum = np.concatenate([[0.0], np.cumsum(seg_lens)])
-            total = cum[-1]
+                and len(entry[0].points) >= 2 and n_nodes >= 2
+                and result_cached is not None and len(result_cached) >= 4):
+            _fp, _projected, u_at_nodes, u_per_pt = result_cached
+            n_pts = len(u_per_pt)
+            seg = int(info['seg'])
+            frac = float(info['frac'])
+            if 0 <= seg < n_pts - 1:
+                hover_u = float(u_per_pt[seg]
+                                + (u_per_pt[seg + 1] - u_per_pt[seg]) * frac)
+            elif seg >= n_pts - 1 and n_pts > 0:
+                hover_u = float(u_per_pt[-1])
+            else:
+                hover_u = float(u_per_pt[0]) if n_pts > 0 else 0.0
 
-            if total > 1e-12:
-                # Hover fraction: arc-length up to the hover segment + frac
-                seg = info['seg']
-                frac = info['frac']
-                hover_s = cum[seg] + seg_lens[seg] * frac if seg < len(seg_lens) else cum[-1]
-                hover_frac = hover_s / total
-
-                # Fraction of each node origin along the polyline.
-                # Vectorised: compute the (n_nodes, n_polyline)
-                # distance matrix in one BLAS call instead of looping
-                # in Python.  ``argmin`` along axis=1 gives the closest
-                # polyline vertex to each origin in one pass.
-                diff = pts_3d[None, :, :] - origins[:, None, :]
-                d2 = np.einsum('ijk,ijk->ij', diff, diff)
-                nearest = np.argmin(d2, axis=1)
-                node_fracs = cum[nearest] / total
-
-                # Find which node-gap the hover_frac falls in.
-                # Non-closed: gaps are [frac[0], frac[1]], ..., [frac[n-2], frac[n-1]].
-                # Closed: an extra wrap gap [frac[n-1], frac[0]+1].
-                if closed:
-                    # Extend node_fracs with wrap entry
-                    sorted_idx = np.argsort(node_fracs)
-                    sorted_fracs = node_fracs[sorted_idx]
-                    # Find position in sorted cycle
-                    pos_in_sorted = int(np.searchsorted(sorted_fracs, hover_frac))
-                    # pos_in_sorted indicates which sorted gap the hover is in.
-                    # Insert after sorted_idx[pos_in_sorted - 1] in node order.
-                    if pos_in_sorted == 0:
-                        # Wrap-around: insert after the last node
-                        insert_pos = (sorted_idx[-1] + 1) % n_nodes
-                    elif pos_in_sorted >= n_nodes:
-                        insert_pos = (sorted_idx[-1] + 1) % n_nodes
-                    else:
-                        insert_pos = sorted_idx[pos_in_sorted - 1] + 1
+            node_us = np.asarray(u_at_nodes, dtype=float)
+            if closed:
+                # ``node_us`` from splprep with ``per=True`` is monotonic
+                # in [0, 1]; find the cyclic gap whose [u_i, u_{i+1})
+                # contains hover_u, treating the last→first wrap as a
+                # gap that crosses 1.0.
+                sorted_idx = np.argsort(node_us)
+                sorted_us = node_us[sorted_idx]
+                pos_in_sorted = int(np.searchsorted(sorted_us, hover_u))
+                if pos_in_sorted == 0 or pos_in_sorted >= n_nodes:
+                    insert_pos = (sorted_idx[-1] + 1) % n_nodes
                 else:
-                    # Open: find the gap [node_fracs[i], node_fracs[i+1]]
-                    for j in range(n_nodes - 1):
-                        if node_fracs[j] <= hover_frac <= node_fracs[j + 1]:
-                            insert_pos = j + 1
-                            break
-                    if insert_pos is None:
-                        # Hover before first or after last → append at closer end
-                        insert_pos = 0 if hover_frac < node_fracs[0] else n_nodes
+                    insert_pos = sorted_idx[pos_in_sorted - 1] + 1
+            else:
+                # Open: ``node_us`` is sorted by construction (splprep
+                # without per= preserves input order along an open
+                # curve).  Find the gap containing hover_u.
+                for j in range(n_nodes - 1):
+                    if node_us[j] <= hover_u <= node_us[j + 1]:
+                        insert_pos = j + 1
+                        break
+                if insert_pos is None:
+                    # Hover before first or after last → append at closer end
+                    insert_pos = 0 if hover_u < node_us[0] else n_nodes
 
         if insert_pos is None:
-            # Fallback: nearest-origin Euclidean (degenerate cases)
+            # Fallback: nearest-origin Euclidean (cache miss / degenerate)
             if n_nodes < 2:
                 insert_pos = n_nodes
             else:
@@ -2908,8 +3374,13 @@ class GeodesicSplineApp(MidpointShooterApp):
             # the same root, so we just drop subsequent calls.
             if getattr(self, '_dialog_open', False):
                 return
-            self._dialog_open = True
+            # Set the flag *inside* the try so an exception thrown while
+            # constructing the dialog (e.g. tkinter failing in headless
+            # mode) cannot leave ``_dialog_open=True`` permanently
+            # stuck — which would block every subsequent right-double-
+            # click for the rest of the session.
             try:
+                self._dialog_open = True
                 parsed = self._open_coordinates_dialog(seg)
             finally:
                 self._dialog_open = False
@@ -2934,31 +3405,13 @@ class GeodesicSplineApp(MidpointShooterApp):
                          ) -> tuple[GeodesicSegment, str] | None:
         """Pure hit-test against the hover cache — no drag side-effects.
 
-        Mirrors the early portion of ``_try_hit_marker`` (rebuild cache
-        if dirty, screen-project the marker positions, run the Numba
-        ``_hover_argmin_sq`` kernel, occlusion check) but stops short
-        of the drag-start logic — we only need to know **which marker**
-        is under the cursor, not to begin a gesture.
-
-        ``allowed_tags`` filters by marker kind (``'p'`` / ``'a'`` /
-        ``'b'``).  Returns ``(seg, tag)`` when a marker passes the pick
-        radius + occlusion checks, else ``None``.
+        Thin wrapper around the parent's
+        ``_closest_marker_under_cursor``; kept as a separate method so
+        the right-click ``coord-edit`` dialog (the only caller) reads
+        cleanly and so future spline-aware filtering can be added here
+        without touching the base class.
         """
-        if self._hover_dirty:
-            self._rebuild_hover_cache()
-        if self._hover_n == 0:
-            return None
-        pts_2d = self._to_screen_batch(self._hover_pts_3d[:self._hover_n])
-        best, best_sq = _hover_argmin_sq(
-            pts_2d, self._hover_n, float(x), float(y))
-        if best_sq >= self.cfg.PICK_TOLERANCE_SQ:
-            return None
-        if self._is_marker_occluded(self._hover_pts_3d[best]):
-            return None
-        seg, tag = self._hover_tags[best]
-        if allowed_tags is not None and tag not in allowed_tags:
-            return None
-        return seg, tag
+        return self._closest_marker_under_cursor(x, y, allowed_tags)
 
     @staticmethod
     def _parse_coordinates(text: str) -> tuple[float, float, float] | None:
@@ -3802,23 +4255,30 @@ class GeodesicSplineApp(MidpointShooterApp):
                 result.append(j)
         return result
 
-    def _recompute_spans(self, node=None) -> None:
-        """Recomputes Bézier spans for the active spline.
+    def _iter_affected_spans(self, sid: int,
+                             node: 'GeodesicSegment | None'):
+        """Yield ``(i, n0, n1)`` for every span whose endpoints depend
+        on *node* (or every span when *node* is None).
 
-        When *node* is provided, only spans adjacent to that node are
-        recomputed (exactly 2 for interior nodes, 1 for endpoints of
-        open splines).  Otherwise all spans are recomputed.
+        Shared iteration mechanics for ``_recompute_spans`` (blue +
+        interp + didactic) and ``_submit_geodesic_spans`` (orange):
 
-        During drag preview (``node.is_dragging and node.is_preview``),
-        affected spans use LOD sampling and are drawn with the lighter
-        drag style (``SPAN_DRAG_COLOR``, thinner).  On consolidation
-        (debounce sets ``is_preview=False``), the same spans are
-        recomputed at full quality with normal appearance.
+          * Resolves the node-to-span-index mapping via
+            ``_adjacent_span_indices`` (or yields the full range).
+          * Looks up each span's endpoint pair via ``_span_pair``.
+          * Yields nothing when the spline is empty or *node* is not
+            in the spline (avoids the duplicated ``try: idx = nodes.index(node)``
+            block from the two consumers).
+
+        Does **not** apply ``p_b is None`` / ``path_b is None``
+        safety checks — those have caller-specific side effects
+        (blue clears the actor; orange just skips submission), so
+        the consumer keeps that branch.
         """
-        sid = self.active_spline_idx
         nodes = self.splines[sid]
         total = self._span_count(sid)
-
+        if total == 0:
+            return
         if node is not None:
             try:
                 idx = nodes.index(node)
@@ -3828,6 +4288,31 @@ class GeodesicSplineApp(MidpointShooterApp):
                 idx, total, self.splines_closed[sid])
         else:
             indices = range(total)
+        for i in indices:
+            n0, n1 = self._span_pair(sid, i)
+            yield i, n0, n1
+
+    def _recompute_spans(self, node=None, *, sid: int | None = None) -> None:
+        """Recomputes Bézier spans for the active spline (or *sid* when given).
+
+        When *node* is provided, only spans adjacent to that node are
+        recomputed (exactly 2 for interior nodes, 1 for endpoints of
+        open splines).  Otherwise all spans are recomputed.
+
+        *sid* defaults to ``self.active_spline_idx``.  Pass it explicitly
+        from callers that walk every spline (load, undo full restore,
+        ``_rebuild_all_orange``) instead of mutating ``active_spline_idx``
+        as a side channel — that pattern caused the
+        ``audit fixes: cleanup leak, origin_cache invalidation`` regression.
+
+        During drag preview (``node.is_dragging and node.is_preview``),
+        affected spans use LOD sampling and are drawn with the lighter
+        drag style (``SPAN_DRAG_COLOR``, thinner).  On consolidation
+        (debounce sets ``is_preview=False``), the same spans are
+        recomputed at full quality with normal appearance.
+        """
+        if sid is None:
+            sid = self.active_spline_idx
 
         is_dragging = node is not None and node.is_dragging
         # Visual drag style: lighter/thinner while preview, normal on consolidation
@@ -3838,12 +4323,15 @@ class GeodesicSplineApp(MidpointShooterApp):
         max_s = sc.DRAG_MAX_SAMPLES if is_dragging else sc.MAX_SAMPLES
 
         adaptive = sc.ADAPTIVE_SAMPLING
-        for i in indices:
-            n0, n1 = self._span_pair(sid, i)
+        ctrl = self._ctrl_scratch  # (4, 3) view; rows reused per span
+        for i, n0, n1 in self._iter_affected_spans(sid, node):
             if n0.p_b is None or n1.p_a is None:
                 self._set_span(sid, i, None)
                 continue
-            ctrl = [n0.origin, n0.p_b, n1.p_a, n1.origin]
+            ctrl[0] = n0.origin
+            ctrl[1] = n0.p_b
+            ctrl[2] = n1.p_a
+            ctrl[3] = n1.origin
             n = self.geo.adaptive_samples(ctrl, res, min_s, max_s)
             t_vals = GeodesicMesh.curvature_adaptive_t_vals(ctrl, n) if adaptive else None
             # Two-mode Bezier: during drag use fast Euclidean+projection
@@ -3856,13 +4344,13 @@ class GeodesicSplineApp(MidpointShooterApp):
             # passing ``path_12=None``.
             path_12 = None
             if not is_dragging:
-                path_12 = self.geo.compute_endpoint_local(n0.p_b, n1.p_a)
+                path_12, was_fallback = self.geo.compute_endpoint_local(
+                    n0.p_b, n1.p_a)
                 if path_12 is not None and len(path_12) < 2:
                     path_12 = None
                 # Track fallbacks only on consolidation.  During drag the
                 # hybrid skips the solver entirely so there is nothing to flag.
-                self._mark_span_degraded(
-                    (sid, i), self.geo._last_was_fallback)
+                self._mark_span_degraded((sid, i), was_fallback)
             pts = self.geo.hybrid_de_casteljau_curve(
                 ctrl, n0.path_b, n1.path_a, n, fast=is_dragging,
                 t_vals=t_vals, path_12=path_12)
@@ -3901,7 +4389,7 @@ class GeodesicSplineApp(MidpointShooterApp):
         #     "snap" from the approximation to the exact geodesic —
         #     the visible snap is itself a teaching moment.
         if self._didactic_visible:
-            if node is None or self._is_node_in_last_span(node, sid):
+            if node is None or self._is_node_in_last_span(node):
                 self._compute_didactic(fast=is_dragging)
         else:
             self._didactic_dirty = True
@@ -3971,17 +4459,41 @@ class GeodesicSplineApp(MidpointShooterApp):
             return
 
         nodes = self.splines[sid]
-        if len(nodes) < 2:
+        n_nodes = len(nodes)
+        if n_nodes < 2:
             self._set_interp_curve(sid, None)
+            self._interp_result_cache.pop(sid, None)
             return
 
-        origins = np.array([n.origin for n in nodes], dtype=float)
+        # Reuse a per-spline (N, 3) origins buffer.  Grows when N
+        # changes; otherwise filled in place — eliminates the
+        # ``np.array([n.origin for n in nodes])`` allocation each
+        # drag frame.
+        buf = self._interp_origins_buf.get(sid)
+        if buf is None or buf.shape[0] != n_nodes:
+            buf = np.empty((n_nodes, 3), dtype=float)
+            self._interp_origins_buf[sid] = buf
+        for ni, node in enumerate(nodes):
+            buf[ni] = node.origin
+        origins = buf
         closed = self.splines_closed[sid]
 
         # Need at least k+1 points for degree k
-        k = min(3, len(origins) - 1)
-        if closed and len(origins) < k + 1:
+        k = min(3, n_nodes - 1)
+        if closed and n_nodes < k + 1:
             self._set_interp_curve(sid, None)
+            self._interp_result_cache.pop(sid, None)
+            return
+
+        # Content fingerprint: when origins + flags are bit-identical
+        # to the previous successful call, reuse the projected
+        # polyline directly.  Saves ~3-10 ms on no-op recomputes
+        # (e.g. `_recompute_spans` runs interp every drag frame even
+        # when only ANOTHER spline's node moved).
+        fp = (origins.tobytes(), bool(closed), bool(is_dragging))
+        cached = self._interp_result_cache.get(sid)
+        if cached is not None and cached[0] == fp:
+            self._set_interp_curve(sid, cached[1])
             return
 
         try:
@@ -3991,6 +4503,7 @@ class GeodesicSplineApp(MidpointShooterApp):
         except Exception as exc:  # noqa: BLE001 — scipy raises bare Exception
             log.debug("splprep failed for spline %d: %s", sid, exc)
             self._set_interp_curve(sid, None)
+            self._interp_result_cache.pop(sid, None)
             return
 
         # High base sample count -- the 3D B-spline has no geodesic
@@ -4013,14 +4526,25 @@ class GeodesicSplineApp(MidpointShooterApp):
         raw_pts = np.column_stack((x, y, z))
 
         projected = self.geo.project_smooth_batch(raw_pts)
+        # Per-rendered-point splprep ``u`` parameter, propagated through
+        # secant subdivision so node-insertion can locate the picked
+        # segment in parametric space (robust on self-intersecting
+        # splines, which 3-D distance can mis-attribute at the
+        # crossing).  ``u_at_nodes = u`` gives each input origin its
+        # exact parameter value directly from splprep — no need to
+        # search for the closest polyline vertex per origin.
+        u_per_pt = u_fine.copy()
         # Secant subdivision only on consolidation — too slow for drag
         if not is_dragging:
             mean_edge = float(np.sqrt(self.geo._face_edge_len2.mean()))
             interp_tol = mean_edge * sc.INTERP_SECANT_TOL_FACTOR
-            projected = self.geo.subdivide_secant_chords(
+            projected, u_per_pt = self.geo.subdivide_secant_chords(
                 projected, tol=interp_tol,
-                max_depth=sc.INTERP_SECANT_MAX_DEPTH)
+                max_depth=sc.INTERP_SECANT_MAX_DEPTH,
+                labels=u_per_pt)
 
+        u_at_nodes = np.asarray(u, dtype=float)
+        self._interp_result_cache[sid] = (fp, projected, u_at_nodes, u_per_pt)
         self._set_interp_curve(sid, projected)
 
     # --- Background curve layer (fully geodesic orange) ---
@@ -4097,35 +4621,25 @@ class GeodesicSplineApp(MidpointShooterApp):
             prop.SetColor(sc.GEO_COLOR)
         actor.SetVisibility(self._layer_visible['orange'])
 
-    def _submit_geodesic_spans(self, node: GeodesicSegment | None = None) -> None:
+    def _submit_geodesic_spans(self, node: GeodesicSegment | None = None,
+                               *, sid: int | None = None) -> None:
         """Submits affected spans for background orange de Casteljau computation.
 
-        Identifies the same span indices as ``_recompute_spans`` (adjacent
-        to *node*, or all spans if *node* is None).  For each span with
-        complete control points, submits a worker to ``_work_mgr``.  Hides
-        the orange actor while computation is in progress — the Master
-        Clock timer will progressively reveal it as points arrive.
+        Walks the same span set as ``_recompute_spans`` via the shared
+        ``_iter_affected_spans`` generator (adjacent to *node*, or all
+        spans if *node* is None).  For each span with complete control
+        points, submits a worker to ``_work_mgr``.  Hides the orange
+        actor while computation is in progress — the Master Clock
+        timer will progressively reveal it as points arrive.
+
+        *sid* defaults to ``self.active_spline_idx``; see ``_recompute_spans``
+        for why callers that walk every spline should pass it explicitly.
         """
-        sid = self.active_spline_idx
-        nodes = self.splines[sid]
-        total = self._span_count(sid)
-        if total == 0:
-            return
-
-        if node is not None:
-            try:
-                idx = nodes.index(node)
-            except ValueError:
-                return
-            indices = self._adjacent_span_indices(
-                idx, total, self.splines_closed[sid])
-        else:
-            indices = range(total)
-
+        if sid is None:
+            sid = self.active_spline_idx
         sc = self.scfg
-        for i in indices:
+        for i, n0, n1 in self._iter_affected_spans(sid, node):
             span_key = (sid, i)
-            n0, n1 = self._span_pair(sid, i)
             if n0.p_b is None or n1.p_a is None:
                 continue
             ctrl = [n0.origin, n0.p_b, n1.p_a, n1.origin]
@@ -4140,7 +4654,12 @@ class GeodesicSplineApp(MidpointShooterApp):
             self._work_mgr.submit_span(
                 span_key, ctrl,
                 n0.path_b, n1.path_a[::-1],
-                sc.GEO_SAMPLES, adaptive=sc.ADAPTIVE_SAMPLING)
+                sc.GEO_SAMPLES, adaptive=sc.ADAPTIVE_SAMPLING,
+                deviation_mode=sc.ORANGE_DEVIATION_MODE,
+                subdiv_tol_factor=sc.ORANGE_SUBDIV_TOL_FACTOR,
+                subdiv_max_depth=sc.ORANGE_SUBDIV_MAX_DEPTH,
+                chord_bridging=sc.ORANGE_CHORD_BRIDGING,
+                submesh_subdiv=sc.ORANGE_SUBMESH_SUBDIV)
 
     def _rebuild_all_orange(self) -> None:
         """Resubmits the fully-geodesic (orange) workers for **every** span
@@ -4155,13 +4674,8 @@ class GeodesicSplineApp(MidpointShooterApp):
         fresh and the HUD reflects the new total.
         """
         self._work_mgr.cancel_all()
-        saved_sid = self.active_spline_idx
-        try:
-            for sid in range(len(self.splines)):
-                self.active_spline_idx = sid
-                self._submit_geodesic_spans()
-        finally:
-            self.active_spline_idx = saved_sid
+        for sid in range(len(self.splines)):
+            self._submit_geodesic_spans(sid=sid)
         self._set_hud(_t("orange_rebuilt"), 'orange')
         self.plotter.render()
 
@@ -4193,14 +4707,44 @@ class GeodesicSplineApp(MidpointShooterApp):
             self._hide_didactic_actors()
             if self._didactic_slider is not None:
                 self._didactic_slider.SetEnabled(0)
+            # Cancel any in-flight slider-tick consolidation — would
+            # otherwise fire ~100 ms later and pay the cost of an
+            # exact recompute whose result is never rendered.
+            self.state.pending_debounces.pop('didactic_t', None)
             self._set_hud("DIDACTIC OFF", 'grey', sticky_seconds=1.5)
         self.plotter.render()
 
-    def _is_node_in_last_span(self, node: GeodesicSegment, sid: int) -> bool:
-        """True iff ``node`` is one of the two endpoints of the spline's
-        last span (the span the didactic scaffold visualises).
+    def _resolve_didactic_sid(self) -> int:
+        """Spline index whose last span the didactic scaffold visualises.
 
-        Match rule mirrors ``_compute_didactic``'s "last span" pick:
+        Walks backward from ``active_spline_idx`` looking for the first
+        spline with at least 2 nodes.  This lets the scaffold remain
+        anchored on the *previous* span right after the user inserts a
+        break — ``Dbl-click R`` and ``LOOP CLOSED + BREAK`` both create
+        a new empty spline and switch ``active_spline_idx`` to it, so
+        without the walk-back the scaffold would vanish at the moment
+        the user is most likely to want to discuss what they just
+        finished.
+
+        Returns -1 when no spline has a last span yet (fresh editor,
+        or every spline reduced to a placeholder).
+        """
+        sid = self.active_spline_idx
+        while sid >= 0:
+            if sid < len(self.splines) and len(self.splines[sid]) >= 2:
+                return sid
+            sid -= 1
+        return -1
+
+    def _is_node_in_last_span(self, node: GeodesicSegment) -> bool:
+        """True iff ``node`` is one of the two endpoints of the span the
+        didactic scaffold currently visualises.
+
+        The didactic span is resolved via ``_resolve_didactic_sid`` —
+        typically the active spline's last span, but falls back to the
+        previous spline when active is a post-break placeholder.
+
+        Match rule:
 
           * Open spline of N nodes: ``nodes[N-2]`` and ``nodes[N-1]``.
           * Closed spline: wrap-around endpoints ``nodes[N-1]`` and
@@ -4208,15 +4752,13 @@ class GeodesicSplineApp(MidpointShooterApp):
 
         Lookups use ``is`` (identity), not ``==``, since
         ``GeodesicSegment`` instances are referenced by identity
-        throughout the editor.  Returns False on the empty / single-
-        node placeholder cases — the scaffold has no last span there
-        and recomputing would be a no-op.
+        throughout the editor.  Returns False when no didactic span
+        exists — recomputing would be a no-op.
         """
-        if sid < 0 or sid >= len(self.splines):
+        sid = self._resolve_didactic_sid()
+        if sid < 0:
             return False
         nodes = self.splines[sid]
-        if len(nodes) < 2:
-            return False
         if self.splines_closed[sid]:
             return node is nodes[-1] or node is nodes[0]
         return node is nodes[-2] or node is nodes[-1]
@@ -4278,29 +4820,62 @@ class GeodesicSplineApp(MidpointShooterApp):
     def _on_didactic_t_change(self, value: float) -> None:
         """Slider callback: re-run the cascade at the new ``t``.
 
-        The slider fires this on every interaction tick (we passed
-        ``interaction_event='always'``), so the user sees the four
-        auxiliary lines reshape live as they drag.  Cost per call is
-        the same ~75-125 ms as the initial toggle — acceptable on
-        modern hardware; the cascade is a teaching aid, not a hot
-        render path.
+        Always uses ``fast=False`` (exact geodesic).  Rationale:
+        ``path_12`` is t-INVARIANT and held in the ``'exact'`` slot
+        of ``_didactic_geo_cache``.  As long as the geometry is
+        stable (no node drag in flight), every slider tick after
+        the first hits the cache in ~1-5 ms.  The first tick pays
+        the ~75-125 ms ``compute_endpoint_local`` cost once.
+
+        An earlier implementation alternated ``fast=True`` on the
+        live tick with ``fast=False`` on a 100 ms debounce.  That
+        produced a **visual jump** in the path_12 segment between
+        each tick → debounce transition because the Euclidean
+        projection used by ``fast`` differs from the true geodesic
+        — same H_out/H_in, two different polylines.  Slider
+        movement is fundamentally different from node-drag: only
+        ``t`` changes, never the geometry, so the ``fast`` mode's
+        purpose (cheap approximation while geometry mutates) does
+        not apply here.
         """
         self._didactic_t = float(value)
-        if self._didactic_visible:
-            self._compute_didactic()
-            self.plotter.render()
+        if not self._didactic_visible:
+            return
+        self._compute_didactic(fast=False)
+        self.plotter.render()
+        # Cancel any obsolete debounce from the legacy fast/exact
+        # alternating implementation — defensive cleanup.
+        self.state.pending_debounces.pop('didactic_t', None)
+
+    def _didactic_t_consolidate(self) -> None:
+        """No-op kept for backwards compatibility.
+
+        Was the debounced exact recompute fired ~100 ms after the
+        last slider tick.  No longer needed: ``_on_didactic_t_change``
+        now uses ``fast=False`` directly so the cache holds the
+        exact answer continuously and there is nothing to settle to.
+        """
+        return
 
     def _compute_didactic(self, fast: bool = False) -> None:
-        """Build the 4 auxiliary geodesic lines for the active spline's
-        last span at parameter ``self._didactic_t``.
+        """Build the 4 auxiliary geodesic lines for the resolved
+        didactic span at parameter ``self._didactic_t``.
 
-        "Last span" depends on the spline's open/closed flag:
+        Span resolution: ``_resolve_didactic_sid`` returns the active
+        spline's index when it has ≥ 2 nodes, otherwise walks backward
+        to the previous spline.  This keeps the scaffold anchored on
+        the most recent fully-formed span across breaks (``Dbl-click R``
+        and ``LOOP CLOSED + BREAK`` both produce an empty active
+        spline).
+
+        "Last span" within the resolved spline depends on the
+        open/closed flag:
           * Open spline of N nodes: span between ``nodes[N-2]`` and
             ``nodes[N-1]``.
           * Closed spline: the wrap-around span between ``nodes[N-1]``
             and ``nodes[0]``.
 
-        When the active spline has fewer than 2 nodes, or the relevant
+        When no spline has ≥ 2 nodes, or the relevant
         ``path_a`` / ``path_b`` is missing (e.g. the user just inserted
         a single node), the actors are hidden and a brief HUD note
         explains why.
@@ -4324,17 +4899,13 @@ class GeodesicSplineApp(MidpointShooterApp):
         (callback ``_on_didactic_t_change``); each slider tick re-fires
         this method.
         """
-        sid = self.active_spline_idx
-        if sid < 0 or sid >= len(self.splines):
-            self._hide_didactic_actors()
-            self._didactic_dirty = True
-            return
-        nodes = self.splines[sid]
-        if len(nodes) < 2:
+        sid = self._resolve_didactic_sid()
+        if sid < 0:
             self._hide_didactic_actors()
             self._didactic_dirty = True
             self._set_hud("DIDACTIC: no last span", 'grey', sticky_seconds=2.0)
             return
+        nodes = self.splines[sid]
 
         if self.splines_closed[sid]:
             n0, n1 = nodes[-1], nodes[0]
@@ -4358,20 +4929,78 @@ class GeodesicSplineApp(MidpointShooterApp):
         # via ``hybrid_de_casteljau_curve``'s ``path_12=None`` branch
         # during drag).  Closing over ``fast`` here keeps the four
         # resolution sites below readable.
+        # Use the same submesh subdivision level as the orange
+        # worker so the didactic scaffold's collapse point lands
+        # exactly on the rendered orange curve.  Without this, the
+        # orange (worker, with subdiv) and the didactic (main thread,
+        # without subdiv) would compute slightly different geodesics
+        # in coarse regions of the mesh.
+        sub_lvl = int(self.scfg.ORANGE_SUBMESH_SUBDIV)
         def _pair_path(p0, p1):
             if fast:
                 return self._cheap_geodesic(p0, p1)
-            path = self.geo.compute_endpoint_local(p0, p1)
+            path, _ = self.geo.compute_endpoint_local(
+                p0, p1, submesh_subdiv=sub_lvl)
             if path is None or len(path) < 2:
                 return np.array([p0, p1])
             return path
 
-        # Level 1: middle segment H_out -> H_in.
-        path_12 = _pair_path(H_out, H_in)
-
-        cum_b, total_b = GeodesicMesh.compute_path_lengths(path_b)
-        cum_a, total_a = GeodesicMesh.compute_path_lengths(path_a_rev)
-        cum_12, total_12 = GeodesicMesh.compute_path_lengths(path_12)
+        # --- Level 1: middle segment H_out -> H_in ---
+        # path_12 (and the cumulative lengths of path_b / path_a /
+        # path_12) are INVARIANT to ``t``: they only change when the
+        # last-span endpoint nodes move.  Cache them so dragging the
+        # didactic slider does not retrigger ``compute_endpoint_local``
+        # (~75-125 ms per tick) every frame.
+        #
+        # Two slots: ``fast`` and ``exact``.  The slider tick path uses
+        # ``fast`` (Euclidean lerp + projection); the debounce
+        # consolidation 100 ms after the last tick uses ``exact``
+        # (compute_endpoint_local).  An earlier single-slot cache
+        # alternated between the two on every tick → debounce → tick
+        # cycle, recomputing path_12 each time *and* showing a visible
+        # jump because the two approximations differ on curved
+        # surfaces.  Keeping both entries lets each path hit the cache
+        # independently while the geometry is stable.
+        #
+        # Cache key (per slot) is by object identity of the geometry
+        # buffers — every handle/origin drag produces fresh ndarrays in
+        # ``SegmentData.update_*``, so ``id(...)`` flipping is the
+        # natural invalidation trigger.  HAZARD: CPython recycles
+        # addresses after GC, so two distinct objects can share an
+        # ``id()`` over time.  We pin all 8 keyed objects via the
+        # ``'refs'`` field below — they cannot be freed while the
+        # cache entry is live, so ``id`` collisions are impossible.
+        cache_key = (
+            id(n0), id(n1),
+            id(n0.origin), id(n0.p_b), id(n0.path_b),
+            id(n1.origin), id(n1.p_a), id(n1.path_a),
+        )
+        if self._didactic_geo_cache is None:
+            self._didactic_geo_cache = {}
+        slot = 'fast' if fast else 'exact'
+        cached = self._didactic_geo_cache.get(slot)
+        if cached is not None and cached['key'] == cache_key:
+            path_12 = cached['path_12']
+            cum_b, total_b = cached['cum_b'], cached['total_b']
+            cum_a, total_a = cached['cum_a'], cached['total_a']
+            cum_12, total_12 = cached['cum_12'], cached['total_12']
+        else:
+            path_12 = _pair_path(H_out, H_in)
+            cum_b, total_b = GeodesicMesh.compute_path_lengths(path_b)
+            cum_a, total_a = GeodesicMesh.compute_path_lengths(path_a_rev)
+            cum_12, total_12 = GeodesicMesh.compute_path_lengths(path_12)
+            self._didactic_geo_cache[slot] = {
+                'key': cache_key,
+                # Strong refs to every object whose id() is in ``key`` —
+                # prevents GC + address reuse from creating false hits.
+                'refs': (n0, n1,
+                         n0.origin, n0.p_b, n0.path_b,
+                         n1.origin, n1.p_a, n1.path_a),
+                'path_12': path_12,
+                'cum_b': cum_b, 'total_b': total_b,
+                'cum_a': cum_a, 'total_a': total_a,
+                'cum_12': cum_12, 'total_12': total_12,
+            }
 
         # Clamp defensively — the slider should already constrain the
         # value to [0, 1], but a hand-set ``self._didactic_t`` could
@@ -4467,6 +5096,7 @@ class GeodesicSplineApp(MidpointShooterApp):
         has_worker_results = self._work_mgr.drain_queue()
 
         self._apply_worker_fallbacks()
+        self._apply_shoot_truncation_hud()
         self._update_orange_hud()
 
         needs_render = self._refresh_arrows_on_camera_change()
@@ -4496,6 +5126,21 @@ class GeodesicSplineApp(MidpointShooterApp):
         for span_key in list(self._work_mgr.degraded_spans):
             self._mark_span_degraded(span_key, True)
         self._work_mgr.degraded_spans.clear()
+
+    def _apply_shoot_truncation_hud(self) -> None:
+        """Surface a HUD warning when ``compute_shoot`` bailed out via
+        the non-2-manifold fan safeguard since the previous tick.
+
+        The truncation happens inside the JIT inner loop, which has no
+        direct access to the HUD; ``compute_shoot`` increments a
+        monotonic counter on the ``GeodesicMesh`` and we diff it here
+        to detect new events.  Sticky for ~3 s so a single shoot during
+        a fast drag still leaves a visible message.
+        """
+        cur = getattr(self.geo, '_shoot_truncation_count', 0)
+        if cur != self._shoot_truncation_seen:
+            self._shoot_truncation_seen = cur
+            self._set_hud(_t("shoot_truncated"), 'red', sticky_seconds=3.0)
 
     def _update_orange_hud(self) -> None:
         """Translates the manager's batch counters into a HUD line."""
@@ -4530,6 +5175,17 @@ class GeodesicSplineApp(MidpointShooterApp):
         dead spans — their worker terminated abnormally and any cached
         partial data should be discarded by ``_clear_dead_orange_spans``
         instead of being rendered.
+
+        The polyline returned by ``_work_mgr.get_points`` is already in
+        its final form — phase 1 + phase 2 of the worker produce
+        cascade-faithful samples, and phase 3 (when enabled) replaces
+        the inter-sample chords with exact mesh geodesics.  No
+        ``subdivide_secant_chords`` is run here: that legacy post-pass
+        was projecting *chord midpoints* to the surface, which moved
+        the orange polyline off the cascade and was the visible cause
+        of the orange-vs-didactic mismatch.  The worker now handles
+        both density (cascade samples in problem regions) and surface-
+        hugging (geodesic chord-bridging) directly.
         """
         dirty_orange = self._work_mgr.dirty_spans - self._work_mgr.dead_spans
         self._work_mgr.dirty_spans = set()
@@ -4541,14 +5197,8 @@ class GeodesicSplineApp(MidpointShooterApp):
             pts = self._work_mgr.get_points(span_key)
             if pts is None:
                 continue
-            # Secant subdivision only on completion — avoids O(N^2) cost
-            # of re-subdividing the growing polyline on every progressive
-            # point arrival.
             is_done = span_key in self._work_mgr.done_spans
             if is_done:
-                pts = self.geo.subdivide_secant_chords(
-                    pts, tol=self._secant_tol,
-                    max_depth=self.scfg.SECANT_MAX_DEPTH)
                 self._work_mgr.done_spans.discard(span_key)
             self._set_geo_span(*span_key, pts, computing=not is_done)
             rendered = True
@@ -4621,7 +5271,16 @@ class GeodesicSplineApp(MidpointShooterApp):
 
         # numpy .tolist() produces Python floats which json.dump writes
         # with full repr precision (~17 significant digits) by default.
-        fname = datetime.now().strftime('%Y%m%d_%H%M%S') + '.json'
+        # Resolve filename collisions: holding 's' triggers VTK key
+        # autorepeat which fires this method many times within a
+        # single second, all colliding on ``yyyymmdd_HHMMSS.json``.
+        # Append ``_NN`` only when the base name already exists.
+        base = datetime.now().strftime('%Y%m%d_%H%M%S')
+        fname = f"{base}.json"
+        suffix = 1
+        while Path(fname).exists():
+            fname = f"{base}_{suffix:02d}.json"
+            suffix += 1
         try:
             self._atomic_write_json(fname, data)
         except OSError as exc:
@@ -4637,6 +5296,166 @@ class GeodesicSplineApp(MidpointShooterApp):
         self.plotter.render()
 
     @staticmethod
+    def _format_session_json(data: dict) -> str:
+        """Render the session dict with 3-line aligned nodes::
+
+            {
+              "version": 2,
+              "mesh_file": "LL.vtk",
+              "splines": [
+                {
+                  "closed": false,
+                  "nodes": [
+                    {"origin": [x, y, z],
+                     "p_a":    [x, y, z],
+                     "p_b":    [x, y, z]},
+                    {"origin": [x, y, z],
+                     "p_a":    [x, y, z],
+                     "p_b":    [x, y, z]}
+                  ]
+                }
+              ]
+            }
+
+        Each node spans one line per coordinate field with the colons
+        aligned (``"origin":`` is the longest known key; ``"p_a"`` /
+        ``"p_b"`` get extra spaces after the colon to match).
+        Continuation lines align under the opening ``{`` of the first
+        line so the values form a clean visual column.
+
+        Compared to ``json.dump(indent=2)``'s 12 lines per node, this
+        emits 3 lines per node and keeps the coordinate triplets
+        inline — typical sessions shrink ~3×.
+
+        The output is still valid JSON: every value goes through
+        ``json.dumps`` so quoting / escaping / float repr (full-precision
+        ~17-digit ``repr(float(x))``) is unchanged.  Round-trip via
+        ``json.loads`` reproduces the original ``data`` exactly.
+
+        Defensive fallback: if the dict shape diverges from the
+        v1/v2 session schema, returns ``json.dumps(data, indent=2)``
+        unchanged so we never emit malformed output.
+        """
+        # Validate the structure we know how to compact-format; on any
+        # surprise, fall back to the verbose default.  Using EAFP
+        # rather than full schema validation: ``_validate_session_dict``
+        # is the canonical schema check; here we just need the shape
+        # to traverse safely.
+        try:
+            splines = data['splines']
+            if not isinstance(splines, list):
+                raise TypeError
+            for s in splines:
+                if not isinstance(s, dict):
+                    raise TypeError
+                if not isinstance(s.get('nodes', []), list):
+                    raise TypeError
+        except (KeyError, TypeError):
+            return json.dumps(data, indent=2, allow_nan=False)
+
+        def _arr(vec) -> str:
+            """Inline JSON array of floats — single line, comma-space.
+
+            Uses ``allow_nan=False`` so any NaN or ±Infinity that
+            slipped past the validator (e.g. from a degenerate solver
+            fallback) raises ``ValueError`` here instead of silently
+            writing the non-RFC-8259 literals ``NaN`` / ``Infinity``.
+            """
+            return '[' + ', '.join(
+                json.dumps(float(x), allow_nan=False) for x in vec) + ']'
+
+        # Canonical key order inside a node.  Anything not in this
+        # tuple is appended at the end (forward-compat for future
+        # schema extensions).
+        NODE_CANON = ('origin', 'tangent', 'p_a', 'p_b')
+
+        def _node_lines(node: dict, indent: str, is_last: bool) -> list[str]:
+            """Render *node* as N lines (one per key) with colons
+            aligned.  The first line opens with ``{`` immediately
+            after *indent*; subsequent lines continue at *indent + 1*
+            so all keys form a vertical column under the first key.
+            The closing brace + optional trailing comma is appended
+            to the last line.
+            """
+            keys: list[str] = [k for k in NODE_CANON if k in node]
+            for k in node:
+                if k not in NODE_CANON:
+                    keys.append(k)
+            tail = '' if is_last else ','
+            if not keys:
+                return [f'{indent}{{}}{tail}']
+
+            key_reprs = [json.dumps(k) for k in keys]
+            # ljust width = longest "key": + 1 space → values align.
+            pad_to = max(len(kr) for kr in key_reprs) + 2  # +1 colon, +1 space
+            cont = indent + ' '   # +1 to align under '{' contents
+
+            lines: list[str] = []
+            n = len(keys)
+            for i, (k, kr) in enumerate(zip(keys, key_reprs)):
+                val = node[k]
+                if val is None:
+                    rendered = 'null'
+                elif k in NODE_CANON:
+                    rendered = _arr(val)
+                else:
+                    # Unknown extras: defer to default json encoding.
+                    rendered = json.dumps(val)
+                prefix = (kr + ':').ljust(pad_to)
+                if i == 0:
+                    line = f'{indent}{{{prefix}{rendered}'
+                else:
+                    line = f'{cont}{prefix}{rendered}'
+                if i < n - 1:
+                    line += ','
+                else:
+                    line += '}' + tail
+                lines.append(line)
+            return lines
+
+        out: list[str] = ['{']
+        # Top-level: version + mesh_file first (canonical), then any
+        # other forward-compat keys, then splines last.
+        TOP_HEAD = ('version', 'mesh_file')
+        for key in TOP_HEAD:
+            if key in data:
+                out.append(f'  {json.dumps(key)}: {json.dumps(data[key])},')
+        for key in data:
+            if key in TOP_HEAD or key == 'splines':
+                continue
+            out.append(f'  {json.dumps(key)}: {json.dumps(data[key])},')
+        out.append('  "splines": [')
+
+        for si, spline in enumerate(splines):
+            out.append('    {')
+            if 'closed' in spline:
+                out.append(
+                    f'      "closed": {json.dumps(spline["closed"])},')
+            # Forward-compat: emit any other keys before nodes
+            # (matters because nodes is the open-ended block).
+            for key in spline:
+                if key in ('closed', 'nodes'):
+                    continue
+                out.append(
+                    f'      {json.dumps(key)}: {json.dumps(spline[key])},')
+            nodes = spline.get('nodes', [])
+            if not nodes:
+                out.append('      "nodes": []')
+            else:
+                out.append('      "nodes": [')
+                last_n = len(nodes) - 1
+                for ni, node in enumerate(nodes):
+                    out.extend(_node_lines(
+                        node, '        ', is_last=(ni == last_n)))
+                out.append('      ]')
+            spline_close = '    }' + (',' if si < len(splines) - 1 else '')
+            out.append(spline_close)
+
+        out.append('  ]')
+        out.append('}')
+        return '\n'.join(out) + '\n'
+
+    @staticmethod
     def _atomic_write_json(fname: str, data: dict) -> None:
         """Writes *data* as JSON to *fname* atomically (UTF-8).
 
@@ -4644,23 +5463,45 @@ class GeodesicSplineApp(MidpointShooterApp):
         ``os.replace`` it onto the target.  ``os.replace`` is atomic on
         both POSIX and Windows for files on the same volume — the user
         sees either the old file or the new one, never a partial write.
+
+        Output uses ``_format_session_json``'s compact layout (one
+        node per line, inline 3-float coordinate arrays).  Falls
+        back to verbose ``json.dump(indent=2)`` if the dict shape
+        is unrecognised.
+
+        On any failure (encoder raising on an unsupported type,
+        disk-full mid-flush, missing target dir on the replace step,
+        ...) the partial ``*.tmp`` is removed so the user's directory
+        does not accumulate orphan tmp files across repeated save
+        attempts.
         """
         target = Path(fname)
-        with tempfile.NamedTemporaryFile(
-                'w', encoding='utf-8',
-                dir=target.parent if str(target.parent) else None,
-                prefix=target.stem + '.', suffix='.tmp',
-                delete=False) as tmp:
-            json.dump(data, tmp, indent=2)
-            tmp.flush()
-            try:
-                os.fsync(tmp.fileno())
-            except OSError:
-                # Some filesystems (network, exotic) don't support fsync.
-                # Replace below is still atomic at the inode level.
-                pass
-            tmp_path = tmp.name
-        os.replace(tmp_path, fname)
+        text = GeodesicSplineApp._format_session_json(data)
+        tmp_path: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                    'w', encoding='utf-8',
+                    dir=target.parent if str(target.parent) else None,
+                    prefix=target.stem + '.', suffix='.tmp',
+                    delete=False) as tmp:
+                tmp_path = tmp.name
+                tmp.write(text)
+                tmp.flush()
+                try:
+                    os.fsync(tmp.fileno())
+                except OSError:
+                    # Some filesystems (network, exotic) don't support
+                    # fsync.  Replace below is still atomic at the
+                    # inode level.
+                    pass
+            os.replace(tmp_path, fname)
+            tmp_path = None
+        finally:
+            if tmp_path is not None:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
     # --- VTK export (key 'v') ---
 
@@ -4680,13 +5521,18 @@ class GeodesicSplineApp(MidpointShooterApp):
 
         Reuse vs recompute
         ------------------
-        If ``EXPORT_VTK_SAMPLES == GEO_SAMPLES`` AND the live orange
+        If ``EXPORT_VTK_SAMPLES >= GEO_SAMPLES`` AND the live orange
         cache contains polylines for every span (no orange workers
-        still active), the live polylines are reused — they are
-        already secant-subdivided and identical to what
-        ``compute_orange`` would produce.  Otherwise the export
-        recomputes via a fresh ``ProcessPoolExecutor`` inside
-        ``spline_export.compute_orange``.
+        still active), the live polylines are reused as-is — they
+        already include the worker's phase-2 cascade densification
+        and phase-3 chord-bridging, so the exported curve matches
+        exactly what is on screen.  ``EXPORT_VTK_SAMPLES`` acts as a
+        *minimum quality* threshold: any value at or above
+        ``GEO_SAMPLES`` triggers the (free) reuse path; below it,
+        the export falls back to a fresh ``compute_orange`` with
+        only the requested sample count and no densification —
+        useful for ultra-light exports where the curve only needs
+        coarse landmarks.
 
         Per-spline semantics:
           * 0 nodes → skipped (placeholder break).
@@ -4715,16 +5561,28 @@ class GeodesicSplineApp(MidpointShooterApp):
         self.plotter.render()  # paint the HUD before we block
 
         n_samples = self.scfg.EXPORT_VTK_SAMPLES
-        # Reuse-from-cache is safe iff (a) the live cache was built
-        # with the same sample count, and (b) no workers are still
-        # producing data.  Active workers may have populated some
-        # spans but not others; rather than mix sources we just
-        # recompute when any worker is in flight.
+        # Reuse-from-cache is safe iff (a) the requested sample count
+        # is at least the worker's grid (``GEO_SAMPLES``) — the cached
+        # polylines already contain phase-1 samples + phase-2
+        # densification + phase-3 chord-bridging, so any
+        # ``n_samples >= GEO_SAMPLES`` is satisfied for free with
+        # higher fidelity than a fresh compute would give — and
+        # (b) no workers are still producing data.  Active workers may
+        # have populated some spans but not others; rather than mix
+        # sources we just recompute when any worker is in flight.
         can_reuse_live = (
-            n_samples == self.scfg.GEO_SAMPLES
+            n_samples >= self.scfg.GEO_SAMPLES
             and not self._work_mgr.active_spans
         )
 
+        # Disable the interactor during the blocking compute so
+        # mouse / keyboard events queue up cleanly instead of being
+        # processed against the about-to-stale state.  ``Disable``
+        # ignores all input until ``Enable`` runs again — clearer to
+        # the user than a silently-frozen UI.  Wrapped in try/finally
+        # so a worker exception still re-enables interaction.
+        iren = self.plotter.iren.interactor
+        iren.Disable()
         try:
             spline_points_list, landmarks = self._gather_vtk_export_data(
                 n_samples, can_reuse_live)
@@ -4736,6 +5594,8 @@ class GeodesicSplineApp(MidpointShooterApp):
                 'red', sticky_seconds=4.0)
             self.plotter.render()
             return
+        finally:
+            iren.Enable()
 
         n_spans = sum(len(s) for s in spline_points_list)
         n_lm = len(landmarks)
@@ -4795,8 +5655,9 @@ class GeodesicSplineApp(MidpointShooterApp):
         The reuse path requires every span of the spline to be already
         rendered (cache hit + ≥2 points).  If even one span is missing
         we fall through to the recompute branch — mixing partial live
-        data with a fresh recompute would risk inconsistent secant
-        subdivisions across span boundaries.
+        data (which has full phase-1+2+3 fidelity) with a fresh
+        recompute (which doesn't) would write a polyline whose
+        density jumps inconsistently at span boundaries.
         """
         n_spans = len(nodes) if closed else len(nodes) - 1
         if n_spans == 0:
@@ -4907,11 +5768,17 @@ class GeodesicSplineApp(MidpointShooterApp):
         for _pd, actor in self._interp_cache.values():
             safe_remove_actor(self.plotter, actor)
         self._interp_cache.clear()
+        self._interp_origins_buf.clear()
+        self._interp_result_cache.clear()
         self._span_drag_state.clear()
         self._degraded_spans.clear()
         # All curve actors gone — hover cache must be rebuilt next time.
         self._hover_curve_dirty = True
         self._hover_curve_items_cached = []
+        # Didactic cache pins references to the active spline's last-span
+        # nodes; releasing it here ensures a structural change can't
+        # mistake a recycled object for a still-valid keyed entry.
+        self._didactic_geo_cache = None
 
     def _load_from_data(self, data: dict) -> int:
         """Replaces all splines with those described in *data*.
@@ -4993,6 +5860,19 @@ class GeodesicSplineApp(MidpointShooterApp):
         """
         self._work_mgr.shutdown()
         self._clear_all_curve_caches()
+
+        # PyVista ``add_key_event`` callbacks bind lambdas that close
+        # over ``self`` — they would keep the app alive after the
+        # window closes if left attached.  ``clear_key_event_callbacks``
+        # drops the whole map (no per-key tag API exists).  Same
+        # neighbour-friendly trade-off as the parent's
+        # ``RemoveObservers`` choice: this only fires at teardown.
+        try:
+            iren = self.plotter.iren
+            if iren is not None:
+                iren.clear_key_event_callbacks()
+        except (AttributeError, RuntimeError):
+            pass
 
         # Auxiliary single-instance actors — collected as one list so
         # the iteration is obvious and easy to extend if more are added
@@ -5219,7 +6099,17 @@ def _cli_main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
-        # Ensure workers are cleaned up even if init/load was interrupted.
+        # Ensure workers AND VTK resources are cleaned up even if
+        # init/load was interrupted.  ``app.cleanup()`` removes the
+        # interactor observers, master-clock timer, segment actors,
+        # and resets the global polygon-offset state — without this,
+        # programmatic reuse of the module (notebook, test harness)
+        # leaks observers and pins GPU memory.
+        if app is not None:
+            try:
+                app.cleanup()
+            except Exception as exc:  # noqa: BLE001 — teardown best-effort
+                log.debug("app cleanup: %s", exc)
         if app is not None and hasattr(app, '_work_mgr'):
             try:
                 app._work_mgr.shutdown()

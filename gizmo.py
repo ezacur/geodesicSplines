@@ -376,11 +376,14 @@ class SegmentData:
     def _update_symmetric_ray(self, primary_path: np.ndarray, geo: GeodesicMesh,
                               shoot_sign: float) -> tuple:
         """Shoot the opposite ray with exact same length and perfectly opposite tangent direction.
-        Returns (path, endpoint) for the opposite ray."""
+        Returns (path, endpoint) for the opposite ray.  Endpoint is a
+        copy, not a view into ``opp_path[-1]`` — protects callers from
+        accidental aliasing if ``opp_path`` is later mutated.
+        """
         v_tan = self._tangent_direction(primary_path, self.normal)
         total_l = float(np.sum(np.linalg.norm(np.diff(primary_path, axis=0), axis=1)))
         opp_path = geo.compute_shoot(self.origin, shoot_sign * v_tan, total_l, self.face_idx)
-        opp_end = opp_path[-1] if opp_path is not None else None
+        opp_end = np.array(opp_path[-1], dtype=float) if opp_path is not None else None
         return opp_path, opp_end
 
     def _fast_geodesic_from_origin(self, target: np.ndarray, geo: GeodesicMesh) -> np.ndarray | None:
@@ -408,7 +411,51 @@ class SegmentData:
                 "AGILE_DRAG solver failed: %s", exc)
             return np.array([self.origin, target])
 
-    def update_from_a(self, new_a: np.ndarray, geo: GeodesicMesh, exact: bool = False) -> None:
+    def _update_from_handle(self, new_pos: np.ndarray, primary: str,
+                            geo: GeodesicMesh, exact: bool) -> None:
+        """Shared body of ``update_from_a`` / ``update_from_b``.
+
+        *primary* is the literal string ``'a'`` or ``'b'`` and selects
+        which side is the user-driven (primary) ray; the opposite side
+        is reflected via ``_update_symmetric_ray``.  The dispatch is
+        explicit (``if primary == 'a'``) rather than ``getattr/setattr``
+        on stringly-named attributes — keeping the names static
+        preserves IDE autocomplete, mypy attribute checks, and rename
+        refactors.
+        """
+        assert primary in ('a', 'b'), primary
+        self.is_preview = AGILE_DRAG and not exact
+        if self._origin_cache is None:
+            self._origin_cache = geo.prepare_origin(self.origin)
+
+        if exact:
+            primary_path, _ = geo.compute_endpoint_from_origin(
+                self._origin_cache, new_pos)
+        else:
+            primary_path = self._fast_geodesic_from_origin(new_pos, geo)
+
+        if primary_path is None or len(primary_path) <= 1:
+            return
+
+        # Defensive copy of the endpoint — a view into primary_path
+        # would alias internal storage and break the SegmentData
+        # "all vectors owned" invariant.
+        primary_end = np.array(primary_path[-1], dtype=float)
+
+        if primary == 'a':
+            self.path_a = primary_path
+            self.p_a = primary_end
+            self.path_b, self.p_b = self._update_symmetric_ray(
+                self.path_a, geo, -1.0)
+        else:
+            self.path_b = primary_path
+            self.p_b = primary_end
+            self.path_a, self.p_a = self._update_symmetric_ray(
+                self.path_b, geo, -1.0)
+        self.update_local_v(geo)
+
+    def update_from_a(self, new_a: np.ndarray, geo: GeodesicMesh,
+                      exact: bool = False) -> None:
         """Expansion/Rotation: recalculate symmetry from handle A.
 
         Two-phase strategy:
@@ -417,38 +464,15 @@ class SegmentData:
         In both cases the opposite ray (B) is shot with identical arc-length
         and perfectly opposite tangent direction.
         """
-        self.is_preview = AGILE_DRAG and not exact
-        if self._origin_cache is None:
-            self._origin_cache = geo.prepare_origin(self.origin)
+        self._update_from_handle(new_a, 'a', geo, exact)
 
-        if exact:
-            self.path_a = geo.compute_endpoint_from_origin(self._origin_cache, new_a)
-        else:
-            self.path_a = self._fast_geodesic_from_origin(new_a, geo)
-
-        if self.path_a is not None and len(self.path_a) > 1:
-            self.p_a = self.path_a[-1]
-            self.path_b, self.p_b = self._update_symmetric_ray(self.path_a, geo, -1.0)
-            self.update_local_v(geo)
-
-    def update_from_b(self, new_b: np.ndarray, geo: GeodesicMesh, exact: bool = False) -> None:
+    def update_from_b(self, new_b: np.ndarray, geo: GeodesicMesh,
+                      exact: bool = False) -> None:
         """Expansion/Rotation: recalculate symmetry from handle B.
 
-        Two-phase strategy (see update_from_a docstring).
+        Two-phase strategy (see ``update_from_a`` docstring).
         """
-        self.is_preview = AGILE_DRAG and not exact
-        if self._origin_cache is None:
-            self._origin_cache = geo.prepare_origin(self.origin)
-
-        if exact:
-            self.path_b = geo.compute_endpoint_from_origin(self._origin_cache, new_b)
-        else:
-            self.path_b = self._fast_geodesic_from_origin(new_b, geo)
-
-        if self.path_b is not None and len(self.path_b) > 1:
-            self.p_b = self.path_b[-1]
-            self.path_a, self.p_a = self._update_symmetric_ray(self.path_b, geo, -1.0)
-            self.update_local_v(geo)
+        self._update_from_handle(new_b, 'b', geo, exact)
 
     def update_magnitude(self, cursor_3d: np.ndarray, drag_marker: str,
                          geo: GeodesicMesh, exact: bool = False) -> None:
@@ -542,9 +566,9 @@ class SegmentData:
             self.face_idx, fast_mode=fast)
 
         if self.path_b is not None and len(self.path_b) > 1:
-            self.p_b = self.path_b[-1]
+            self.p_b = np.array(self.path_b[-1], dtype=float)
         if self.path_a is not None and len(self.path_a) > 1:
-            self.p_a = self.path_a[-1]
+            self.p_a = np.array(self.path_a[-1], dtype=float)
 
         # Keep h_length consistent with the new magnitude.  We
         # deliberately do NOT call ``update_local_v`` here — that
@@ -566,15 +590,22 @@ class SegmentData:
         """
         self.is_preview = AGILE_DRAG and not exact
         self._origin_cache = None
-        self.origin, self.face_idx = new_p, new_fi
+        # Defensive copy of the incoming origin: callers (the editor's
+        # ``_pick_result_buf``) reuse a single ndarray across frames,
+        # so storing a view would mean ``self.origin`` silently follows
+        # the cursor on the very next mouse-move.
+        self.origin = np.array(new_p, dtype=float)
+        self.face_idx = int(new_fi)
         self._rotate_basis(geo.get_interpolated_normal(new_p, new_fi))
 
         v_3d = self.local_v[0] * self.u + self.local_v[1] * self.v
         fast = self.is_preview
         self.path_b = geo.compute_shoot(self.origin, v_3d, self.h_length, self.face_idx, fast_mode=fast)
         self.path_a = geo.compute_shoot(self.origin, -v_3d, self.h_length, self.face_idx, fast_mode=fast)
-        self.p_b = self.path_b[-1] if self.path_b is not None else None
-        self.p_a = self.path_a[-1] if self.path_a is not None else None
+        self.p_b = (np.array(self.path_b[-1], dtype=float)
+                    if self.path_b is not None else None)
+        self.p_a = (np.array(self.path_a[-1], dtype=float)
+                    if self.path_a is not None else None)
 
     def _rotate_basis(self, new_normal: np.ndarray) -> None:
         """Rodrigues rotation of (u, v, normal) basis to align with new_normal.
@@ -643,7 +674,10 @@ class SegmentData:
             else:
                 vec[0] = rx; vec[1] = ry; vec[2] = rz
 
-        self.normal = new_normal
+        # Defensive copy — ``geo.get_interpolated_normal`` returns a
+        # fresh ndarray today, but storing the alias would tie this
+        # segment's normal to whatever buffer the caller reuses next.
+        self.normal = np.array(new_normal, dtype=float)
 
 
 class GeodesicSegment(SegmentData):
@@ -697,15 +731,28 @@ class GeodesicSegment(SegmentData):
         mapper.SetRelativeCoincidentTopologyPointOffsetParameter(offset)
 
     def clear_actors(self, plotter: pv.Plotter) -> None:
-        """Removes all internal actors from the VTK scene."""
+        """Removes all internal actors from the VTK scene.
+
+        Also resets the arrow transform cache and the per-segment
+        arrow vertex buffers — without that, a subsequent
+        ``update_visuals`` on a fresh PolyData would skip the rotation
+        path (cache hit) and write *stale* geometry from before
+        teardown.
+        """
         if self._act_line is not None:
             safe_remove_actor(plotter, self._act_line)
         self._act_line = None
+        self._pd_line = None
         for tag in self._handle_act:
             if self._handle_act[tag] is not None:
                 safe_remove_actor(plotter, self._handle_act[tag])
             self._handle_pd[tag] = None
             self._handle_act[tag] = None
+        # Invalidate arrow transform cache + scratch buffers so the
+        # next render rebuilds geometry from scratch.
+        self._arrow_cache.clear()
+        self._arrow_buf_a = None
+        self._arrow_buf_b = None
 
     @classmethod
     def _ensure_cone_template(cls) -> tuple[np.ndarray, np.ndarray]:
@@ -716,26 +763,6 @@ class GeodesicSegment(SegmentData):
             cls._cone_tpl_pts = np.array(cone.points, dtype=float)
             cls._cone_tpl_faces = np.array(cone.faces)
         return cls._cone_tpl_pts, cls._cone_tpl_faces
-
-    @staticmethod
-    def _rotation_x_to(d: np.ndarray) -> np.ndarray:
-        """Rodrigues rotation matrix mapping ``(1, 0, 0)`` to unit vector *d*.
-
-        Used to orient the cone template along the geodesic tangent direction.
-        Handles the degenerate case where *d* ≈ ``(-1, 0, 0)`` (180° rotation).
-        """
-        c = float(d[0])  # cos(θ) = dot([1,0,0], d)
-        s = np.sqrt(d[1] * d[1] + d[2] * d[2])  # |cross([1,0,0], d)|
-        if s < 1e-10:
-            if c > 0:
-                return np.eye(3)
-            return np.diag(np.array([-1.0, 1.0, -1.0]))  # 180° around Y
-        inv_s = 1.0 / s
-        ky, kz = -d[2] * inv_s, d[1] * inv_s
-        K = np.array([[0.0, -kz,  ky],
-                      [kz,  0.0,  0.0],
-                      [-ky, 0.0,  0.0]])
-        return np.eye(3) + K * s + K @ K * (1.0 - c)
 
     def _update_handle_arrow(self, plotter, tag: str, pt, color) -> None:
         """Renders handle A or B as a directional cone aligned with the

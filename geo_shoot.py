@@ -216,7 +216,7 @@ import pyvista as pv
 import vtk
 
 from geodesics import GeodesicMesh
-from gizmo import GeodesicSegment, WARN_SHOOT, _color_rgb
+from gizmo import GeodesicSegment, WARN_SHOOT, _color_rgb, safe_remove_actor
 
 
 # Module-level logger.  No handler is attached here; geo_splines
@@ -642,6 +642,24 @@ class SurfaceCursor:
         self._circle_screen = screen_q.copy()
         self._circle_cid = cid
 
+    def cleanup(self) -> None:
+        """Detach the cursor's VTK actors from the plotter.
+
+        The cursor adds two actors (the projected circle and the
+        geodesic crosshair) in ``setup_actors``.  When the same
+        plotter is reused — notebook re-runs, automated tests that
+        create several ``MidpointShooterApp`` instances per process —
+        not removing them leaks one polydata + one actor per session.
+
+        Idempotent: subsequent calls are no-ops because the actor
+        attributes are set to ``None``.
+        """
+        for attr in ('_circle_actor', '_lines_actor'):
+            actor = getattr(self, attr, None)
+            if actor is not None:
+                safe_remove_actor(self._plotter, actor)
+                setattr(self, attr, None)
+
 
 class MidpointShooterApp:
     """
@@ -670,10 +688,19 @@ class MidpointShooterApp:
 
         # Pre-allocated pick result buffer (avoids np.array() per pick)
         self._pick_result_buf = np.empty(3, dtype=float)
+        # Camera position buffer reused by ``_is_marker_occluded`` —
+        # filled from a 3-tuple every call instead of allocating
+        # ``np.array(self.plotter.camera.position)`` each mouse-move.
+        self._cam_pos_buf = np.empty(3, dtype=float)
 
         # Lazy VTK helpers — explicit None avoids hasattr checks in hot paths.
         self._vtk_coord: vtk.vtkCoordinate | None = None
         self._saved_style: vtk.vtkInteractorStyle | None = None
+        # Master-clock timer + RenderEvent observer ids (assigned in run(),
+        # destroyed in cleanup()).  Tracking them by id is what lets us
+        # re-instantiate the app without leaking VTK observers.
+        self._master_timer_id: int | None = None
+        self._render_observer_tag: int | None = None
 
         self._setup_plotter()
         # Surface cursor — self-contained component (circle + crosshair)
@@ -701,7 +728,19 @@ class MidpointShooterApp:
             self.mesh = mesh_or_path
 
         self.geo = GeodesicMesh(self.mesh)
-        
+
+        # Re-bind ``self.mesh`` to the post-Morton synced PolyData
+        # produced by ``_build_locator``.  Otherwise rendering
+        # (``mesh_actor``, ``_edge_mesh``) would draw the *original*
+        # vertex/face order while the locator + ``self.geo.F`` carry
+        # the reordered one — vertex IDs returned by the locator no
+        # longer match the per-vertex scalars we might attach to
+        # ``self.mesh``.  ``GeodesicMesh._build_locator`` already
+        # creates a fresh PolyData synced to ``self.geo.V/F``; pick
+        # it up here so every consumer sees the same order.
+        if self.geo._pv_mesh is not None:
+            self.mesh = self.geo._pv_mesh
+
         # Diagonal for scale-dependent thresholds
         b = self.mesh.bounds
         self.diag = np.sqrt((b[1]-b[0])**2 + (b[3]-b[2])**2 + (b[5]-b[4])**2)
@@ -780,11 +819,29 @@ class MidpointShooterApp:
         self._ray_p0 = np.zeros(3, dtype=float)
         self._ray_p1 = np.zeros(3, dtype=float)
 
-        # Mouse events
+        # Mouse events.  Tags are captured so ``cleanup`` can call
+        # ``RemoveObserver(tag)`` per-observer instead of
+        # ``RemoveObservers(EventType)`` — the latter nukes ALL
+        # observers for that event, including any that PyVista or
+        # third-party plugins may have installed.  Storing the tags
+        # is the price of being a good neighbour.
         vtki = self.plotter.iren.interactor
-        vtki.AddObserver(vtk.vtkCommand.LeftButtonPressEvent, self._on_press, 1.0)
-        vtki.AddObserver(vtk.vtkCommand.LeftButtonReleaseEvent, self._on_release, 1.0)
-        vtki.AddObserver(vtk.vtkCommand.MouseMoveEvent, self._on_move, 1.0)
+        self._observer_tags: list[tuple[object, int]] = [
+            (vtki, vtki.AddObserver(
+                vtk.vtkCommand.LeftButtonPressEvent, self._on_press, 1.0)),
+            (vtki, vtki.AddObserver(
+                vtk.vtkCommand.LeftButtonReleaseEvent, self._on_release, 1.0)),
+            (vtki, vtki.AddObserver(
+                vtk.vtkCommand.MouseMoveEvent, self._on_move, 1.0)),
+            # When the cursor leaves the render window mid-drag, VTK
+            # never delivers ``LeftButtonReleaseEvent`` to this
+            # interactor — the user can drop the button outside the
+            # canvas and ``state.active_seg`` would stay latched, with
+            # ``_lock_camera`` still in effect.  Treat ``LeaveEvent``
+            # as a synthetic release so the drag terminates cleanly.
+            (vtki, vtki.AddObserver(
+                vtk.vtkCommand.LeaveEvent, self._on_leave_canvas, 1.0)),
+        ]
 
         self.plotter.add_key_event('e', self._on_export)
         # Delete key removed — node deletion requires spline-aware reconnection
@@ -797,8 +854,10 @@ class MidpointShooterApp:
         ignores timers created before ``Start()``.
         """
         self._debounce_sec = 0.15
-        self.plotter.iren.interactor.AddObserver(
-            vtk.vtkCommand.TimerEvent, self._on_poll_timer, 1.0)
+        vtki = self.plotter.iren.interactor
+        self._observer_tags.append(
+            (vtki, vtki.AddObserver(
+                vtk.vtkCommand.TimerEvent, self._on_poll_timer, 1.0)))
 
     @staticmethod
     def _print_help() -> None:
@@ -821,30 +880,113 @@ class MidpointShooterApp:
         mapper.SetRelativeCoincidentTopologyLineOffsetParameters(0, offset)
         mapper.SetRelativeCoincidentTopologyPointOffsetParameter(offset)
 
+    def _create_aux_actor(
+            self, *, kind: str, color: str, depth: float,
+            point_size: float = 1.0, line_width: float = 1.0,
+            opacity: float = 1.0, name: str | None = None,
+            initial_pts: np.ndarray | None = None,
+    ) -> tuple[pv.PolyData, object]:
+        """Factory for invisible, depth-prioritised feedback actors.
+
+        Centralises the very repetitive "create a PolyData, hand it
+        to ``add_mesh``, set depth priority, hide it" pattern used
+        by stitch / hover / snap / coord-preview / didactic actors.
+        Each call site shrinks from ~5 lines of boilerplate to one.
+
+        Parameters
+        ----------
+        kind : ``'point'`` or ``'line'``
+            Selects between ``render_points_as_spheres`` (with
+            *point_size*) and a plain polyline (with *line_width*).
+        color : str
+            Any colour string PyVista accepts ("white", "#888888", ...).
+        depth : float
+            Z-buffer offset passed to ``_set_depth_priority``.  More
+            negative = drawn closer to the camera.
+        point_size, line_width : float
+            Honoured per *kind*; the unused one is ignored.
+        opacity : float
+            Alpha multiplier (default 1.0).
+        name : str | None
+            Optional plotter-side name for debug introspection.
+        initial_pts : (N, 3) ndarray | None
+            Initial point cloud.  ``None`` defaults to a single
+            (0, 0, 0) point for ``'point'`` actors (PyVista requires
+            at least one) or an empty PolyData for ``'line'``
+            actors (line consumers tolerate empty).
+
+        Returns
+        -------
+        ``(polydata, actor)`` — both already added to the plotter
+        and starting hidden.
+        """
+        if initial_pts is not None:
+            pd = pv.PolyData(np.asarray(initial_pts, dtype=float))
+        elif kind == 'point':
+            pd = pv.PolyData(np.zeros((1, 3), dtype=float))
+        else:
+            pd = pv.PolyData()
+
+        if kind == 'point':
+            actor = self.plotter.add_mesh(
+                pd, color=color, point_size=point_size, opacity=opacity,
+                render_points_as_spheres=True,
+                lighting=False, pickable=False, name=name,
+            )
+        elif kind == 'line':
+            actor = self.plotter.add_mesh(
+                pd, color=color, line_width=line_width, opacity=opacity,
+                lighting=False, pickable=False, name=name,
+            )
+        else:
+            raise ValueError(f"_create_aux_actor: unknown kind {kind!r}")
+
+        self._set_depth_priority(actor, depth)
+        actor.SetVisibility(False)
+        return pd, actor
+
     def _is_marker_occluded(self, marker_pos: np.ndarray) -> bool:
         """Returns True if *marker_pos* is occluded by the mesh from the camera view.
 
         Performs a ray-cast from the camera to the marker. If the first hit on
         the mesh is significantly closer than the marker itself, it is
         considered occluded.
+
+        Hot path: runs on every mouse-move that hovers a marker.
+        Inlined to avoid ``np.array`` and ``np.linalg.norm``
+        allocations — the previous implementation built two fresh
+        3-vectors and called norm twice per call.
         """
-        cam_pos = np.array(self.plotter.camera.position)
+        cam_pos = self._cam_pos_buf
+        cx, cy, cz = self.plotter.camera.position
+        cam_pos[0] = cx; cam_pos[1] = cy; cam_pos[2] = cz
         # Ray cast from camera to marker
         hit = self.geo.locator.IntersectWithLine(
             cam_pos, marker_pos, 0.0001,
             self._pick_t, self._pick_pt, self._pick_pcoords,
             self._pick_sub_id, self._pick_cell_id, self._pick_cell
         )
-        if hit:
-            # First hit position
-            hit_pt = np.array([self._pick_pt[0], self._pick_pt[1], self._pick_pt[2]])
-            # dist_hit and dist_marker from camera
-            dist_hit = np.linalg.norm(hit_pt - cam_pos)
-            dist_marker = np.linalg.norm(marker_pos - cam_pos)
-            # Threshold: 1e-4 * mesh diagonal to avoid self-occlusion artifacts.
-            if dist_hit < dist_marker - self.diag * 1e-4:
-                return True
-        return False
+        if not hit:
+            return False
+        # Inline squared-distance comparison.  We need an absolute
+        # threshold (``diag * 1e-4``) so squared distances must be
+        # compared against an adjusted bound:
+        #   dist_hit < dist_marker - eps
+        #   ⇔ sqrt(d2_hit) < sqrt(d2_marker) - eps
+        # Avoiding two sqrt calls and the temp arrays of the old
+        # implementation; the algebra below is the equivalent
+        # squared-form check, exact for non-negative arguments.
+        hpx = self._pick_pt[0]; hpy = self._pick_pt[1]; hpz = self._pick_pt[2]
+        dhx = hpx - cx; dhy = hpy - cy; dhz = hpz - cz
+        dmx = marker_pos[0] - cx; dmy = marker_pos[1] - cy; dmz = marker_pos[2] - cz
+        d2_hit = dhx*dhx + dhy*dhy + dhz*dhz
+        d2_marker = dmx*dmx + dmy*dmy + dmz*dmz
+        eps = self.diag * 1e-4
+        # ``d_hit < d_marker - eps`` ⇔
+        # ``d_hit + eps < d_marker`` ⇔
+        # ``(d_hit + eps)² < d_marker²``  (both sides ≥ 0).
+        d_hit = d2_hit ** 0.5
+        return (d_hit + eps) ** 2 < d2_marker
 
     # --- UI Helpers ---
 
@@ -1104,40 +1246,84 @@ class MidpointShooterApp:
         new_s.update_local_v(self.geo)
         new_s.update_visuals(self.plotter)
 
-    def _try_hit_marker(self, x: int, y: int) -> bool:
-        """Hit-test all segment handles against screen position (x, y).
+    def _closest_marker_under_cursor(
+            self, x: int, y: int,
+            allowed_tags: tuple[str, ...] | None = None,
+    ) -> tuple['GeodesicSegment', str] | None:
+        """Pure hit-test against the hover cache — returns ``(seg, tag)``
+        for the nearest marker under ``(x, y)`` that is within
+        ``PICK_TOLERANCE_SQ`` and not occluded by the mesh; ``None``
+        otherwise.
 
-        Uses the pre-built ``_hover_pts_3d`` cache for vectorized
-        screen-projection and squared-distance comparison — no per-marker
-        VTK coordinate calls.
+        No side-effects: does not lock the camera, mutate session
+        state, or repaint actors.  Used as the shared early-stage of
+        ``_try_hit_marker`` (drag-start), the spline subclass override
+        (drag-start with active-spline switch), and ``_hit_test_marker``
+        (right-click coord-edit dialog filtered to ``'p'`` markers).
 
-        Returns True and initiates drag if a handle is within
-        ``PICK_TOLERANCE`` pixels; False otherwise.  Subclasses may
-        override to add spline-index switching or other pre-drag logic.
+        ``allowed_tags`` filters by marker kind (``'p'`` / ``'a'`` /
+        ``'b'``); ``None`` disables the filter.
         """
         if self._hover_dirty:
             self._rebuild_hover_cache()
         if self._hover_n == 0:
-            return False
+            return None
         pts_2d = self._to_screen_batch(self._hover_pts_3d[:self._hover_n])
-        best, best_sq = _hover_argmin_sq(pts_2d, self._hover_n,
-                                         float(x), float(y))
+        best, best_sq = _hover_argmin_sq(
+            pts_2d, self._hover_n, float(x), float(y))
         if best_sq >= self.cfg.PICK_TOLERANCE_SQ:
-            return False
-        
+            return None
         # Occlusion check: skip if hidden by mesh
         if self._is_marker_occluded(self._hover_pts_3d[best]):
-            return False
-
+            return None
         seg, tag = self._hover_tags[best]
-        self.state.active_seg = seg
-        self.state.drag_marker = tag
-        seg.is_active = True
-        seg.is_dragging = True
+        if allowed_tags is not None and tag not in allowed_tags:
+            return None
+        return seg, tag
+
+    def _try_hit_marker(self, x: int, y: int) -> bool:
+        """Hit-test all segment handles at screen ``(x, y)`` and start
+        a drag if one is within ``PICK_TOLERANCE`` pixels and not
+        occluded.
+
+        The actual hit-test is delegated to
+        ``_closest_marker_under_cursor`` (vectorised screen projection
+        + squared-distance + occlusion check).  This method then layers
+        the drag-start side effects: lock the camera, populate
+        ``state.active_seg`` / ``state.drag_marker``, flip the segment
+        flags, paint the HUD, and render.  Any exception in that
+        post-lock setup unwinds state and unlocks the camera before
+        re-raising — without that the user would be stranded with a
+        frozen viewport.
+
+        Returns True when a drag was initiated, False otherwise.
+        Subclasses may override to add spline-index switching or
+        other pre-drag logic (see ``GeodesicSplineApp._try_hit_marker``).
+        """
+        hit = self._closest_marker_under_cursor(x, y)
+        if hit is None:
+            return False
+        seg, tag = hit
+        # Lock camera FIRST so the rest of the setup can fail safely:
+        # any exception below is caught and rolls back state + camera
+        # before re-raising — without that the user would be left with
+        # a frozen camera and no way to release.
         self._lock_camera()
-        self._set_hud(f"DRAGGING {tag.upper()}", 'gold')
-        seg.update_visuals(self.plotter)
-        self.plotter.render()
+        try:
+            self.state.active_seg = seg
+            self.state.drag_marker = tag
+            seg.is_active = True
+            seg.is_dragging = True
+            self._set_hud(f"DRAGGING {tag.upper()}", 'gold')
+            seg.update_visuals(self.plotter)
+            self.plotter.render()
+        except Exception:  # noqa: BLE001 — must always reach unlock
+            self.state.active_seg = None
+            self.state.drag_marker = None
+            seg.is_active = False
+            seg.is_dragging = False
+            self._unlock_camera()
+            raise
         return True
 
     def _on_press(self, obj, event) -> None:
@@ -1228,8 +1414,12 @@ class MidpointShooterApp:
             now = time.perf_counter()
             x, y = self.plotter.iren.get_event_position()
 
-            # Pixel culling
-            if self.state._last_mouse_px is not None:
+            # Pixel culling — skip during a drag so slow / sub-pixel
+            # drags still update the segment.  Without this guard a
+            # user dragging at &lt;1 px/frame sees the segment freeze
+            # mid-gesture.
+            if (self.state.active_seg is None
+                    and self.state._last_mouse_px is not None):
                 dx = x - self.state._last_mouse_px[0]
                 dy = y - self.state._last_mouse_px[1]
                 if dx*dx + dy*dy < 4.0:  # 2px threshold, squared
@@ -1402,6 +1592,23 @@ class MidpointShooterApp:
             self._unlock_camera()
             self.plotter.render()
 
+    def _on_leave_canvas(self, obj, event) -> None:
+        """Synthetic release when the cursor leaves the render window.
+
+        VTK does not deliver ``LeftButtonReleaseEvent`` to the
+        interactor when the user drops the button outside the canvas,
+        which would leave ``state.active_seg`` latched and the camera
+        locked until the cursor re-enters AND the user clicks again.
+        Treating ``LeaveEvent`` as a release terminates the drag
+        cleanly and unlocks the camera.
+
+        No-op when no drag is in flight — VTK fires ``LeaveEvent``
+        every time the cursor crosses the canvas border, dragging or
+        not, so the early-return in ``_on_release`` keeps this cheap.
+        """
+        if self.state.active_seg is not None:
+            self._on_release(obj, event)
+
     def _finalize_release(self, seg: GeodesicSegment) -> None:
         """Post-drag finalization hook.  Override for subclass-specific behavior
         (e.g. span recomputation in ``GeodesicSplineApp``).
@@ -1414,21 +1621,41 @@ class MidpointShooterApp:
         self._set_hud("FINISHED", 'lime')
 
     def _lock_camera(self) -> None:
-        """Swaps to a bare vtkInteractorStyle that blocks camera interaction."""
+        """Swaps to a bare vtkInteractorStyle that blocks camera interaction.
+
+        Idempotent: a second call while already locked returns silently
+        rather than overwriting ``_saved_style`` with the no-op style
+        and losing the original.  That used to happen when an exception
+        in the press handler skipped ``_unlock_camera`` and the next
+        drag fired a fresh ``_lock_camera``.
+        """
+        if self._saved_style is not None:
+            return
         vtki = self.plotter.iren.interactor
         self._saved_style = vtki.GetInteractorStyle()
         noop_style = vtk.vtkInteractorStyle()
         noop_style.AddObserver(vtk.vtkCommand.CharEvent, lambda o, e: None, 100.0)
         vtki.SetInteractorStyle(noop_style)
+        self._noop_style = noop_style
 
     def _unlock_camera(self) -> None:
-        """Restores saved interactor style, re-blocking CharEvent."""
+        """Restores saved interactor style, re-blocking CharEvent.
+
+        Tear down the no-op style explicitly so its CharEvent observer
+        does not linger inside VTK while the original style is back in
+        control.
+        """
         vtki = self.plotter.iren.interactor
         if self._saved_style is not None:
             vtki.SetInteractorStyle(self._saved_style)
             self._saved_style.RemoveObservers("CharEvent")
             self._saved_style.AddObserver(
                 vtk.vtkCommand.CharEvent, lambda obj, ev: None, 100.0)
+            self._saved_style = None
+            noop = getattr(self, '_noop_style', None)
+            if noop is not None:
+                noop.RemoveObservers("CharEvent")
+                self._noop_style = None
 
     def _toggle_wireframe(self) -> None:
         """Toggles wireframe overlay with 'w'."""
@@ -1499,6 +1726,8 @@ class MidpointShooterApp:
 
         Static resources (mesh actor, cursor, HUD, slider) are owned by
         the Plotter and cleaned up by ``plotter.close()``.
+
+        Idempotent — safe to call multiple times.
         """
         # Clear all geodesic segment actors
         for seg in self.segments:
@@ -1511,6 +1740,17 @@ class MidpointShooterApp:
                 log.debug("seg.clear_actors during cleanup: %s", exc)
         self.segments.clear()
 
+        # Detach the surface cursor's actors (circle + crosshair).
+        # See ``SurfaceCursor.cleanup`` for the rationale — this matters
+        # for repeated-instance flows (notebooks, tests) where the
+        # plotter is reused across sessions.
+        cursor = getattr(self, '_cursor', None)
+        if cursor is not None:
+            try:
+                cursor.cleanup()
+            except (AttributeError, RuntimeError) as exc:
+                log.debug("cursor.cleanup during cleanup: %s", exc)
+
         # Clear pending debounces
         self.state.pending_debounces.clear()
 
@@ -1520,10 +1760,36 @@ class MidpointShooterApp:
         try:
             vtki = self.plotter.iren.interactor
             if vtki is not None:
-                vtki.RemoveObservers(vtk.vtkCommand.LeftButtonPressEvent)
-                vtki.RemoveObservers(vtk.vtkCommand.LeftButtonReleaseEvent)
-                vtki.RemoveObservers(vtk.vtkCommand.MouseMoveEvent)
-                vtki.RemoveObservers(vtk.vtkCommand.TimerEvent)
+                # Per-tag removal (vs ``RemoveObservers(EventType)``)
+                # so we only detach OUR observers and leave any
+                # PyVista / plugin observers on the same events
+                # untouched.
+                for target, tag in getattr(self, '_observer_tags', []):
+                    try:
+                        target.RemoveObserver(tag)
+                    except (AttributeError, RuntimeError):
+                        pass
+                self._observer_tags = []
+                # Master-clock repeating timer created in run() —
+                # destroying it stops the heartbeat that otherwise
+                # keeps firing _on_poll_timer (and pinning self) when
+                # the same interactor is reused for another session.
+                if self._master_timer_id is not None:
+                    try:
+                        vtki.DestroyTimer(self._master_timer_id)
+                    except (AttributeError, RuntimeError):
+                        pass
+                    self._master_timer_id = None
+            # RenderEvent observer attached in run() — remove by tag if
+            # it never fired (window closed before first render).
+            if self._render_observer_tag is not None:
+                try:
+                    rw = self.plotter.iren.interactor.GetRenderWindow()
+                    if rw is not None:
+                        rw.RemoveObserver(self._render_observer_tag)
+                except (AttributeError, RuntimeError):
+                    pass
+                self._render_observer_tag = None
         except (AttributeError, RuntimeError):
             pass
 
@@ -1539,10 +1805,32 @@ class MidpointShooterApp:
         See module docstring 'Master Clock pattern' for rationale.
         """
         def _start_master_clock(obj, event):
-            obj.RemoveObservers("RenderEvent")  # one-shot
-            self.plotter.iren.interactor.CreateRepeatingTimer(50)
-        self.plotter.iren.interactor.GetRenderWindow().AddObserver(
-            "RenderEvent", _start_master_clock)
+            # Self-remove (one-shot) using the captured tag so we don't
+            # nuke any other RenderEvent observer that PyVista or a
+            # plugin may have attached.
+            tag = getattr(self, '_render_observer_tag', None)
+            if tag is not None:
+                obj.RemoveObserver(tag)
+                self._render_observer_tag = None
+            try:
+                self._master_timer_id = (
+                    self.plotter.iren.interactor.CreateRepeatingTimer(50))
+            except Exception as exc:  # noqa: BLE001 — VTK timer init is fragile
+                # CreateRepeatingTimer can refuse if the iren is not yet
+                # initialized for some platforms.  Re-attach the
+                # RenderEvent observer so the next render gets another
+                # shot — without this the master clock never fires
+                # and debounce / orange polling silently break.
+                log.warning(
+                    "master clock CreateRepeatingTimer failed (%s); "
+                    "will retry on next render", exc)
+                self._master_timer_id = None
+                self._render_observer_tag = (
+                    self.plotter.iren.interactor.GetRenderWindow()
+                    .AddObserver("RenderEvent", _start_master_clock))
+        self._render_observer_tag = (
+            self.plotter.iren.interactor.GetRenderWindow().AddObserver(
+                "RenderEvent", _start_master_clock))
         try:
             self.plotter.show()
         except KeyboardInterrupt:

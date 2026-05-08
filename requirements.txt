@@ -12,11 +12,23 @@
 # on first install.  On Windows, MSVC 2022 Build Tools is the most
 # reliable path.  On Linux, gcc >= 9.
 # See: https://github.com/nmwsharp/potpourri3d
+#
+# This file installs the EDITOR runtime.  Numba is the optional JIT
+# accelerator (~50-2000x speedup on hot paths) and is canonically
+# declared as the ``jit`` extra in pyproject.toml; install it with:
+#
+#   pip install -r requirements.txt   # plain editor
+#   pip install -e .[jit]             # add Numba (recommended)
+#   pip install -e .[jit,dev]         # contributor setup
 
 numpy>=1.24,<3
 scipy>=1.10
 pyvista>=0.42
 vtk>=9.2
 potpourri3d>=1.2
-numba>=0.58          # optional — @njit becomes a no-op if missing,
-                     #            but all hot paths will be ~50-2000x slower
+
+# Numba is the optional JIT accelerator (``@njit`` becomes a no-op
+# if missing, but hot paths run 50-2000x slower).  Install via the
+# ``[jit]`` extra in pyproject.toml — that is the canonical
+# declaration, kept out of this file so we DO exercise the no-Numba
+# code path on any plain ``pip install -r requirements.txt``.

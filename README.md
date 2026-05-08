@@ -59,6 +59,8 @@ pip install -r requirements.txt
 
 # No argument -> opens fandisk.obj if present in the current directory,
 # otherwise falls back to the in-memory icosahedron demo mesh.
+# (fandisk.obj is bundled with the repo as a sample mesh — see the
+#  end of this file for attribution.)
 python geo_splines.py
 
 # Open a specific mesh file (any VTK-supported format: .obj, .ply, .stl, ...)
@@ -295,11 +297,75 @@ sequenceDiagram
 - `GEO_SAMPLES = 33` (= 2^5 + 1) — 5 clean binary-subdivision levels.
 - **Progressive hierarchical refinement**: the worker computes points
   in midpoint → quarter → eighth → ... order (not t=0 to t=1).  The
-  main thread stores results in a sparse buffer pre-seeded with the
+  main thread maintains a t-sorted buffer pre-seeded with the
   two node origins, so the curve is visible from submission-time as
   a 2-point stub that **refines in detail** rather than growing from
   one end.  User sees the overall shape in ~150 ms instead of waiting
   several seconds for a snake to traverse the span.
+
+#### Three-phase worker pipeline
+
+After Phase 1 (the canonical 33 samples) the worker runs two extra
+phases so the rendered orange polyline matches the underlying cascade
+mathematically — fixing the historical "orange polyline drifts away
+from the didactic point" mismatch that the legacy
+`subdivide_secant_chords` post-pass produced (it inserted points
+projected to the surface, not points on the cascade).
+
+| Phase | Purpose | Output |
+|---|---|---|
+| **1 — Canonical samples** | Evaluate the de Casteljau cascade at the 33 grid t-values, hierarchical order. | `('point', span_key, t, point)` per sample. |
+| **2 — Cascade densification** | For every consecutive sample pair whose chord deviates from the true curve beyond `ORANGE_SUBDIV_TOL_FACTOR × mean_edge`, insert a fresh cascade evaluation at the midpoint t. Recursive up to `ORANGE_SUBDIV_MAX_DEPTH`. Each insertion is sent immediately, so the curve refines progressively in problem regions. | More `('point', span_key, t, point)` messages, t-sorted on the parent via bisect. |
+| **3 — Geodesic chord-bridging** | Connect every consecutive sample pair with an exact mesh geodesic via `short_geodesic` (fast path: adjacent triangles, ~5 µs) or `compute_endpoint_local` (fallback, ~25 ms). Result polyline hugs the surface even between samples — no straight 3-D chords cutting through ridges. | One `('chord_geo', span_key, polyline)` message; replaces the t-sorted chord polyline as the rendering source. |
+
+Two deviation criteria for Phase 2 (selectable via
+`SplineConfig.ORANGE_DEVIATION_MODE`):
+
+| Mode | Cost per pair | Decision rule |
+|---|---|---|
+| `'cascade'` (default) | One full cascade evaluation per pair (~75 ms) | Split if `‖chord_midpoint − cascade_eval(t_mid)‖ > tol` — measures deviation from the *true* curve.  Always pays the cascade cost even on pairs that won't split. |
+| `'surface'` | One batched `project_smooth_batch` call (~µs per pair) + cascade evaluation only on pairs flagged for splitting | Split if `‖chord_midpoint − project(chord_midpoint)‖ > tol` — only catches mesh-piercing chords, but cheap.  Inserted point is still the cascade evaluation, so geometric quality is identical between modes; only the *decision* of whether to split differs. |
+
+`'cascade'` is the honest metric (the curve is the truth) and is the
+default.  `'surface'` exists as a faster fallback for users with
+many splines on dense meshes who find `'cascade'` too slow.  Disable
+chord-bridging entirely with `ORANGE_CHORD_BRIDGING = False` if you
+want straight chords between samples (rarely useful, kept as an
+escape hatch).
+
+#### `short_geodesic` — fast path for adjacent triangles
+
+Phase 3 connects ~30-100 sample pairs per span by exact geodesic.
+Calling `compute_endpoint_local` (~25 ms) for every pair would dominate
+the worker's cost.  `GeodesicMesh.short_geodesic` is a fast specialised
+path that handles two cases without invoking the edge-flip solver:
+
+- **Same triangle** → straight 3-D segment (the triangle is flat,
+  geodesic is the chord).  Returns `[p0, p1]`.
+- **Adjacent triangles (sharing an edge)** → unfold both faces into a
+  common plane around the shared edge, find the optimal crossing via
+  the classic mirror reflection trick, validate that the crossing
+  falls strictly inside the shared edge with margin
+  `max(1e-7, 0.001 × edge_length)`.  Returns `[p0, q, p1]` in ~5 µs.
+- **Anything else** (non-adjacent faces, vertex-only adjacency,
+  degenerate edge, crossing on/near a shared-edge vertex) → returns
+  `None`; the worker falls back to `compute_endpoint_local`.
+
+The validation margin is critical: a crossing that lands on a shared-
+edge vertex means the optimal geodesic actually wraps around the
+vertex's curvature cone — the flat unfolding is not valid in that
+case, and the result would be wrong.  Bouncing to the full solver
+preserves correctness.
+
+#### Reuse for VTK export (key `v`)
+
+The cached orange polyline (post-phase-3) is the rendering source of
+truth.  When `EXPORT_VTK_SAMPLES >= GEO_SAMPLES` and no workers are
+in flight, the `v` key reuses those polylines verbatim — the export
+is bit-for-bit identical to what is on screen, with no recomputation.
+Lower export sample counts trigger a fresh `compute_orange` with no
+densification (useful for ultra-light exports of coarse landmark
+curves; the CLI `spline_export.py` does the same).
 
 #### Progress feedback
 
@@ -321,21 +387,30 @@ signal dominates any progress indicator.
 #### Didactic scaffold (key `d`)
 
 A toggleable visualisation of the de Casteljau cascade for the
-active spline's **last span** at parameter `t = 0.5`.  Useful for
-teaching, debugging, or just understanding what the orange curve is
-doing under the hood.  Pressing `d` draws four dark-green geodesic
-auxiliary lines:
+active spline's **last span** at a slider-controlled parameter `t`
+(default `0.5`, range `[0, 1]`).  Useful for teaching, debugging, or
+just understanding what the orange curve is doing under the hood.
+
+A horizontal slider appears in the bottom-left when the scaffold is
+toggled on; dragging it sweeps `t` across the span and the four
+auxiliary lines reshape live (each tick re-runs the four
+``compute_endpoint_local`` calls, ~75-125 ms — feels live on modern
+hardware).  When the scaffold is toggled off the slider is disabled
+along with the lines.  Toggling it back on remembers the last `t`.
+
+Pressing `d` draws four dark-green geodesic auxiliary lines:
 
 | Line | Endpoints | Stage of the cascade |
 |---|---|---|
 | `path_12`    | `H_out ↔ H_in`   | Level 1: middle segment between the two handles. |
 | `path_c0`    | `b01 ↔ b12`      | Level 2: first chord between consecutive level-1 midpoints. |
 | `path_c1`    | `b12 ↔ b23`      | Level 2: second chord. |
-| `path_final` | `c0 ↔ c1`        | Level 3: collapses to the orange curve sample at `t = 0.5`. |
+| `path_final` | `c0 ↔ c1`        | Level 3: collapses to the orange curve sample at the chosen `t`.  A small dark-green sphere is rendered at `geodesic_lerp(path_final, t)` so the collapse point is visually unambiguous — by construction it lies exactly on the orange curve. |
 
-The intermediate points themselves (`b01`, `b12`, `b23`, `c0`, `c1`)
-are computed via geodesic_lerp on the level-N paths but not drawn
-as markers — the lines alone make the structure readable.
+The intermediate points (`b01`, `b12`, `b23`, `c0`, `c1`) on levels
+1-2 are computed via geodesic_lerp on the level-N paths but not
+drawn as markers — only the level-3 collapse point gets its own
+sphere, since that is what the cascade is converging to.
 
 "Last span" means:
 - **Open spline** of N nodes: span between `nodes[N-2]` and `nodes[N-1]`.
@@ -343,12 +418,15 @@ as markers — the lines alone make the structure readable.
 - Active spline with **<2 nodes**: a brief HUD message
   (`DIDACTIC: no last span`) and nothing is drawn.
 
-**On-demand semantics**: while the scaffold is invisible, no compute
-runs.  Toggling ON triggers a synchronous rebuild (~75-125 ms — four
-``compute_endpoint_local`` calls).  Drag invalidates the cache and
-hides the actors so the per-frame cost stays zero.  Consolidation
-(``_recompute_spans`` with ``is_dragging=False``) re-renders the
-scaffold if it is currently visible.
+**Refresh policy**:
+
+| State | Cost | Method |
+|---|---|---|
+| Invisible | 0 | Skipped entirely |
+| Toggled on | ~75-125 ms | ``_compute_didactic(fast=False)`` — exact geodesics via ``compute_endpoint_local`` |
+| Slider drag | ~75-125 ms / tick | ``_compute_didactic(fast=False)`` — exact geodesics |
+| Node drag | ~5-10 ms / frame | ``_compute_didactic(fast=True)`` — Euclidean line + ``project_smooth_batch`` (same trick blue uses for ``path_12`` during drag) |
+| Drag release | ~75-125 ms | ``_compute_didactic(fast=False)`` — re-renders with exact geodesic; the visible snap from approximation to exact is itself didactic |
 
 Opacity tracks the global handle opacity (cycled with `t`), so the
 scaffold fades together with the node markers and tangent arrows.
@@ -474,6 +552,33 @@ points nudged toward their face centroids (nudge fraction relative to
 the shortest edge, same clamping as above). Only if the retry also
 fails, falls back to vertex-snapped geodesic via the pre-built solver.
 
+### Short Geodesic (`short_geodesic`)
+
+When two points lie in the same triangle or in two edge-adjacent
+triangles, the geodesic between them is either a straight 3-D segment
+(same triangle, since the triangle is flat) or a unique two-segment
+polyline through one specific point on the shared edge (adjacent
+triangles).  No edge-flip iteration, no submesh extraction, no solver
+invocation — just a 2-D mirror-reflection construction in the plane of
+the unfolded triangle pair (~5 µs).
+
+This is the fast path used by the orange worker's phase-3 chord-
+bridging.  After the cascade has produced ~30-100 t-sorted samples
+along a span, consecutive samples are typically very close on the
+mesh and frequently land in adjacent triangles (or the same one),
+so `short_geodesic` succeeds for the majority of pairs and the
+worker only pays the full `compute_endpoint_local` cost (~25 ms) on
+the few pairs that span more than two triangles or wrap around a
+vertex.
+
+The validation step is the load-bearing part of the contract: if the
+optimal crossing falls within `max(1e-7, 0.001 × edge_length)` of
+either shared-edge vertex, `short_geodesic` returns `None` and the
+caller falls back.  A near-vertex crossing means the true optimal
+geodesic actually wraps around the vertex's cone of curvature — the
+flat-plane unfolding is no longer valid there, so the result would
+be wrong.
+
 ### Local Submesh Solver (`compute_endpoint_local`)
 
 `compute_endpoint_local` is the workhorse geodesic solver for all
@@ -494,6 +599,41 @@ the two endpoints (~5-25 ms).
   to the new handle position (~40× faster than global solver).
 - **CLI export** (`spline_export.py`): all geodesic calculations for
   blue and orange curves.
+
+#### Submesh Subdivision (kwarg `submesh_subdiv`, default 0)
+
+`compute_endpoint_local` accepts an optional `submesh_subdiv=N`
+that runs **N rounds of 1-to-4 Loop subdivision** on the extracted
+submesh BEFORE the solver constructs.  Each round multiplies the
+face count by 4.
+
+**Why this exists.**  `EdgeFlipGeodesicSolver` (Sharp & Crane 2020)
+is exact in the discrete-geodesic sense: it returns the shortest
+path along edges of the **input** triangulation.  On a coarse
+mesh, "shortest path along edges" can differ noticeably from the
+geodesic of the underlying smooth surface — and worse, between
+two cascade samples the discrete geodesic can flip-flop between
+two near-equal-length edge chains, producing visible kinks
+(~cm-scale jumps) in the rendered orange curve.
+
+Subdividing the submesh once gives the solver finer edges to work
+with: the discrete geodesic converges to the smooth-surface
+geodesic, the flip-flop disappears, and consecutive cascade
+samples vary continuously.  Verified empirically on fandisk: a
+4.5 cm jump between two samples drops to **0.5 mm** at level 1.
+Level 2 gives the same answer (already converged) at higher cost,
+sometimes triggers solver degeneracy, and is not recommended.
+
+**Cost.**  ~4× per level (a 25 ms call → ~100 ms at level 1).
+The orange worker runs in background processes so this does not
+block the UI; the visible curve just appears a few seconds later.
+
+**Used by.**  `ORANGE_SUBMESH_SUBDIV = 1` in `SplineConfig` (default)
+threads `submesh_subdiv=1` through every `compute_endpoint_local`
+call inside the orange worker AND the didactic scaffold (so the
+collapse point still lands exactly on the rendered curve).  Blue
+consolidation and handle drag stay at `submesh_subdiv=0` for
+latency.
 
 #### Projected-Line Pre-filter
 
@@ -523,29 +663,38 @@ Why this beats a spherical / bounding-box filter:
 - **Scales to any topology**: no assumptions about where the geodesic
   "should" be — the projection finds it automatically.
 
-#### Adaptive Retry
+#### Three-phase fallback
 
-The submesh is expanded by increasing topological rings on each
-failure (boundary touch or solver exception):
+When phase A's tight 3-ring submesh fails (boundary touch or solver
+exception), the search escalates through two more phases.  Each
+phase reuses the BFS state of the previous one, so depth N costs
+"N rings of advance" rather than "restart from the seed":
 
-| Attempt | k_rings | Submesh size (typ.) |
-|---|---|---|
-| 1 | 3 | seed + 3 rings (tight) |
-| 2 | 7 | seed + 7 rings |
-| 3 | 15 | |
-| 4 | 30 | |
-| 5 | 60 | last local attempt |
+| Phase | Strategy | Submesh size (typ.) | Use case |
+|---|---|---|---|
+| **A** | Euclidean tube + 3 rings | seed + 3 rings (tight) | Convex / mildly-curved geometry — the common case |
+| **B** | Dijkstra corridor + 3 rings | corridor + 3 rings | U-shape / horseshoe where the Euclidean line projects onto the wrong wall |
+| **C** | BFS expansion 15 → 30 → 60 rings | progressively wider | Pathological cases where neither A nor B converges |
 
-After all 5 attempts fail, falls back to `compute_endpoint` on the
-full mesh.  Each retry costs ~5-15 ms (rebuild submesh + solver); far
-cheaper than the ~300 ms global solver, so the retry strategy turns
-what used to be a 300 ms stutter into a 30-60 ms blip in rare edge
-cases.
+Phase B is activated only when phase A returns `'boundary'` or
+`'error'`.  It runs scipy's C-coded
+[`scipy.sparse.csgraph.dijkstra`](https://docs.scipy.org/doc/scipy/reference/generated/scipy.sparse.csgraph.dijkstra.html)
+on the **face dual graph** (nodes = faces, edge weights =
+centroid-to-centroid distance).  Backtracing from the end face to
+the start face yields a topological corridor that respects surface
+topology — even when the Euclidean shortcut goes through air.  The
+graph is built lazily on first miss (typical session never pays the
+~5-50 ms construction cost).
+
+Each phase costs ~5-25 ms (rebuild submesh + solver); the rare
+phase-B Dijkstra adds ~10-50 ms once.  Compared to the ~300 ms
+global solver, this turns what would otherwise be a 300 ms stutter
+into a 30-90 ms blip on extreme concave geometry.
 
 #### Pipeline summary
 
 1. Project line A→B onto mesh → seed face set.
-2. Expand seed by `k_rings` (3 on first attempt).
+2. **Phase A**: BFS expand seed by 3 rings.
 3. Extract submesh (V_sub, F_sub, vertex remap).
 4. Identify submesh boundary faces (for the post-solve check).
 5. Topology insertion: query the **global** KDTree, translate to
@@ -553,8 +702,14 @@ cases.
    global nearest is not in the submesh, local KDTree fallback for
    that point only.  Then `_add_point_local` does 1-to-3 subdivision.
 6. Build local `EdgeFlipGeodesicSolver`, solve.
-7. Boundary check: any path point on a submesh boundary face → retry
-   with bigger `k_rings`.  Exhausted retries → global fallback.
+7. Boundary check: any path point on a submesh boundary face → escalate.
+8. **Phase B (Dijkstra)** on `'boundary'` / `'error'`: build (lazy)
+   face dual graph, find shortest face-to-face path A→B by
+   centroid distance, union the corridor + 3-ring expansion with
+   the existing visited set, retry solve.
+9. **Phase C**: progressive BFS expansion (15 / 30 / 60 rings) over
+   whichever set phases A and B left in `visited` / `frontier`.
+10. Exhausted retries → global fallback (`compute_endpoint`).
 
 Correctness is never compromised: all failure paths end in the exact
 global solver.  A `trivial` result (endpoints collapsed to one
@@ -611,9 +766,42 @@ step, as a second line of defense.
 
 **Topology insertion robustness**: `_find_face_buf` unconditionally
 includes all faces created by prior insertions (not just those adjacent
-to the nearest original vertex). `_split_edge_buf` was removed entirely
--- all point insertions now use 1-to-3 subdivision which is manifold by
-construction.
+to the nearest original vertex).
+
+### Topology insertion: 2-to-4 edge split + 1-to-3 interior split
+
+Two distinct subdivision operations are used to insert a new point
+into the mesh topology, picked by where the point lies:
+
+| Strategy | When | Effect |
+|---|---|---|
+| **Snap-to-vertex** | bary coord `> 1 − 1e−7` (point essentially ON a mesh vertex) | Reuse the existing vertex; no insertion. |
+| **2-to-4 edge split** | bary coord `< 1e−3` AND adjacency available (point on / very near an edge) | Find the neighbour triangle across the shared edge; split BOTH triangles into 2 sub-faces each. The new vertex `p` is placed at its **exact requested position** — no nudge, no projection. Manifold by construction (4 well-formed sub-faces, no slivers). |
+| **1-to-3 interior split** | otherwise (point strictly inside a triangle) | Subdivide the containing triangle into 3 sub-faces meeting at `p`. Standard barycentric subdivision. |
+
+The 2-to-4 path is the load-bearing fix for **smooth orange / didactic
+agreement on dense meshes**.  Without it, a point sweeping continuously
+across an edge (as the cascade's `t` parameter varies) would trip the
+old "nudge inward toward centroid" workaround at `edge_eps = 1e−3` and
+produce a discrete ~1e−4 jump in the inserted-vertex position — which
+then propagated through three cascade levels into ~3e−5 jitter on the
+final curve.  The 2-to-4 split has no such discontinuity: as the point
+slides along the edge, the inserted vertex slides along it
+continuously, and the topology change happens once when the point first
+crosses INTO the triangle (not every time it grazes the edge).
+
+The fallback nudge at `nudge_eps = 1e−7` is kept as a last resort for
+the rare case where the 2-to-4 cannot apply: boundary edges of the
+submesh (no neighbour to split with) or inconsistent adjacency.  When
+it fires, the 1-to-3 path's post-subdivision area check
+(`area < 1e−15 → snap to nearest vertex`) catches any remaining
+degenerate sub-face.
+
+Adjacency is maintained via a per-call `adj_buf` matrix, built once
+from `self._face_adj` (global path) or from the submesh's `F_sub`
+(local path) and updated in lockstep with `F_buf` after every
+insertion.  See `_split_edge_2to4`'s docstring for the bookkeeping
+details (4 modified/new face entries + up to 4 outer-neighbour re-routes).
 
 ### Surface Projection (`project_smooth_batch`)
 
@@ -665,8 +853,17 @@ The tolerance defaults to ~1% of the mean edge length -- adaptive to
 mesh density. Segments that pass the test don't trigger any further
 work on subsequent iterations.
 
-Applied to both Bezier curve layers (blue consolidated, orange).
-Skipped during drag for performance.
+Applied to the **blue consolidated** Bezier curve and the **black
+interpolation** B-spline; skipped during drag for performance.
+
+Note: the orange curve no longer uses this pass.  It used to, but
+the inserted points (chord midpoint projections) are not on the
+de Casteljau cascade, so the rendered orange polyline drifted from
+the underlying mathematics — visible as a mismatch with the
+didactic point at non-grid `t` values.  The orange worker now does
+its own *cascade densification + geodesic chord-bridging* (see the
+"Three-phase worker pipeline" section above), which keeps the
+rendered curve faithful to the cascade by construction.
 
 ## Snap to Vertex / Edge (Shift / Ctrl modifier)
 
@@ -694,13 +891,16 @@ Useful when the spline must land exactly on a topological landmark
 
 When `compute_endpoint` or `compute_endpoint_local` cannot produce a
 true geodesic (cross-component query, solver failure on degenerate
-topology) it returns a 2-point straight-line stub and flags
-`self.geo._last_was_fallback = True`.  The app reads that flag after
-every blue-layer call and tracks degraded spans in
-`_degraded_spans`; the orange worker transmits the same flag via its
-`'done'` pipe message.  Degraded spans are repainted **saturated red**
-(`#ff2020`) and a HUD warning fires once per transition so the user
-notices a silent failure instead of trusting a phantom curve.
+topology) it returns a 2-point straight-line stub.  The function
+signature is `(path, was_fallback)` — the second element of the tuple
+is `True` whenever the result is degraded.  Returning the flag in the
+tuple (rather than via instance state on the `GeodesicMesh`) is what
+makes the call thread-safe across the orange worker pool.  The app
+reads the flag after every blue-layer call and tracks degraded spans
+in `_degraded_spans`; the orange worker transmits the same flag via
+its `'done'` pipe message.  Degraded spans are repainted **saturated
+red** (`#ff2020`) and a HUD warning fires once per transition so the
+user notices a silent failure instead of trusting a phantom curve.
 
 ## SSAO (experimental)
 
@@ -730,8 +930,8 @@ The original vertex / face order in a `.ply` / `.obj` file is usually
 arbitrary relative to 3D position — two geometrically adjacent
 triangles can sit megabytes apart in `_face_verts`, `_face_adj`, and
 `_face_normals`.  Every edge crossing in `_shoot_loop` (and every
-step of the bidirectional BFS in `compute_endpoint_local`) then pays
-an L3 cache miss.
+step of the BFS expansion in `compute_endpoint_local`'s phase A / C
+or the Dijkstra walk in phase B) then pays an L3 cache miss.
 
 Morton reordering places geometrically close triangles close in
 memory.  The neighbour lookup via `_face_adj[fi, edge_i]` now usually
@@ -930,9 +1130,13 @@ noise into vertex-normal interpolation. The smoothing pipeline:
    inner loop for exact ray-edge math.
 2. **Smoothed face normals** -- Laplacian-smoothed (5 iterations). Two
    weighting strategies selectable via `COTANGENT_WEIGHTS`:
-   - **Uniform** (default): each neighbor has equal weight.
-   - **Cotangent**: weights by dihedral angle at the shared edge.
-     Invariant to triangulation quality (better for scanned meshes).
+   - **Uniform** (default off): each neighbor has equal weight.
+   - **Cotangent** (default on): classical Pinkall-Polthier weights --
+     for each shared edge, the weight is `½ · (cot α + cot β)` where
+     α, β are the angles opposite to the edge in each triangle.
+     This is the canonical discrete Laplace-Beltrami operator;
+     genuinely invariant to triangulation quality (better for
+     photogrammetry / scanned meshes with long thin triangles).
 3. **Vertex normals** -- **angle-weighted pseudo-normals**
    (Baerentzen & Aanaes 2005).  Each face contributes to a vertex
    weighted by the interior angle it subtends at that vertex.  This
@@ -1125,11 +1329,12 @@ A single `render()` per timer tick batches all updates.
     {
       "closed": false,
       "nodes": [
-        {
-          "origin": [x, y, z],
-          "p_a":    [ax, ay, az],
-          "p_b":    [bx, by, bz]
-        }
+        {"origin": [x0, y0, z0],
+         "p_a":    [ax0, ay0, az0],
+         "p_b":    [bx0, by0, bz0]},
+        {"origin": [x1, y1, z1],
+         "p_a":    [ax1, ay1, az1],
+         "p_b":    [bx1, by1, bz1]}
       ]
     }
   ]
@@ -1140,6 +1345,20 @@ Each node persists three 3-D points: ``origin`` (the node position on
 the surface), ``p_a`` (handle A endpoint), and ``p_b`` (handle B
 endpoint).  Either or both handle entries may be ``null`` for
 placeholder single-node splines that haven't yet had tangents set up.
+
+#### Layout
+
+The save path uses a hand-rolled formatter
+(``_format_session_json``) that keeps the outer structure indented
+but emits each node on **three aligned lines** (one per coordinate
+field) with each 3-vector inline.  Compared to
+``json.dump(indent=2)``'s 12+ lines per node, sessions shrink ~3×
+at the same readability — the colon column is preserved across
+``"origin"`` / ``"p_a"`` / ``"p_b"`` so the values form a clean
+vertical stripe.  Output is plain JSON (no extensions); any standard
+JSON parser round-trips it without information loss.  If the dict
+shape ever drifts away from the v1/v2 schema, the formatter falls
+back to ``json.dumps(indent=2)`` so we never emit malformed JSON.
 
 On load, the editor rebuilds ``path_a`` and ``path_b`` via
 ``compute_endpoint_from_origin`` (the EdgeFlipGeodesicSolver) — the
@@ -1214,4 +1433,12 @@ geo_shoot.py         MidpointShooterApp + SurfaceCursor
 geo_splines.py       GeodesicSplineApp (main application)
 spline_export.py     CLI curve exporter
 requirements.txt     Pinned dependency versions
+fandisk.obj          Bundled sample mesh (~6.6k faces).  The
+                     no-argument editor launch opens this file
+                     when present in the current directory.
+                     Classic "fandisk" CAD-style benchmark mesh
+                     widely used in computational geometry papers
+                     (e.g. Hoppe 1996, Botsch & Kobbelt).  Kept in
+                     the repo so the editor has an immediately
+                     usable demo without external downloads.
 ```
