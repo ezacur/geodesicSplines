@@ -1543,10 +1543,25 @@ class GeodesicMesh:
 
         Single canonical implementation shared by ``get_barycentric``,
         ``_bary_buf``, and ``get_barycentric``.
+
+        The five dot products are spelled out as scalar arithmetic
+        rather than ``np.dot`` on 3-vectors: ``np.dot`` carries a
+        per-call Python↔C dispatch cost that dominates for length-3
+        inputs, and this is a hot leaf (``find_face`` /
+        ``_outside_score`` call it once per candidate face).  The
+        summation order is left-to-right, matching NumPy's sequential
+        reduction for a 3-element dot — verified bit-for-bit against the
+        cascade parity oracle (``tests/benchmark_endpoint_local.py
+        --check``, 0.000e+00 on both locator regimes).
         """
-        v0, v1, v2 = B - A, C - A, p - A
-        d00 = np.dot(v0, v0); d01 = np.dot(v0, v1); d11 = np.dot(v1, v1)
-        d20 = np.dot(v2, v0); d21 = np.dot(v2, v1)
+        v0x = B[0] - A[0]; v0y = B[1] - A[1]; v0z = B[2] - A[2]
+        v1x = C[0] - A[0]; v1y = C[1] - A[1]; v1z = C[2] - A[2]
+        v2x = p[0] - A[0]; v2y = p[1] - A[1]; v2z = p[2] - A[2]
+        d00 = v0x * v0x + v0y * v0y + v0z * v0z
+        d01 = v0x * v1x + v0y * v1y + v0z * v1z
+        d11 = v1x * v1x + v1y * v1y + v1z * v1z
+        d20 = v2x * v0x + v2y * v0y + v2z * v0z
+        d21 = v2x * v1x + v2y * v1y + v2z * v1z
         denom = d00 * d11 - d01 * d01
         if abs(denom) < 1e-15:
             return 1/3, 1/3, 1/3
@@ -2220,13 +2235,25 @@ class GeodesicMesh:
         for _ in range(extra_rings):
             if not frontier:
                 return
+            # Gather every neighbour of the current frontier in one
+            # vectorised index op (``adj[frontier]`` ⇒ (k, 3)) instead of a
+            # Python double loop over (frontier × 3 edges) — this loop was
+            # the bulk of the ``bfs`` profiling bucket.  Drop boundary
+            # slots (-1) and dedupe; the membership filter against
+            # ``visited`` then keeps the result identical to the scalar
+            # loop.  ``visited`` / ``frontier`` stay plain sets, so the
+            # arbitrary gather order is irrelevant: the final sets are the
+            # same and callers consume ``sorted(visited)``.
+            frontier_arr = np.fromiter(frontier, dtype=np.intp, count=len(frontier))
+            nbrs = adj[frontier_arr].ravel()
+            nbrs = nbrs[nbrs >= 0]
+            if nbrs.size == 0:
+                return
             next_f = set()
-            for fi in frontier:
-                for nb in adj[fi]:
-                    nb_i = int(nb)
-                    if nb_i >= 0 and nb_i not in visited:
-                        visited.add(nb_i)
-                        next_f.add(nb_i)
+            for nb in np.unique(nbrs).tolist():
+                if nb not in visited:
+                    visited.add(nb)
+                    next_f.add(nb)
             if not next_f:
                 return
             frontier.clear()
