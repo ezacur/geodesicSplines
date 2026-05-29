@@ -1607,6 +1607,50 @@ class GeodesicMesh:
         u, v, w = self.get_barycentric(p, fi)
         return max(0.0, -u) + max(0.0, -v) + max(0.0, -w)
 
+    def _find_faces_batch(self, pts: np.ndarray) -> np.ndarray:
+        """Vectorised equivalent of ``[self.find_face(p) for p in pts]``.
+
+        Returns an ``(N,)`` int array that is **bit-for-bit identical** to
+        calling ``find_face`` per point — it selects the same nearest
+        vertex and the same incident face — but amortises the per-point
+        Python↔C overhead of ``KDTree.query`` into one batched call.
+
+        Regime split:
+
+        * **Locator present** (interactive editor mesh): VTK
+          ``FindClosestPoint`` has no vectorised API, so this falls back to
+          the per-point loop.  That regime's ``find_face`` is already
+          ~11 µs/call, and batching cannot help it.
+        * **No locator** (orange worker / CLI export — both build the mesh
+          with ``build_locator=False``): the KDTree path is fully
+          batchable.  One batched ``KDTree.query`` over all points, then
+          the same per-point arg-min of ``_outside_score`` over the nearest
+          vertex's incident faces that ``find_face`` performs (same key,
+          same candidate iteration order ⇒ same tie-break ⇒ identical
+          face).  This is the hot path: the boundary check in
+          ``_try_solve_on_region`` calls ``find_face`` once per geodesic
+          path point, and the worker's no-locator ``find_face`` was
+          profiled at ~46 % of ``compute_endpoint_local``.
+        """
+        pts = np.asarray(pts, dtype=float)
+        n = len(pts)
+        out = np.empty(n, dtype=np.int64)
+        if self.locator is not None:
+            for i in range(n):
+                out[i] = self.find_face(pts[i])
+            return out
+        # No locator — batch the single expensive C call (KDTree.query),
+        # then replicate find_face's candidate selection exactly.
+        _, vis = self._kdtree.query(pts)
+        vf_data = self._vf_data
+        vf_off = self._vf_offsets
+        for i in range(n):
+            vi = int(vis[i])
+            p = pts[i]
+            cands = vf_data[vf_off[vi]:vf_off[vi + 1]]
+            out[i] = int(min(cands, key=lambda fi: self._outside_score(p, int(fi))))
+        return out
+
     def compute_shoot(self, p_start: F64Array, d_vec: F64Array, length: float,
                     face_idx: int = None, max_steps: int = 400,
                     fast_mode: bool = False) -> F64Array | None:
@@ -2317,9 +2361,18 @@ class GeodesicMesh:
         # Boundary check: if any path point falls on a boundary face of
         # the submesh, the solver may have been forced against the edge
         # of the region and the real geodesic goes further out.
-        for pt in path:
-            fi_global = self.find_face(pt)
-            if fi_global in boundary_faces_global:
+        #
+        # ``_find_faces_batch`` returns the same per-point face the
+        # per-point ``find_face`` loop would (identical nearest-vertex +
+        # candidate selection), but amortises the no-locator
+        # ``KDTree.query`` into one batched call.  The orange worker / CLI
+        # export build the mesh with ``build_locator=False``, where this
+        # query was profiled at ~46 % of ``compute_endpoint_local``.  The
+        # verdict is unchanged: 'boundary' iff ANY path point lands on a
+        # submesh-boundary face — checking them in order returns at the
+        # same point the old loop did.
+        for fi_global in self._find_faces_batch(path):
+            if int(fi_global) in boundary_faces_global:
                 return ('boundary', None)
 
         return ('ok', path)
