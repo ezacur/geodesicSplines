@@ -3029,8 +3029,18 @@ class GeodesicMesh:
 
         for fi in (face_idx, nf, nf + 1):
             tri = V_buf[F_buf[fi]]
-            area = 0.5 * np.linalg.norm(
-                np.cross(tri[1] - tri[0], tri[2] - tri[0]))
+            e1 = tri[1] - tri[0]
+            e2 = tri[2] - tri[0]
+            # Explicit cross-product magnitude — avoids np.cross's
+            # axis-handling (moveaxis / normalize_axis_tuple) and norm's
+            # nrm2 wrapper, both of which dominate a single 3-vector op.
+            # The area only gates the <1e-15 degenerate check (real areas
+            # are ~1e-6, nine orders away), so any last-ULP drift cannot
+            # flip the branch — verified bit-for-bit by the parity oracle.
+            cx = e1[1] * e2[2] - e1[2] * e2[1]
+            cy = e1[2] * e2[0] - e1[0] * e2[2]
+            cz = e1[0] * e2[1] - e1[1] * e2[0]
+            area = 0.5 * (cx * cx + cy * cy + cz * cz) ** 0.5
             if area < 1e-15:
                 F_buf[face_idx] = saved_face
                 F_buf[nf] = saved_nf0
@@ -3505,8 +3515,18 @@ class GeodesicMesh:
         # insertion completely and snap to the nearest original vertex.
         for fi in (face_idx, nf, nf + 1):
             tri = V_buf[F_buf[fi]]
-            area = 0.5 * np.linalg.norm(
-                np.cross(tri[1] - tri[0], tri[2] - tri[0]))
+            e1 = tri[1] - tri[0]
+            e2 = tri[2] - tri[0]
+            # Explicit cross-product magnitude — avoids np.cross's
+            # axis-handling (moveaxis / normalize_axis_tuple) and norm's
+            # nrm2 wrapper, both of which dominate a single 3-vector op.
+            # The area only gates the <1e-15 degenerate check (real areas
+            # are ~1e-6, nine orders away), so any last-ULP drift cannot
+            # flip the branch — verified bit-for-bit by the parity oracle.
+            cx = e1[1] * e2[2] - e1[2] * e2[1]
+            cy = e1[2] * e2[0] - e1[0] * e2[2]
+            cz = e1[0] * e2[1] - e1[1] * e2[0]
+            area = 0.5 * (cx * cx + cy * cy + cz * cz) ** 0.5
             if area < 1e-15:
                 # Undo: restore all three F_buf slots + vertex count
                 F_buf[face_idx] = saved_face
