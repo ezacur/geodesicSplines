@@ -169,6 +169,9 @@ classDiagram
 | l | Load splines from JSON (file dialog; schema-validated) |
 | v | Export orange curve to timestamped binary `.vtk` (same output as `spline_export.py --vtk --samples N` with `N = SplineConfig.EXPORT_VTK_SAMPLES`; reuses live cache when `EXPORT_VTK_SAMPLES == GEO_SAMPLES`, otherwise recomputes).  Single-node splines are written as `VTK_VERTEX` landmarks. |
 | d | Toggle the **didactic scaffold** for the active spline's last span — four dark-green auxiliary geodesic lines that visualise the de Casteljau cascade at `t = 0.5`.  See the dedicated [Didactic Scaffold](#didactic-scaffold-key-d) section below for the full geometric story. |
+| Ctrl+X | Import **guide polylines** from one or more VTK-readable files (multi-select).  Only line cells (cell type 3 `VTK_LINE` / type 4 `VTK_POLY_LINE`) are kept; polygonal cells in the same file are dropped.  Replaces any previously-loaded guides.  Newly-imported guides always start visible at `GUIDE_OPACITY`, regardless of the prior toggle state.  See [Guide Curves](#guide-curves-ctrlx--x). |
+| x (hold) | While held, every imported guide actor jumps to **opacity 1.0** for an unmistakable preview.  On release the visibility *toggles* relative to the state captured at press time: visible → hidden, or hidden → visible with a 500 ms ease-out fade from 1.0 back to `GUIDE_OPACITY`. |
+| n (hold) | Show node-index labels above every node while the key is held; release to hide.  Single-spline scenes show just the 1-based node index (`3`); multi-spline scenes prefix the 1-based spline index (`s1:3`).  Labels are rendered in an **overlay layer** (`SetLayer(1)` sharing the main camera) so they can never be partially clipped by the mesh in screen-space — but visibility is gated per-node by `_is_marker_occluded`, so a node that is genuinely on the far side of the mesh (the ray from camera to its origin is blocked) does NOT get a label.  Labels follow nodes that are being dragged and re-evaluate occlusion as the camera orbits. |
 | e | Export geodesic paths to TXT |
 | w | Toggle wireframe overlay |
 | a | Cycle surface transparency |
@@ -186,6 +189,75 @@ to `DEBUG` (worker traces, snap diagnostics, solver fallbacks).
 
 Three colored checkboxes (bottom-left) mirror the b/o/k keys for
 layer visibility.
+
+### Guide Curves (Ctrl+X / X)
+
+Reference polylines imported from external VTK files to assist
+spline placement (e.g. anatomical landmarks scanned separately,
+isophote curves computed offline, blueprint annotations).
+
+**Loading** (`Ctrl+X`): opens a multi-select file dialog filtered to
+`.vtk .vtp .ply .stl .obj`.  Each selected file becomes one rendered
+actor.  The dialog **replaces** any previously-loaded guides — there
+is no "append" shortcut; re-importing is the way to swap in a
+different set.
+
+**Filtering**: PyVista's reader accepts files that contain both
+polygonal and line cells (e.g. a triangulated surface with a few
+annotation polylines).  To keep the rendering focused, only
+`points + lines` are copied to the actor; polygonal cells are
+silently dropped.  A file with zero line cells is reported as a HUD
+error and skipped, but the rest of the multi-select batch still
+loads.
+
+**Container handling**: `pv.read` picks the dataset class from the
+file header, not the extension.  Many tools emit legacy `.vtk` as
+`vtkUnstructuredGrid` even when the data is purely 1-D (`VTK_LINE`
+cells).  The loader detects that case and converts via
+`vtkGeometryFilter` before the line-extraction step.  `MultiBlock`
+containers are unwrapped to their first PolyData / UnstructuredGrid
+block.
+
+**Styling**: solid green (`SplineConfig.GUIDE_COLOR_HEX = '#00aa00'`),
+line width 3, resting opacity `GUIDE_OPACITY = 0.1`.  Z-depth
+(`DEPTH_GUIDE = -3.0`) places guides between the mesh surface and the
+colored spline curves, so the user's actual splines remain visually
+dominant on top.  Newly-imported guides always come up visible at
+`GUIDE_OPACITY` (any in-flight hold / fade tied to the previous set
+is cancelled), so a hidden-then-reload cycle never leaves the user
+staring at an empty viewport.
+
+**Hold-to-preview + release-to-toggle** (`X`, no Ctrl): rather than
+the legacy press-to-toggle, the key now combines a momentary preview
+with the eventual toggle.
+
+  - *On press* — the first KeyPress of a hold cycle (OS key-repeats
+    are ignored via a captured-state gate) snapshots the current
+    visibility into `_x_hold_was_visible`, cancels any in-flight fade
+    (`pending_debounces.pop('guides_fade')`), and forces every actor
+    to opacity 1.0 + `SetVisibility(True)`.  No HUD message — the
+    visual change is feedback enough.
+  - *On release* — the snapshot decides the new resting state:
+      - **was visible →** `SetVisibility(False)` on every actor (and
+        reset alpha back to `GUIDE_OPACITY` so the next show starts
+        from the resting value).  HUD: "GUIDES OFF".
+      - **was hidden →** keep visible and schedule a 500 ms ease-out
+        fade (`1 - (1-t)²`) from 1.0 down to `GUIDE_OPACITY`.  The
+        fade is driven by `_tick_guides_fade` self-rescheduling on
+        the Master Clock (~50 ms cadence, ≈10 frames).  HUD:
+        "GUIDES ON".
+  - *Without guides loaded* the press path still emits the
+    "NO GUIDES LOADED — use Ctrl+X to import" reminder; release is a
+    no-op.
+
+The hold / release pair is wired with raw VTK `KeyPressEvent` /
+`KeyReleaseEvent` observers (PyVista's `add_key_event` is press-only)
+— same pattern as the `n` hold-to-show node-label shortcut.  Modifier
+keys (Ctrl / Shift / Alt) gate both handlers so `Ctrl+X` (import)
+stays unambiguous.
+
+**Persistence**: guides are *not* saved into the session JSON.
+Re-import with `Ctrl+X` after loading a session.
 
 ## The Spline Model
 
@@ -731,9 +803,19 @@ and reused for all spatial queries that don't require the VTK locator:
 - **Vertex snap** in topology insertion: when a point falls within 1e-4
   of a vertex in barycentric coordinates, snaps to that vertex instead
   of subdividing.
-- **Stitch preview**: fast vertex-snapped geodesic via the pre-built
-  solver (`_solver.find_geodesic_path(idx_s, idx_e)`), using KDTree to
-  find the nearest vertex indices.
+- **Stitch preview**: two-tier pipeline driven by the cursor.
+  - *Fast path* (~0.01 ms, every mouse-move that crosses
+    `STITCH_SKIP_PX`): vertex-snapped geodesic via the pre-built solver
+    (`_solver.find_geodesic_path(idx_s, idx_e)`), using KDTree to find
+    the nearest vertex indices.
+  - *Exact refinement* (~25 ms, fires once the cursor has been still for
+    `STITCH_EXACT_DEBOUNCE_SEC` ≈ 150 ms): replaces the snapped endpoint
+    with a topology-inserted endpoint at the exact cursor position via
+    `compute_endpoint_from_origin`.  Scheduled on every mouse-move
+    (independently of the 3-px fast-path gate) so a sub-pixel twitch
+    still resets the timer.  Defensive checks abort the refinement if
+    spline state has changed since scheduling, so the fast line stays
+    on screen unchanged.
 
 The KDTree is NOT used in the Numba JIT shooting kernel (scipy objects
 are opaque to Numba). The fallback path in `_shoot_loop` uses a local
@@ -1005,12 +1087,23 @@ self.state.pending_debounces['my_task'] = (
 
 To cancel: `self.state.pending_debounces.pop('my_task', None)`.
 
-### Drag Consolidation
+### Registered Debounce Tasks
 
-During drag, each mouse move schedules a `'drag_exact'` debounce at
-150 ms in the future. If the mouse keeps moving, the deadline keeps
-advancing (the task is overwritten with a fresh deadline). When the mouse
-pauses for 150 ms, the callback fires and computes the exact geodesic.
+Two tasks share the same Master Clock registry, both with a 150 ms
+deadline that is reset on every relevant mouse-move (the task entry is
+overwritten with a fresh deadline, so a moving cursor never lets it
+fire):
+
+- **`'drag_exact'`** — scheduled while a handle (P / A / B) is being
+  dragged.  When the cursor pauses, `_fire_debounce` re-runs the exact
+  topology-inserted geodesic for the dragged segment, replacing the
+  cheap fast-mode preview drawn at display refresh rate.
+- **`'stitch_exact'`** — scheduled on every mouse-move that has a valid
+  surface pick (whether or not the 3-px fast-stitch gate fired).  When
+  the cursor pauses, `_fire_stitch_exact` recomputes the gray cursor
+  line with the exact endpoint (`compute_endpoint_from_origin`)
+  instead of the vertex-snap fast path.  See the **Stitch preview**
+  bullet under [KDTree](#kdtree) for the two-tier pipeline.
 
 ### The Spline Extension
 
@@ -1031,8 +1124,25 @@ No additional timers are created.
 ## Curve Hover Detection
 
 When the cursor moves over a visible spline curve (and no handle drag is
-active), a colored marker appears at the closest point on the curve. This
-is the entry point for node insertion (double-click on the marker).
+active), a **telescopic-sight marker** appears at the closest point on
+the curve: a thin circumference plus a thinner horizontal + vertical
+crosshair whose intersection marks the precise insertion point.  The
+shape disambiguates it from any node sphere or handle marker, the
+crosshair lines are aligned with the camera's view-plane axes (always
+horizontal / vertical on screen regardless of curve direction —
+behaving like a real optical sight), and the colour matches the curve
+layer (blue / orange / black-interp).  Built from two actors so the
+circumference and the crosshair can carry independent line widths
+(`HOVER_MARKER_CIRCLE_LINE_WIDTH = 2`,
+`HOVER_MARKER_CROSS_LINE_WIDTH = 1`).  Both actors live in the
+overlay renderer (layer 1, no depth-test against the mesh) so the
+marker never gets partially clipped; the underlying point pick
+(`_pick_closest_curve`) still filters out points on the far side of
+the mesh via `_is_marker_occluded`, so the marker only appears at
+positions the user can actually see.  Radius is constant in screen
+space (`HOVER_MARKER_SCREEN_SCALE` × camera distance) so it does not
+shrink when zooming out.  This marker is the entry point for node
+insertion (double-click on it).
 
 ### Per-Segment Distance
 
@@ -1187,8 +1297,29 @@ During drag, affected spans show a lighter/thinner appearance:
 | Consolidated | Full blue (semi-geodesic, upgraded via path_12) | Growing | Normal colors |
 | Idle | Full blue | Full orange | Normal colors |
 
-Handle opacity follows the global gizmo opacity (cycled with `t`), but
-hovered handles always go fully opaque for visual prominence.
+Handle opacity follows the global gizmo opacity (cycled with `t`).
+Hovering **any** sub-element of a node — P sphere, A handle, or B
+handle — bumps the **entire** gizmo (both handles + the red tangent
+line) to opacity 1.0 **and** raises its z-buffer priority from the
+resting `GIZMO_DEPTH_NORMAL = -8.0` to `GIZMO_DEPTH_HOVER = -26.0`
+(deeper than `DEPTH_CURVE_HOVER = -24`), so the hovered gizmo draws
+on top of the orange / blue / black curves and the telescopic-sight
+curve-hover marker — the user reads the full geometry of the node
+they are aiming at without it being clipped by overlapping splines.
+Per-marker affordances (the hovered marker turns black / darkred and
+grows ×1.4) still indicate exactly which sub-element will receive a
+drag.
+
+The opacity / depth revert is **debounced**: when the cursor leaves
+all handles the gizmo keeps the bumped styling for an
+`_HOVER_REVERT_SEC = 0.3` grace period (registered as
+`pending_debounces['hover_revert']` on the Master Clock).  Returning
+to a handle within the grace period cancels the pending revert
+silently — no flicker for cursor twitches.  Crossing into a *different*
+gizmo's handle reverts the previous one immediately and applies the
+new one (no overlap of two hovered gizmos).  Starting a drag also
+bypasses the grace period — the drag-preview style takes over and a
+lingering hover bump would be misleading.
 
 The drag preview itself is governed by the `AGILE_DRAG` flag in
 `gizmo.py`: when `True` (default) the in-flight handle uses a
@@ -1286,6 +1417,32 @@ of mistaking the slowness for a different bug.
   view or has the wrong dtype; a one-line copy on the Python side
   is cheaper than debugging a ghost triangle.
 
+### Solver-path micro-optimisations (output-preserving)
+
+`compute_endpoint_local` is the per-cascade-sample workhorse (the orange
+worker fires ~90 of them per span) and the blue-layer consolidation
+solver, so in the `submesh_subdiv=0` regime its Python-side overhead --
+not the C++ `EdgeFlipGeodesicSolver` -- dominates the call. A profiling
+pass (`tests/benchmark_endpoint_local.py`, fandisk) drove four changes,
+each verified **bit-for-bit** against the cascade parity oracle
+(`--baseline` / `--check`, `0.000e+00` on both locator regimes):
+
+| Change | What | Gain (worker path) |
+|---|---|---|
+| Batched boundary-check `find_face` | `_find_faces_batch` amortises the no-locator `KDTree.query` over all path points in one call -- the orange worker / CLI export build with `build_locator=False`, where `find_face` profiled at ~46 % of the call | ~13 % |
+| Scalarised `_barycentric` | five `np.dot` on 3-vectors → explicit scalar arithmetic (`np.dot`'s per-call dispatch dominates length-3 inputs); a leaf called once per candidate face | ~10 % |
+| Vectorised `_bfs_advance` | `adj[frontier]` gather + dedupe instead of a Python double loop over (frontier × 3 edges); plain-set interface kept | ~10 % |
+| Batched `_to_local` endpoint query | one `KDTree.query([p_start, p_end])` instead of two single-point queries (scipy's query wrapper costs ~tens of µs/call, not ~1-2 µs) | ~4 % |
+
+The four compound to roughly a third off the worker-path mean/call, with
+no measurable change on the locator (interactive editor) path and zero
+change to any rendered curve. Ideas tried and *rejected* by the same
+oracle / profiler -- a Numba bool-mask `_bfs_advance` rewrite (~2 %,
+within noise), and swapping `find_face` for
+`project_smooth_batch_with_faces` (changes the curve ~2e-2) -- are
+recorded with their measurements in
+[`docs/REJECTED_SUGGESTIONS.md`](docs/REJECTED_SUGGESTIONS.md).
+
 ### Type Hints
 
 Public APIs in `geodesics.py` use `numpy.typing` aliases
@@ -1329,10 +1486,12 @@ A single `render()` per timer tick batches all updates.
     {
       "closed": false,
       "nodes": [
-        {"origin": [x0, y0, z0],
+        {"id":     1,
+         "origin": [x0, y0, z0],
          "p_a":    [ax0, ay0, az0],
          "p_b":    [bx0, by0, bz0]},
-        {"origin": [x1, y1, z1],
+        {"id":     2,
+         "origin": [x1, y1, z1],
          "p_a":    [ax1, ay1, az1],
          "p_b":    [bx1, by1, bz1]}
       ]
@@ -1346,16 +1505,23 @@ the surface), ``p_a`` (handle A endpoint), and ``p_b`` (handle B
 endpoint).  Either or both handle entries may be ``null`` for
 placeholder single-node splines that haven't yet had tangents set up.
 
+An optional ``id`` field (1-based, matches the labels shown by the
+'n' hot-key) is emitted by the writer as a cosmetic aid for humans
+skimming the file.  The loader **does not consume it** — node order
+in the list defines the runtime index — so deleting, renumbering, or
+omitting ``id`` entries by hand is harmless.  Legacy sessions written
+before the field was introduced load unchanged.
+
 #### Layout
 
 The save path uses a hand-rolled formatter
 (``_format_session_json``) that keeps the outer structure indented
-but emits each node on **three aligned lines** (one per coordinate
-field) with each 3-vector inline.  Compared to
-``json.dump(indent=2)``'s 12+ lines per node, sessions shrink ~3×
-at the same readability — the colon column is preserved across
-``"origin"`` / ``"p_a"`` / ``"p_b"`` so the values form a clean
-vertical stripe.  Output is plain JSON (no extensions); any standard
+but emits each node on **four aligned lines** (one per field,
+``id`` plus the three coordinate triplets) with each 3-vector
+inline.  Compared to ``json.dump(indent=2)``'s 12+ lines per node,
+sessions shrink ~3× at the same readability — the colon column is
+preserved across ``"id"`` / ``"origin"`` / ``"p_a"`` / ``"p_b"`` so
+the values form a clean vertical stripe.  Output is plain JSON (no extensions); any standard
 JSON parser round-trips it without information loss.  If the dict
 shape ever drifts away from the v1/v2 schema, the formatter falls
 back to ``json.dumps(indent=2)`` so we never emit malformed JSON.

@@ -53,6 +53,13 @@ position + screenshot) where `IntersectWithLine` returns the wrong
 occlusion answer *and* `vtkHardwareSelector` returns the right one
 on the same input.
 
+**Measured (2026-05-31)**: micro-benchmarked `IntersectWithLine`
+camera→marker rays on fandisk (12.9k faces) — **2.1 µs/call**.  The
+check fires at most once per frame (only the single hovered marker), so
+its cost is **~0.002 ms/frame** (~0.01 % of a 60 fps budget).  Confirms
+"negligible": a GPU Z-buffer read cannot be meaningfully faster than a
+2 µs op and would add a whole render pass.
+
 ### Replace cone arrows with `vtkGlyph3D`
 
 **Proposed**: in [`gizmo.py:_update_handle_arrow`](../gizmo.py#L620),
@@ -72,6 +79,17 @@ frame.
   A glyph approach needs to keep that derivation, which adds
   complexity without removing it.
 - No profiling shows arrow rendering as a hot path during drag.
+
+**Measured (2026-05-31)**: micro-benchmarked the cone transform
+(`_rotation_x_to_jit` + `np.dot`) — **1.7 µs per cache-miss**, 0.66 µs
+for the cache-hit comparison; the cone template is 9 vertices
+(`resolution=8`), not 30.  Worst case is a camera drag with
+screen-fixed sizing, where the scale changes every frame so every arrow
+misses: even then it is **0.02 ms/frame at 6 nodes, 0.10 ms at 30, and
+0.34 ms at 100** (2 arrows/node) — all far under a 6.9 ms (144 fps)
+frame.  A `vtkGlyph3D` rewrite would shave a fraction of a sub-ms cost
+while still needing the geodesic-tangent derivation.  Confirms "not the
+bottleneck".
 
 ### Float32 for `V` / `F` in shared memory
 
@@ -175,6 +193,20 @@ single `_kdtree.query([p_start, p_end])`.
   milliseconds.
 - Indistinguishable speedup; adds no clarity.
 
+**Overturned (2026-05-30 — re-profiled and shipped, commit `37c15b8`)**:
+the "~1-2 µs" estimate was wrong.  scipy's `KDTree.query` search is
+C-coded, but its Python *wrapper* (input validation, `k` / `workers`
+handling, output shaping) costs ~tens of µs per call — and that wrapper,
+not the search, dominates a 3-point query.  After the `find_face` batch
+the two `_to_local` queries became a visible slice; batching them into
+one `query([p_start, p_end])` cut `KDTree.query` from 2186 → 1375 calls
+(cProfile; the −811 are exactly the per-`_try_solve` pairs) and measured
+a consistent **~4 %** on the worker path (interleaved A/B, both
+orderings, fandisk no-locator).  Nearest vertices are identical to the
+per-point queries, so it is bit-for-bit output-preserving (parity oracle
+`0.000e+00`, both locator regimes).  Lesson: "C-coded, so negligible"
+ignored the per-call Python wrapper cost — measure, don't estimate.
+
 ### Make the `area < 1e-15` check in `_add_point_local` scale-relative
 
 **Proposed**: in [`_add_point_local`](../geodesics.py#L2844), the
@@ -207,6 +239,17 @@ subdivision would hit the threshold and degrade to vertex-snap.
   area check is the only absolute one and only fires after
   ``_add_point_buf`` has chosen a 1-to-3 subdivision over the
   cheaper snap / 2-to-4 paths.
+- **Confirmed empirically (2026-05-30)**: ran the orange cascade on
+  fandisk uniformly scaled by ``s`` (insertion sub-triangle areas scale
+  by ``s²``) and counted revert-branch hits.  At scale 1.0 (bbox diag
+  7.6) the smallest insertion sub-triangle was ``5.3e-6`` with **0
+  reverts**; at 1e-2 (bbox 0.076) min ``5.3e-10``, **0 reverts**; at
+  1e-4 (bbox 7.6e-4) min ``6.7e-15``, still **0 reverts**.  The branch
+  first fires at scale ~1e-5 (bbox ~7.6e-5, i.e. tens of µm) and only
+  goes all-revert at ~1e-7 (sub-µm bbox).  So at any realistic scale
+  (bbox ≳ 1e-3 — every normalised mesh and mm/cm CAD model) there is a
+  ≥6-order-of-magnitude margin and the absolute threshold cannot
+  misfire.
 - Re-open with a reproduction: sub-nanometre mesh + spline +
   log line showing every insertion taking the area-degenerate
   branch.  The fix will then be straightforward.
@@ -410,6 +453,157 @@ take the per-call time from ~25 ms down to **<5 ms**.
 **Re-open if**: someone shows a profile demonstrating that
 non-solver Python time exceeds ~10 ms per call AND a working
 proof-of-concept beats Numba-JIT'd BFS on a real mesh by ≥3×.
+
+### Batch the boundary-check `find_face` via `project_smooth_batch_with_faces`
+
+**Proposed**: the C++-rewrite entry above lists "batch the per-point
+`find_face` in the boundary check" as a cheap, viable speedup.  The
+boundary check at the end of
+[`_try_solve_on_region`](../geodesics.py#L2316) calls
+`self.find_face(pt)` once per path point (a Python↔VTK round-trip).
+The obvious batch is one vectorised
+`project_smooth_batch_with_faces(path)` call + an `np.isin` membership
+test against `boundary_faces_global` — the *same* projection kernel
+that already seeds the region.
+
+**Rejected because**:
+- **It changes the curve.**  Implemented and validated with the
+  in-process cascade parity oracle
+  ([`tests/benchmark_endpoint_local.py --baseline/--check`](../tests/benchmark_endpoint_local.py)):
+  the output diverged by **~2-3e-2** (max abs, fandisk + 6-node closed
+  spline) on *both* the locator and no-locator paths.  That is the
+  same order as the documented discrete-geodesic flip-flop
+  (`~1.5e-2`), and for the same reason: `find_face` (VTK
+  `FindClosestPoint` + barycentric validation) and the projection
+  kernel (KDTree + analytical projection) disagree on which face a
+  point lands on *at submesh boundaries* — exactly the zone the check
+  inspects.  Flipping a `'boundary'`/`'ok'` verdict changes the
+  escalation path and the final edge chain.  This is the same class
+  of "redistributes the flip-flop" non-transparency that got the
+  `ORANGE_SUBMESH_SUBDIV` bump reverted.
+- A semantics-preserving batch (keeping `find_face` exactly) cannot
+  batch the dominant locator call: VTK `FindClosestPoint` has no
+  vectorised API, so only the no-locator KDTree path is batchable —
+  and that path is the export-only one.
+- **Better targets existed and were taken instead.**  The same
+  profiling run showed the cost is spread across several ~10-15 %
+  buckets, not concentrated in the solver (solver was only ~12-15 %
+  of a ~3.9 ms/call mean on the export cascade — note this is the
+  `submesh_subdiv=0` regime, lighter than the ~25 ms editor-drag
+  figure the C++ entry cites).  Two **bit-for-bit output-preserving**
+  vectorisations were applied instead: the candidate-face scan in
+  [`_add_point_local`](../geodesics.py#L2865) (206→~110 µs/call) and
+  the edge-hash loop in
+  [`_build_face_adj_buf`](../geodesics.py#L2619) (396→~100 µs/call),
+  together ~−20 % on `compute_endpoint_local` with zero curve change
+  (parity `0.000e+00`, locked by
+  [`tests/test_build_face_adj_buf_vectorized.py`](../tests/test_build_face_adj_buf_vectorized.py)).
+
+**Re-open if**: a batch face-classifier is found that returns the
+*identical* face as `find_face` for every path point (so the parity
+oracle stays at `0.000e+00`), and profiling still shows the
+boundary-check `find_face` as a top bucket after the two
+vectorisations above.
+
+**Update (2026-05-29 — partially reopened and shipped)**: the
+parenthetical above ("only the no-locator KDTree path is batchable —
+and that path is the export-only one") was incomplete.  The no-locator
+path is **also the orange worker's** path — the worker and the CLI
+export both build with `build_locator=False` — where `find_face` was
+profiled at **~46 %** of `compute_endpoint_local` (no-locator, fandisk,
+via [`tests/benchmark_endpoint_local.py`](../tests/benchmark_endpoint_local.py)).
+A **semantics-preserving** batch — [`_find_faces_batch`](../geodesics.py),
+which runs the *same* batched `KDTree.query` + candidate arg-min and
+returns the bit-identical face per point — satisfies this entry's own
+re-open trigger and was shipped (commit `68301fb`): parity oracle
+`0.000e+00` on both regimes, ~13 % faster on the worker path, locked by
+[`tests/test_find_faces_batch.py`](../tests/test_find_faces_batch.py).
+The **originally-proposed** swap to `project_smooth_batch_with_faces`
+(a *different* classifier) stays rejected — it still changes the curve
+~2e-2.
+
+### Reduce the global-fallback rate by ignoring real mesh-boundary edges in the truncation check
+
+**Proposed**: real-session profiling (34 heart-SSM sessions, meshes
+32k–246k faces) showed the dominant cost of `compute_endpoint_local`
+is the **full-mesh global solver** reached when all local phases fail
+(~28–29 % of calls on the hard sessions; `solver_build` was 87–98 % of
+the time, almost all of it full-mesh).  Root cause: these are **open**
+surfaces (cut at valve planes, 0.5–5 % of faces on a real boundary),
+and the truncation check in
+[`_try_solve_on_region`](../geodesics.py#L2244) flags a path point on a
+*real* mesh-boundary face (`nb < 0`) as possible truncation → escalate
+→ but escalation can never resolve a real boundary → exhaust local
+phases → fall to the full-mesh solver.  Proposal: treat only
+**artificial** submesh boundaries (a neighbour that exists outside the
+region) as truncating; ignore real mesh-boundary edges.  Optionally
+gate it to dense meshes (`faces > 100k`) to stay exact.
+
+**Rejected because**:
+- **Huge speedups, but it changes the curve unpredictably.**  A/B
+  measured with a parity oracle (cascade output, flag ON vs OFF) on all
+  34 sessions: speedups up to **46×** (`RVN_tricuspide_septum`,
+  24.5 s→0.53 s, exact) — but the curve **diverged** on specific
+  geometries, worst `RVP_pulmonary_septum` **0.130** (235k faces),
+  `RVN_pulmonary_septum` 5.85e-4 (175k), `LVN_240` 0.0167 (32k).  For
+  those spans the global full-mesh solver returns a *genuinely
+  different* geodesic — i.e. the real-boundary touch was a **legitimate**
+  truncation signal there, not an artefact.
+- **The density gate is refuted.**  Divergence does NOT vanish on fine
+  meshes: the densest mesh tested (235k) showed the *largest* divergence
+  (0.130), while a 175k mesh was exact on 5/6 spans.  Divergence tracks
+  the span's start/end geometry (the `*_pulmonary_septum` seeds flip on
+  multiple meshes), not face count — so no `faces > N` threshold
+  separates exact from divergent.
+- **"Gate on agreement" defeats the purpose.**  Verifying the fast
+  result against the full-mesh oracle per call means paying for the
+  full-mesh build anyway — no net speedup.
+- 0.130 is far beyond the documented discrete flip-flop noise
+  (~1.5e-2); shipping it would visibly move the rendered curve on
+  exactly the clinically-interesting septum spans.
+
+**Re-open if**: a *per-call*, *cheap* criterion is found that decides
+when suppressing real-boundary escalation yields the same path as the
+global solver (parity oracle `< 1e-9`), without computing the global
+solve.  The exact-everywhere subset is large (most sessions were
+bit-identical with multi-× speedups) — the blocker is detecting the
+divergent spans without the oracle.  Probe lived in
+`fallback_probe.py` (uncommitted); the per-session A/B numbers are in
+the workflow run `validate-fallback-gate`.
+
+### Numba / bool-mask rewrite of `_bfs_advance`
+
+**Proposed**: replace the set-based BFS frontier expansion in
+[`_bfs_advance`](../geodesics.py) with a length-`nf` NumPy bool
+`visited` mask (optionally a Numba kernel), eliminating the per-ring
+Python loop entirely.  Endorsed in the abstract by the "cheaper paths"
+note of the C++-rewrite entry above ("Numba-JIT the BFS expansion
+(set → numpy bool mask)").
+
+**Rejected because**:
+- The cheaper, lower-risk half was taken first: `_bfs_advance` now
+  vectorises the neighbour gather (`adj[frontier]` + dedupe) while
+  keeping the plain-set interface (commit `b8184bd`).  That alone cut
+  its self-time from 0.207 s → 0.075 s (−64 %) and dropped the `bfs`
+  profiling bucket to **~4.3 %** of `compute_endpoint_local`
+  (no-locator worker, fandisk).
+- The full bool-mask variant was then implemented and A/B-measured
+  against that vectorised-gather version: **~1.8 %, within run-to-run
+  noise** (3.29 vs 3.35 ms mean/call; the runs overlapped — in one
+  cycle the bool-mask was *slower*).  Parity oracle `0.000e+00` — it
+  was correct, just not faster.  4.3 % is the hard ceiling (the whole
+  bucket), so no implementation can exceed it.
+- Cost rejected for that noise-level gain: it changes the
+  `visited` / `frontier` contract from sets to `(bool-mask, array)`
+  across `_bfs_init`, `_bfs_advance`, `_expand_face_region` and the
+  three phases of `compute_endpoint_local` (phase-B
+  `frontier |= frontier_d` → `np.union1d`, `sorted(visited)` →
+  `np.flatnonzero`), and forces a rewrite of the `_bfs_advance`
+  contract test.
+
+**Re-open if**: profiling shows the `bfs` bucket exceeding ~15 % on
+some mesh / regime (a much denser mesh, or a `submesh_subdiv` level
+where the BFS dominates), making the ceiling worth chasing.
 
 ---
 
