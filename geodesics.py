@@ -2203,9 +2203,11 @@ class GeodesicMesh:
         along the expected geodesic path — the two fronts are already
         connected).  Returns a sorted int32 array of face indices.
 
-        See ``_expand_face_region_incremental`` for the version used by
-        ``compute_endpoint_local`` retry loop, which preserves the
-        ``visited``/``frontier`` state across calls.
+        This one-shot helper rebuilds the BFS state from scratch.
+        ``compute_endpoint_local``'s retry loop instead drives
+        ``_bfs_init`` + ``_bfs_advance`` directly, advancing the same
+        ``visited`` / ``frontier`` state by ring *increments* across
+        phases A / B / C so each escalation only walks the new rings.
         """
         visited, frontier = self._bfs_init(seed_faces)
         self._bfs_advance(visited, frontier, k_rings)
