@@ -1433,8 +1433,9 @@ each verified **bit-for-bit** against the cascade parity oracle
 | Scalarised `_barycentric` | five `np.dot` on 3-vectors → explicit scalar arithmetic (`np.dot`'s per-call dispatch dominates length-3 inputs); a leaf called once per candidate face | ~10 % |
 | Vectorised `_bfs_advance` | `adj[frontier]` gather + dedupe instead of a Python double loop over (frontier × 3 edges); plain-set interface kept | ~10 % |
 | Batched `_to_local` endpoint query | one `KDTree.query([p_start, p_end])` instead of two single-point queries (scipy's query wrapper costs ~tens of µs/call, not ~1-2 µs) | ~4 % |
+| Scalarised degenerate-area check | `0.5*norm(cross(e1, e2))` on 3-vectors → explicit cross magnitude in `_add_point_local`'s post-insertion guard; the area only gates a `<1e-15` threshold and is never propagated, so any last-ULP drift is harmless | ~4 % |
 
-The four compound to roughly a third off the worker-path mean/call, with
+The five compound to roughly a third off the worker-path mean/call, with
 no measurable change on the locator (interactive editor) path and zero
 change to any rendered curve. Ideas tried and *rejected* by the same
 oracle / profiler -- a Numba bool-mask `_bfs_advance` rewrite (~2 %,
