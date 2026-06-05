@@ -11,11 +11,32 @@ sits on top of ``MidpointShooterApp`` (geo_shoot.py) and adds:
   - Background workers (``_SpanWorkManager``) for the orange layer.
   - Snapshot-based undo/redo with differential restoration.
   - JSON save / load and CLI entry point.
+  - Imported guide polylines (Ctrl+X to load, X to toggle).
+  - Hold-to-show node-index labels (key 'n').
 
 For the user-facing description (interaction model, three curve layers,
 geodesic algorithms, performance notes, save/load format, dependencies)
 see README.md — that is the canonical reference and this module avoids
 duplicating it to prevent rot.
+
+CLI usage
+---------
+
+::
+
+    python geo_splines.py                                 # default mesh
+    python geo_splines.py <mesh.{obj,ply,stl,vtk}>        # mesh only
+    python geo_splines.py <session.json>                  # session + its own mesh
+    python geo_splines.py <session.json> <mesh.{...}>     # session + override mesh
+
+The fourth form replaces the session's ``mesh_file`` reference with
+the explicit second argument — useful for inspecting the same splines
+against a different geometry (registered counterpart, higher-res
+resampling).  Splines store 3-D positions, not vertex indices, so
+they re-project onto the alternate surface at load time.
+
+Pass ``-h`` / ``--help`` for the same usage block from the command
+line.  See ``_cli_main`` for the canonical reference.
 
 Quick map of the main classes
 -----------------------------
@@ -36,16 +57,43 @@ import logging
 import multiprocessing as mp
 import multiprocessing.shared_memory as _shm
 import os
+
+# Disable the Intel Fortran runtime's Win32 Console Control Handler
+# **before** anything that loads MKL (numpy / scipy / potpourri3d).
+# When Anaconda's scientific stack imports MKL, ``libifcoremd.dll``
+# installs its own ``SetConsoleCtrlHandler`` ahead of the Python
+# signal machinery — that handler runs on Ctrl+C, prints the
+# unreadable ``forrtl: error (200)`` traceback to stderr and calls
+# ``abort()``, killing the process before Python can raise
+# ``KeyboardInterrupt`` or run any ``finally`` cleanup.  With four
+# orange workers each holding their own MKL load, the user sees four
+# interleaved tracebacks and the terminal hangs (parent never gets
+# its KeyboardInterrupt either, because its own MKL handler aborted
+# too).
+#
+# Setting this env var **before MKL is dlopen'd** instructs the
+# Intel Fortran runtime to skip installing the Console Control
+# Handler entirely; Python's ``signal.signal(SIGINT, SIG_IGN)`` in
+# the worker initialiser then becomes the only active handler in
+# children, and the parent's normal ``KeyboardInterrupt`` path takes
+# over.  Workers inherit ``os.environ`` via ``spawn`` so this single
+# assignment covers both ranks.  Harmless on non-Intel toolchains —
+# the var is read only by ``libifcoremd.dll``.
+os.environ.setdefault('FOR_DISABLE_CONSOLE_CTRL_HANDLER', '1')
+
 import signal
 import sys
 import tempfile
+import time
 import weakref
 from collections import deque
+from collections.abc import Iterator
 from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from multiprocessing.connection import Connection
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pyvista as pv
@@ -166,12 +214,21 @@ _HUD_TEXTS: dict[str, str] = {
     "load_failed": "LOAD FAILED",
     "load_failed_version": "LOAD FAILED: unknown version",
     "load_failed_format": "LOAD FAILED: invalid format",
+    "load_failed_json": "LOAD FAILED: invalid JSON at line {line} col {col}: {msg}{hint}",
     "computing_orange": "COMPUTING ORANGE {done}/{total}",
     "orange_done": "ORANGE DONE",
     "orange_rebuilt": "ORANGE REBUILT",
     "geodesic_fallback": "GEODESIC FALLBACK on span {sid}:{i}",
     "shoot_truncated": "GEODESIC TRUNCATED at non-manifold vertex (mesh defect)",
     "gizmo_opacity": "GIZMO OPACITY {pct}",
+    "orange_fullmesh_on":  "ORANGE: FULL-MESH ON (slower, no submesh artifacts) — press R to rebuild",
+    "orange_fullmesh_off": "ORANGE: FULL-MESH OFF (fast submesh) — press R to rebuild",
+    "guides_loaded":     "GUIDES LOADED ({n_files} file(s), {n_segs} segments)",
+    "guides_load_failed": "GUIDE LOAD FAILED: {fname}: {err}",
+    "guides_empty":      "GUIDE LOAD FAILED: {fname} has no line cells (cell type 3)",
+    "guides_on":         "GUIDES ON",
+    "guides_off":        "GUIDES OFF",
+    "guides_none":       "NO GUIDES LOADED — use Ctrl+X to import",
 }
 
 
@@ -190,6 +247,25 @@ def _t(key: str, **kwargs) -> str:
         return template.format(**kwargs)
     except (KeyError, IndexError):
         return template
+
+
+def _json_decode_hint(exc: json.JSONDecodeError) -> str:
+    """Best-effort hint for the most common hand-edit JSON mistakes.
+
+    Returns either an empty string or a leading-space-prefixed hint
+    like ``" (trailing comma?)"`` so the caller can splat it into a
+    HUD / log line without conditional branching.
+
+    Detection is purely on ``exc.msg``: the standard library's parser
+    reports ``Expecting value`` when a comma is followed immediately
+    by a closing bracket, and ``Expecting property name enclosed in
+    double quotes`` for the equivalent inside an object.  Both
+    patterns are the canonical trailing-comma signature.
+    """
+    m = exc.msg
+    if 'Expecting value' in m or 'Expecting property name' in m:
+        return ' (likely a trailing comma — JSON does not allow them)'
+    return ''
 
 
 def _validate_session_dict(data: dict) -> None:
@@ -363,6 +439,16 @@ def _process_initializer(v_shm_name: str, v_shape: tuple, v_dtype: str,
     ``TerminateProcess`` on Windows, killing the children at the OS
     level before any Fortran cleanup can run.
     """
+    # Belt-and-braces against MKL's Console Control Handler: the
+    # module-level ``os.environ.setdefault`` already runs in this
+    # spawned child (Windows ``spawn`` inherits the parent's env, and
+    # the child re-imports geo_splines to resolve this initializer),
+    # but we re-assert it here in case a custom launcher cleared the
+    # variable between fork and ``_process_initializer``.  Must precede
+    # the scipy / pp3d import chain (triggered below by GeodesicMesh
+    # construction) for the same reason as in the parent.
+    os.environ.setdefault('FOR_DISABLE_CONSOLE_CTRL_HANDLER', '1')
+
     # Block SIGINT before anything else — the import of scipy / pp3d
     # below already pulls in MKL, and we want the SIGINT mask in place
     # before any Fortran call starts.
@@ -383,9 +469,9 @@ def _process_initializer(v_shm_name: str, v_shape: tuple, v_dtype: str,
 
     global _process_geo
     shm_v = _shm.SharedMemory(name=v_shm_name)
-    V = np.ndarray(v_shape, dtype=np.dtype(v_dtype), buffer=shm_v.buf)
+    V: np.ndarray = np.ndarray(v_shape, dtype=np.dtype(v_dtype), buffer=shm_v.buf)
     shm_f = _shm.SharedMemory(name=f_shm_name)
-    F = np.ndarray(f_shape, dtype=np.dtype(f_dtype), buffer=shm_f.buf)
+    F: np.ndarray = np.ndarray(f_shape, dtype=np.dtype(f_dtype), buffer=shm_f.buf)
     # GeodesicMesh copies V and F internally (np.asarray), so the shm
     # mapping can be closed after init without invalidating the mesh.
     # ``copy()`` defends against premature shm.close() on platforms
@@ -452,6 +538,13 @@ class SplineConfig:
     SPAN_COLOR_HEX: str = '#a0a0b8'
     SPAN_LINE_WIDTH: int = 2
     STITCH_SKIP_PX: float = 3.0
+    # Delay after the cursor stops moving before the stitch line is
+    # recomputed with the exact (topology-inserted) endpoint geodesic
+    # instead of the vertex-snapped fast path.  ~25 ms compute via
+    # ``compute_endpoint_from_origin`` — small enough to feel instant
+    # once the cursor settles, large enough that continuous motion never
+    # triggers it.
+    STITCH_EXACT_DEBOUNCE_SEC: float = 0.15
 
     # Drag preview: lighter / thinner spans while dragging (before debounce)
     SPAN_DRAG_COLOR_HEX: str = '#88bbff'
@@ -504,6 +597,22 @@ class SplineConfig:
     ORANGE_SUBDIV_TOL_FACTOR: float = 0.01   # fraction of mean edge length
     ORANGE_SUBDIV_MAX_DEPTH: int = 6         # recursion cap for densification
     ORANGE_CHORD_BRIDGING: bool = True       # phase-3 short-geodesic polyline
+    # When True, the worker's level-2 / level-3 cascade geodesics
+    # (``solver(b01, b12)``, ``solver(b12, b23)``, ``solver(c0, c1)``)
+    # use ``compute_endpoint`` (full-mesh insertion) instead of
+    # ``compute_endpoint_local`` (submesh-bounded).  Trades ~3-5×
+    # per-evaluation cost for elimination of submesh-extraction
+    # artifacts — slight changes in the inputs no longer flip the
+    # solver between regions whose discrete geodesics diverge.  Off
+    # by default; flip on for meshes where the orange curve shows
+    # noisy / wandering segments that don't look like genuine
+    # cascade-topology changes (verify by comparing the same span
+    # with the flag on vs off — if the noise drops dramatically,
+    # those jumps were submesh artifacts).  Genuine cascade-topology
+    # jumps (where ``c0`` and ``c1`` themselves cross a saddle as
+    # ``t`` advances) persist regardless of this flag — no solver
+    # swap can fix those.
+    ORANGE_USE_FULL_MESH: bool = False
 
     # Submesh subdivision for the orange worker's geodesic solver.
     # ``compute_endpoint_local`` extracts a small submesh around the
@@ -549,9 +658,52 @@ class SplineConfig:
     INTERP_SECANT_TOL_FACTOR: float = 0.002  # 5x tighter than Bezier layers
     INTERP_SECANT_MAX_DEPTH: int = 8         # 256x local refinement
 
+    # Node-index labels (visible while 'n' key is held).  Black bold
+    # text floating just above each node origin; size in screen-pixels
+    # so it stays legible at any zoom.  Used for "which sphere is
+    # node #4?" debugging during multi-node edits.
+    NODE_LABEL_FONT_SIZE: int = 16
+    NODE_LABEL_COLOR_HEX: str = '#000000'
+    # Pixel offset (dx, dy) applied to every label relative to the
+    # node's screen-projected position.  Pushes the text above the
+    # red sphere so it does not occlude the node marker.
+    NODE_LABEL_OFFSET_PX: tuple = (0, 14)
+
+    # Curve-hover marker (telescopic-sight crosshair on a billboarded
+    # circle): radius of the circle / half-extent of the crosshair,
+    # expressed as a fraction of camera-to-point distance so the
+    # indicator keeps a constant on-screen size at any zoom.  Both
+    # diameters are aligned with the camera's view-plane axes (right
+    # = horizontal, up = vertical) — the curve tangent is NOT used,
+    # so the marker reads as a real telescopic sight regardless of
+    # how the underlying curve is oriented in 3D.
+    HOVER_MARKER_SCREEN_SCALE: float = 0.006
+    # Sample count for the circumference polyline.  32 is enough to
+    # look smooth at typical zoom levels; doubling it doubles the
+    # geometry written on every camera refresh.
+    HOVER_MARKER_CIRCLE_SAMPLES: int = 32
+    # Independent line widths so the circle is visibly "the frame"
+    # and the crosshair reads as a thinner aim guide.
+    HOVER_MARKER_CIRCLE_LINE_WIDTH: int = 2
+    HOVER_MARKER_CROSS_LINE_WIDTH: int = 1
+
+    # Imported guide polylines (key Ctrl+X to load, key X to toggle).
+    # Rendered behind every spline layer so the user's actual curves
+    # remain visually dominant; ``GUIDE_OPACITY`` is the alpha applied
+    # to the line segments (low transparency = high alpha).
+    GUIDE_COLOR_HEX: str = '#00aa00'   # green
+    GUIDE_LINE_WIDTH: int = 3
+    GUIDE_OPACITY: float = 0.1
+    # Hold X to preview guides at full opacity; on release, when the
+    # previous state was 'hidden', the opacity fades from 1.0 back to
+    # ``GUIDE_OPACITY`` over this duration (ease-out quadratic).  Tied
+    # to the Master Clock's 50 ms cadence → ~10 frames of animation.
+    GUIDE_FADE_DURATION_SEC: float = 0.5
+
     # Z-depth priority (polygon offset) per visual layer.
     # Lower = closer to camera = drawn on top.  Layering from back to front:
-    # mesh wireframe → interp → blue Bézier → orange Bézier → curve hover marker
+    # mesh wireframe → guides → interp → blue Bézier → orange Bézier → curve hover marker
+    DEPTH_GUIDE: float = -3.0
     DEPTH_INTERP: float = -6.0
     DEPTH_BLUE: float = -8.0
     DEPTH_STITCH: float = -8.0
@@ -626,14 +778,15 @@ def _eval_cascade_at_t(
     path_a_rev: np.ndarray, cum_a: np.ndarray, total_a: float,
     path_12: np.ndarray, cum_12: np.ndarray, total_12: float,
     submesh_subdiv: int = 0,
+    use_full_mesh: bool = False,
 ) -> tuple[np.ndarray, bool]:
     """Evaluate one full de Casteljau cascade level at parameter *t*.
 
     Used by the orange worker for both phase-1 (canonical t-grid samples)
     and phase-2 (densification at midpoint t-values).  Returns
     ``(point, degraded)`` where ``degraded`` is True if any of the three
-    ``compute_endpoint_local`` calls fell back to a straight-line
-    polyline (component break, solver failure).
+    inner solver calls fell back to a straight-line polyline (component
+    break, solver failure).
 
     The cascade structure:
       level 1  →  b01 = lerp(path_b, t)
@@ -643,41 +796,52 @@ def _eval_cascade_at_t(
                   path_c1 = geodesic(b12, b23)  → c1 = lerp(path_c1, t)
       level 3  →  path_final = geodesic(c0, c1)  → result = lerp(path_final, t)
 
-    *submesh_subdiv* propagates to every ``compute_endpoint_local``
-    call so the discrete geodesic the solver returns converges to
-    the smooth-surface geodesic — see that method's docstring.
+    Solver dispatch:
 
-    Three ``compute_endpoint_local`` calls per evaluation
-    (~25 ms × 3 = 75 ms typical at ``submesh_subdiv=0``; ~100 ms × 3
-    at level 1).  Worker calls this 31 times in phase 1 (skipping the
-    two endpoints) plus once per densification step in phase 2 — the
-    dominant cost of an orange span.
+    * ``use_full_mesh=False`` (default) — uses ``compute_endpoint_local``
+      with the supplied *submesh_subdiv*.  Fast (~25-100 ms per call)
+      but the submesh extraction can return topologically different
+      paths for slightly-perturbed inputs at certain ``t``, producing
+      visible jumps in the rendered curve.
+    * ``use_full_mesh=True`` — uses ``compute_endpoint`` instead.
+      ~3-5× slower because the solver is built on the augmented full
+      mesh, but the answer is stable: equal inputs → equal outputs,
+      modulo only floating-point noise.  Eliminates submesh-extraction
+      artifacts.  Genuine cascade-topology jumps (where ``c0`` and
+      ``c1`` themselves cross a saddle vertex as ``t`` advances)
+      persist — no solver swap can fix those.
     """
     log_w = logging.getLogger("geo_splines.worker")
     degraded = False
+
+    if use_full_mesh:
+        def _solve(p_a, p_b):
+            return geo.compute_endpoint(p_a, p_b)
+    else:
+        def _solve(p_a, p_b):
+            return geo.compute_endpoint_local(
+                p_a, p_b, submesh_subdiv=submesh_subdiv)
 
     b01 = GeodesicMesh.geodesic_lerp(path_b, t, cum_b, total_b)
     b12 = GeodesicMesh.geodesic_lerp(path_12, t, cum_12, total_12)
     b23 = GeodesicMesh.geodesic_lerp(path_a_rev, t, cum_a, total_a)
 
     try:
-        path_c0, fb_c0 = geo.compute_endpoint_local(
-            b01, b12, submesh_subdiv=submesh_subdiv)
+        path_c0, fb_c0 = _solve(b01, b12)
         if fb_c0:
             degraded = True
     except (RuntimeError, ValueError, TypeError, IndexError) as exc:
-        log_w.debug("compute_endpoint_local(b01, b12) failed: %s", exc)
+        log_w.debug("solver(b01, b12) failed: %s", exc)
         path_c0, degraded = np.array([b01, b12]), True
     if path_c0 is None or len(path_c0) < 2:
         path_c0, degraded = np.array([b01, b12]), True
 
     try:
-        path_c1, fb_c1 = geo.compute_endpoint_local(
-            b12, b23, submesh_subdiv=submesh_subdiv)
+        path_c1, fb_c1 = _solve(b12, b23)
         if fb_c1:
             degraded = True
     except (RuntimeError, ValueError, TypeError, IndexError) as exc:
-        log_w.debug("compute_endpoint_local(b12, b23) failed: %s", exc)
+        log_w.debug("solver(b12, b23) failed: %s", exc)
         path_c1, degraded = np.array([b12, b23]), True
     if path_c1 is None or len(path_c1) < 2:
         path_c1, degraded = np.array([b12, b23]), True
@@ -688,12 +852,11 @@ def _eval_cascade_at_t(
     c1 = GeodesicMesh.geodesic_lerp(path_c1, t, cum_c1, total_c1)
 
     try:
-        path_final, fb_f = geo.compute_endpoint_local(
-            c0, c1, submesh_subdiv=submesh_subdiv)
+        path_final, fb_f = _solve(c0, c1)
         if fb_f:
             degraded = True
     except (RuntimeError, ValueError, TypeError, IndexError) as exc:
-        log_w.debug("compute_endpoint_local(c0, c1) failed: %s", exc)
+        log_w.debug("solver(c0, c1) failed: %s", exc)
         path_final, degraded = np.array([c0, c1]), True
     if path_final is None or len(path_final) < 2:
         path_final, degraded = np.array([c0, c1]), True
@@ -753,6 +916,7 @@ def _geodesic_decasteljau_worker(
     subdiv_max_depth: int = 6,
     chord_bridging: bool = True,
     submesh_subdiv: int = 0,
+    use_full_mesh: bool = False,
 ) -> None:
     """Background worker: computes the orange (fully geodesic) curve.
 
@@ -822,6 +986,7 @@ def _geodesic_decasteljau_worker(
 
     try:
         geo = _process_geo
+        assert geo is not None, "_process_initializer must run before _geodesic_decasteljau_worker"
         P0, H_out, H_in, P1 = ctrl
 
         cum_b, total_b = GeodesicMesh.compute_path_lengths(path_b)
@@ -830,12 +995,19 @@ def _geodesic_decasteljau_worker(
         degraded_any = False
 
         # Cache the level-1 middle path (constant across all t).
+        # Honours ``use_full_mesh`` so the cached ``path_12`` matches
+        # the per-t inner solver behaviour — mixing full-mesh inner
+        # calls with a submesh-derived ``path_12`` would let the
+        # submesh artifact leak in via ``b12 = lerp(path_12, t)``.
         try:
-            path_12, fb12 = geo.compute_endpoint_local(
-                H_out, H_in, submesh_subdiv=submesh_subdiv)
+            if use_full_mesh:
+                path_12, fb12 = geo.compute_endpoint(H_out, H_in)
+            else:
+                path_12, fb12 = geo.compute_endpoint_local(
+                    H_out, H_in, submesh_subdiv=submesh_subdiv)
         except (RuntimeError, ValueError, TypeError, IndexError) as exc:
             logging.getLogger("geo_splines.worker").debug(
-                "compute_endpoint_local(H_out, H_in) failed: %s", exc)
+                "level-1 path_12 solver failed: %s", exc)
             path_12, fb12 = None, True
         if path_12 is None or len(path_12) < 2:
             path_12, degraded_any = np.array([H_out, H_in]), True
@@ -859,8 +1031,10 @@ def _geodesic_decasteljau_worker(
 
         for idx in inner_order:
             t = float(t_grid[idx])
-            point, deg = _eval_cascade_at_t(geo, t, *eval_args,
-                                            submesh_subdiv=submesh_subdiv)
+            point, deg = _eval_cascade_at_t(
+                geo, t, *eval_args,
+                submesh_subdiv=submesh_subdiv,
+                use_full_mesh=use_full_mesh)
             if deg:
                 degraded_any = True
             # Insert in t-sorted order on the worker side too — phase 2
@@ -902,8 +1076,10 @@ def _geodesic_decasteljau_worker(
                     if not needs_split[i]:
                         continue
                     t_mid = (t_list[i] + t_list[i + 1]) * 0.5
-                    pt, deg = _eval_cascade_at_t(geo, t_mid, *eval_args,
-                                                 submesh_subdiv=submesh_subdiv)
+                    pt, deg = _eval_cascade_at_t(
+                        geo, t_mid, *eval_args,
+                        submesh_subdiv=submesh_subdiv,
+                        use_full_mesh=use_full_mesh)
                     if deg:
                         degraded_any = True
                     inserts.append((t_mid, pt))
@@ -912,8 +1088,10 @@ def _geodesic_decasteljau_worker(
                 any_split = False
                 for i in range(n_pairs):
                     t_mid = (t_list[i] + t_list[i + 1]) * 0.5
-                    pt, deg = _eval_cascade_at_t(geo, t_mid, *eval_args,
-                                                 submesh_subdiv=submesh_subdiv)
+                    pt, deg = _eval_cascade_at_t(
+                        geo, t_mid, *eval_args,
+                        submesh_subdiv=submesh_subdiv,
+                        use_full_mesh=use_full_mesh)
                     if deg:
                         degraded_any = True
                     diff = pt - mids[i]
@@ -1062,9 +1240,16 @@ class _SpanWorkManager:
                                            weakref.ref(self))
 
         # --- Orange (fully geodesic) tracking ---
+        # ``_points[key]`` is a per-span state dict with three keys:
+        #   - 't_list':   list[float]            (t values, sorted)
+        #   - 'p_list':   list[np.ndarray]       (cascade samples, t-aligned)
+        #   - 'polyline': np.ndarray | None      (phase-3 chord-bridged override)
+        # ``Any``-valued to keep static-typed setitem (e.g. ``state['polyline']
+        # = ndarray``) checkers happy; a TypedDict would be more precise but
+        # the dict is read in only a handful of places.
         self._readers: dict[SpanKey, Connection] = {}
         self._futures: dict[SpanKey, Future] = {}
-        self._points: dict[SpanKey, list[np.ndarray]] = {}
+        self._points: dict[SpanKey, dict[str, Any]] = {}
         self.dirty_spans: set[SpanKey] = set()
         self.done_spans: set[SpanKey] = set()  # spans whose worker sent 'done'
         # Spans whose worker reported a geodesic fallback.  The main
@@ -1182,7 +1367,8 @@ class _SpanWorkManager:
                     subdiv_tol_factor: float = 0.01,
                     subdiv_max_depth: int = 6,
                     chord_bridging: bool = True,
-                    submesh_subdiv: int = 0) -> None:
+                    submesh_subdiv: int = 0,
+                    use_full_mesh: bool = False) -> None:
         """Submits a fully geodesic (orange) worker.
 
         Per-span state on the parent is a t-sorted ``(t_list, p_list)``
@@ -1258,6 +1444,7 @@ class _SpanWorkManager:
             subdiv_max_depth=subdiv_max_depth,
             chord_bridging=chord_bridging,
             submesh_subdiv=submesh_subdiv,
+            use_full_mesh=use_full_mesh,
         )
         try:
             future = self._executor.submit(
@@ -1541,12 +1728,28 @@ class _SpanWorkManager:
         skip the rest of the cleanup and leak the un-unlinked block on
         POSIX ``/dev/shm``.
 
-        ``executor.shutdown(cancel_futures=True)`` (Python >= 3.9) sends
-        SIGTERM equivalents to live workers — they can occasionally emit
-        ``BrokenPipeError`` tracebacks during this teardown.  Those are
-        downgraded to DEBUG level via the worker's logger (set up in
-        ``_process_initializer``); we no longer hard-redirect stderr at
-        the OS level so legitimate failures still surface.
+        Worker termination is **two-phase**:
+
+          1. ``executor.shutdown(wait=False, cancel_futures=True)`` —
+             cancels every *pending* future and signals the executor to
+             stop dispatching new work.  Running futures, however, cannot
+             be cancelled by this call — and our workers have
+             ``SIG_IGN`` on SIGINT (installed in ``_process_initializer``
+             to silence MKL's forrtl traceback), so Ctrl+C does NOT kill
+             them either.  If we stopped here, ``concurrent.futures``'s
+             atexit hook (``_python_exit``) would re-call ``shutdown(wait=True)``
+             and block the interpreter until every worker finished its
+             current orange-geodesic compute (often 2-5 s).  The user
+             sees: "Caught a Ctrl-C within python, exiting program" plus
+             a window that stays open until the workers drain.
+          2. Force-kill via ``Process.kill()`` (Windows: ``TerminateProcess``,
+             POSIX: ``SIGKILL``) on every process in ``executor._processes``.
+             This is the only way to break out promptly when SIGINT was
+             intercepted at Python level *by design*.  Uses the private
+             ``_processes`` attribute because ``concurrent.futures`` does
+             not expose a public force-kill API; the attribute has been
+             stable since 3.5.  Wrapped in try/except so a worker that
+             has already exited cannot break the rest of the loop.
         """
         if getattr(self, '_shutdown_done', False):
             return
@@ -1565,6 +1768,17 @@ class _SpanWorkManager:
                 log.debug("executor.shutdown fallback: %s", exc)
         except Exception as exc:  # noqa: BLE001
             log.debug("executor.shutdown: %s", exc)
+        # Phase 2: force-kill any worker still alive (see docstring).
+        # ``_processes`` is a dict[pid, multiprocessing.Process] on every
+        # supported Python version; defensive ``getattr`` for the
+        # vanishingly small chance the attribute is renamed upstream.
+        for proc in getattr(self._executor, '_processes', {}).values():
+            try:
+                if proc.is_alive():
+                    proc.kill()
+            except (AttributeError, OSError, ValueError) as exc:
+                # OSError: already-reaped pid; ValueError: closed handle
+                log.debug("worker force-kill skipped: %s", exc)
         # Each shm block is cleaned independently: a failure to close()
         # one must not skip unlink() of either.  Both close & unlink are
         # idempotent and safe to call after the executor is gone.
@@ -1616,6 +1830,17 @@ class GeodesicSplineApp(MidpointShooterApp):
         self._MAX_UNDO = 50
         self._undo_stack: deque[dict] = deque(maxlen=self._MAX_UNDO)
         self._redo_stack: deque[dict] = deque(maxlen=self._MAX_UNDO)
+
+        # Session-name state used by ``_on_save`` and ``_on_export_vtk``
+        # to share a base filename across save / export.  Set when a
+        # session JSON is loaded (CLI or ``L`` key) — the JSON's stem
+        # becomes the name and persists until another load replaces
+        # it.  ``None`` means "no session opened yet" — saves / exports
+        # fall back to the legacy ``yyyymmdd_HHMMSS`` timestamp.
+        # Both save and export append a numeric ``_NN`` suffix when
+        # the file already exists so the original loaded JSON is never
+        # silently overwritten.
+        self._session_name: str | None = None
         self._prev_active_spline_idx = 0
         self._span_cache: dict[SpanKey, tuple[pv.PolyData, vtk.vtkActor]] = {}
         # Per-span style key (dragging, degraded) — repaints only fire on change.
@@ -1640,6 +1865,35 @@ class GeodesicSplineApp(MidpointShooterApp):
         self._last_stitch_screen: tuple = (0.0, 0.0)
         self._stitch_origin_cache: dict | None = None  # prepare_origin cache for last node
         self._stitch_origin_node_id: int = -1           # id() of node that owns the cache
+        # Cursor position captured at every mouse-move while a stitch is
+        # eligible; read by ``_fire_stitch_exact`` when the Master Clock
+        # fires after STITCH_EXACT_DEBOUNCE_SEC of stillness.  None means
+        # no refinement is pending (either nothing to refine, or the task
+        # already fired and consumed it).
+        self._stitch_pending_q: np.ndarray | None = None
+
+        # Imported guide polylines (Ctrl+X loads; hold X to preview at
+        # full opacity, release X to toggle hidden / low-opacity).
+        # One actor per file so re-imports replace the previous set
+        # cleanly via ``_clear_guides`` (``safe_remove_actor`` on each).
+        # Parallel lists let the X-key handlers flip every actor in one
+        # pass without re-querying the plotter.
+        self._guide_pds: list[pv.PolyData] = []
+        self._guide_actors: list[vtk.vtkActor] = []
+        self._guide_visible: bool = True
+
+        # X hold-to-preview state.  ``_x_hold_was_visible`` captures the
+        # logical visibility at the moment the user *first* pressed X
+        # (subsequent OS key-repeats are ignored).  ``None`` means the
+        # key is not currently held.  Read by the KeyRelease handler to
+        # decide whether to hide (was visible) or fade in (was hidden).
+        self._x_hold_was_visible: bool | None = None
+
+        # Guides fade-in animation state.  ``_guides_fade_start_t`` is
+        # the ``perf_counter`` at which the fade began; ``None`` means
+        # no fade is active.  Driven by the Master Clock via
+        # ``_tick_guides_fade`` self-rescheduling on the poll timer.
+        self._guides_fade_start_t: float | None = None
         # node → spline index map.  ``WeakKeyDictionary`` avoids the
         # ``id()``-recycling hazard a plain ``dict[int, int]`` keyed by
         # ``id(seg)`` would have: when CPython GC's a deleted segment
@@ -1672,7 +1926,7 @@ class GeodesicSplineApp(MidpointShooterApp):
         # Experimental SSAO — see SSAO_ENABLED module flag at top of file.
         if SSAO_ENABLED:
             try:
-                self.plotter.enable_ssao()
+                self.plotter.enable_ssao()  # type: ignore[call-arg]
             except (AttributeError, RuntimeError) as exc:
                 # Older PyVista lacks enable_ssao (AttributeError); some
                 # OpenGL contexts reject the SSAO render pass at runtime
@@ -1737,6 +1991,22 @@ class GeodesicSplineApp(MidpointShooterApp):
             "?", position=(self._help_x + 5, 52),
             font_size=7, color='white', shadow=True, name="label_help")
 
+        # Full-mesh orange toggle: when on, ``_eval_cascade_at_t`` swaps
+        # ``compute_endpoint_local`` for ``compute_endpoint`` in level-2
+        # / level-3 calls, eliminating submesh-extraction artifacts at
+        # ~3-5× per-evaluation cost.  Toggling does NOT trigger a
+        # rebuild — the user re-issues ``R`` when ready.  Visual:
+        # orange when on (matches the affected layer), grey when off.
+        self._fm_x = self._help_x + 22
+        self._fm_widget = self.plotter.add_checkbox_button_widget(
+            self._toggle_full_mesh_orange,
+            value=self.scfg.ORANGE_USE_FULL_MESH,
+            position=(self._fm_x, 50), size=self._cb_size, border_size=2,
+            color_on='orange', color_off='grey')
+        self._fm_label = self.plotter.add_text(
+            "FM", position=(self._fm_x + 2, 52),
+            font_size=7, color='white', shadow=True, name="label_fm")
+
         # Reposition widgets on window resize so they stay above the slider.
         # Capture the tag so ``cleanup`` (via the parent's ``_observer_tags``
         # mechanism) can detach this observer when the same plotter is
@@ -1747,16 +2017,102 @@ class GeodesicSplineApp(MidpointShooterApp):
         self._observer_tags.append(
             (_vtki, _vtki.AddObserver('ConfigureEvent', self._on_window_resize)))
 
-        # Curve hover marker — single colored sphere, layer-colored.
-        self._curve_hover_pd, self._curve_hover_actor = self._create_aux_actor(
-            kind='point', color='white', point_size=9,
-            depth=self.scfg.DEPTH_CURVE_HOVER)
-        self._curve_hover_pt_buf = np.empty((1, 3), dtype=float)
+        # Overlay renderer (layer 1) hosts both the curve-hover marker
+        # and the node-index labels.  Lives in the same render window
+        # as the main scene and shares its camera, so any orbit / zoom
+        # is mirrored for free.  Layer-1 renderers draw *after* layer-0
+        # with no shared depth buffer — exactly the "always on top, no
+        # z-fighting with the mesh" behaviour we want.  Per-overlay
+        # visibility (which marker / label is actually drawn) is gated
+        # by the consumers' own occlusion logic so the overlay only
+        # shows what the user could plausibly need to see.
+        rwin = self.plotter.render_window
+        assert rwin is not None, "render window not yet created"
+        if rwin.GetNumberOfLayers() < 2:
+            rwin.SetNumberOfLayers(2)
+        self._overlay_renderer = vtk.vtkRenderer()
+        self._overlay_renderer.SetLayer(1)
+        self._overlay_renderer.SetActiveCamera(
+            self.plotter.renderer.GetActiveCamera())
+        self._overlay_renderer.SetInteractive(False)
+        rwin.AddRenderer(self._overlay_renderer)
+
+        # Curve hover marker — a telescopic-sight overlay built from
+        # **two** PolyDatas (different line widths require different
+        # actors).  Both live in the overlay renderer (same layer-1
+        # treatment as the node labels) so they ignore the main z-
+        # buffer; the per-frame orientation is camera right / up,
+        # giving a true 2-D "sight" look regardless of curve direction.
+        # See ``_orient_hover_marker`` for the geometry update.
+        N_circle = self.scfg.HOVER_MARKER_CIRCLE_SAMPLES
+        # Circumference: closed polyline of (N+1) points where the
+        # last point coincides with the first.  Stable line cell so
+        # the refresh path only writes ``.points``.
+        circle_pd = pv.PolyData()
+        circle_pd.points = np.zeros((N_circle + 1, 3), dtype=float)
+        circle_pd.lines = np.concatenate(
+            [[N_circle + 1], np.arange(N_circle + 1, dtype=np.int64)]
+        ).astype(np.int64)
+        circle_actor = vtk.vtkActor()
+        circle_mapper = vtk.vtkPolyDataMapper()
+        circle_mapper.SetInputData(circle_pd)
+        circle_actor.SetMapper(circle_mapper)
+        circle_prop = circle_actor.GetProperty()
+        circle_prop.SetLineWidth(self.scfg.HOVER_MARKER_CIRCLE_LINE_WIDTH)
+        circle_prop.LightingOff()
+        circle_actor.SetVisibility(False)
+        circle_actor.PickableOff()
+        self._overlay_renderer.AddViewProp(circle_actor)
+
+        # Crosshair: two lines (horizontal + vertical) sharing 4 points.
+        # Points order: [-right, +right, -up, +up].
+        cross_pd = pv.PolyData()
+        cross_pd.points = np.zeros((4, 3), dtype=float)
+        cross_pd.lines = np.array([2, 0, 1, 2, 2, 3], dtype=np.int64)
+        cross_actor = vtk.vtkActor()
+        cross_mapper = vtk.vtkPolyDataMapper()
+        cross_mapper.SetInputData(cross_pd)
+        cross_actor.SetMapper(cross_mapper)
+        cross_prop = cross_actor.GetProperty()
+        cross_prop.SetLineWidth(self.scfg.HOVER_MARKER_CROSS_LINE_WIDTH)
+        cross_prop.LightingOff()
+        cross_actor.SetVisibility(False)
+        cross_actor.PickableOff()
+        self._overlay_renderer.AddViewProp(cross_actor)
+
+        self._curve_hover_circle_pd = circle_pd
+        self._curve_hover_circle_actor = circle_actor
+        self._curve_hover_cross_pd = cross_pd
+        self._curve_hover_cross_actor = cross_actor
+        # Pre-allocated point buffers reused on every orient call.
+        self._curve_hover_circle_buf = np.empty((N_circle + 1, 3), dtype=float)
+        self._curve_hover_cross_buf = np.empty((4, 3), dtype=float)
+        # Pre-computed unit-circle samples (cos/sin per angle) — only
+        # need to be multiplied by radius + (right, up) basis at
+        # render time, never recomputed.
+        theta = np.linspace(0.0, 2.0 * np.pi, N_circle + 1)
+        self._curve_hover_cos = np.cos(theta)
+        self._curve_hover_sin = np.sin(theta)
         # Pre-allocated buffer for batched curve hover projection
         self._curve_hover_3d_buf = np.empty((2048, 3), dtype=float)
 
-        # Curve hover state — stored for future node insertion
+        # Curve hover state — stored for future node insertion AND for
+        # the camera-orbit re-orientation hook
+        # (``_refresh_arrows_on_camera_change`` reads ``_curve_hover_state``).
         self.curve_hover_info: dict | None = None
+        self._curve_hover_state: dict | None = None
+
+        # Node-index labels — pool of ``vtkBillboardTextActor3D``s
+        # grown as needed when 'n' is pressed.  Format:
+        #   * single spline  → ``"3"``            (just the node index)
+        #   * multi-spline   → ``"s1:3"``         (spline index + node)
+        # All labels carry the same screen-pixel font size + color so
+        # the rendering stays consistent regardless of zoom.  Held in
+        # a plain list (not WeakRef) because we own the lifetime —
+        # attached to the plotter renderer until ``cleanup()`` removes
+        # them or the pool is resized down.
+        self._node_labels: list[vtk.vtkBillboardTextActor3D] = []
+        self._node_labels_visible: bool = False
 
         # Snap indicator — appears on drag while Shift (vertex) or Ctrl
         # (edge) is held, marking the exact target the drag will land on.
@@ -2040,6 +2396,22 @@ class GeodesicSplineApp(MidpointShooterApp):
                 if not self._is_marker_occluded(pt_3d):
                     best_sq = effective_sq
                     best_pt_3d = pt_3d
+                    # Local curve tangent at the hover point.  The
+                    # current telescopic-sight marker billboards to
+                    # camera and does NOT consume this field, but the
+                    # tangent is kept in the payload for downstream
+                    # callers (potential future affordances, programmatic
+                    # hover analysis, or a debug overlay) — computing it
+                    # here is free since p0 / p1 are already in scope.
+                    edge = p1 - p0
+                    edge_len = np.linalg.norm(edge)
+                    if edge_len > 1e-9:
+                        tangent = edge / edge_len
+                    else:
+                        # Degenerate segment (two coincident polyline
+                        # points) — pick any unit vector so consumers
+                        # always see a well-formed entry.
+                        tangent = np.array([1.0, 0.0, 0.0])
                     # ``span_idx`` is ``-1`` for interp to keep historical
                     # ``info['span_idx']`` semantics for callers that
                     # compare with integers.  The dataclass uses ``None``
@@ -2052,8 +2424,100 @@ class GeodesicSplineApp(MidpointShooterApp):
                         'seg': seg,
                         'frac': frac,
                         'point': best_pt_3d,
+                        'tangent': tangent,
                     }
         return best_info, best_pt_3d
+
+    def _hide_curve_hover_marker(self) -> None:
+        """Hide both actors that make up the telescopic-sight hover
+        marker (circumference + crosshair).  Idempotent.
+        """
+        self._curve_hover_circle_actor.SetVisibility(False)
+        self._curve_hover_cross_actor.SetVisibility(False)
+
+    def _orient_hover_marker(self, pt_3d: np.ndarray) -> None:
+        """Writes the geometry of the telescopic-sight hover marker.
+
+        The marker is a circle (frame) plus a centered crosshair
+        (horizontal + vertical diameters) drawn on the camera's
+        view-plane at world position *pt_3d*.  Orientation:
+
+            view = focal − position             (camera forward, world)
+            right = normalise(view × view_up)   (screen-horizontal in world)
+            up    = normalise(right × view)     (screen-vertical, re-orthogonalised)
+
+        The crosshair's two diameters are aligned with *right* and *up*
+        — i.e. always horizontal / vertical on screen, like a real
+        telescopic sight — regardless of the underlying curve's
+        direction.  Radius scales with camera-to-point distance so the
+        marker keeps a constant on-screen footprint at any zoom
+        (``HOVER_MARKER_SCREEN_SCALE``).
+
+        Degenerate case: when the camera's view direction is parallel
+        to ``view_up`` (e.g. looking straight down a vertical-up axis
+        and the camera's roll happens to put up = view), the
+        ``view × view_up`` cross collapses.  Falls back to a world-axis
+        right vector that is not parallel to view.
+        """
+        cam = self.plotter.camera
+        cam_pos = np.asarray(cam.position, dtype=float)
+        focal = np.asarray(cam.focal_point, dtype=float)
+        view_up = np.asarray(cam.up, dtype=float)
+
+        view = focal - cam_pos
+        vn = float(np.linalg.norm(view))
+        if vn < 1e-9:
+            return  # paranoid — camera collapsed onto its focal point
+        view_unit = view / vn
+
+        right = np.cross(view_unit, view_up)
+        rn = float(np.linalg.norm(right))
+        if rn < 1e-6:
+            # view ∥ view_up.  Swap in a non-parallel world axis.
+            fallback = np.array([1.0, 0.0, 0.0])
+            if abs(np.dot(fallback, view_unit)) > 0.9:
+                fallback = np.array([0.0, 1.0, 0.0])
+            right = np.cross(view_unit, fallback)
+            rn = float(np.linalg.norm(right))
+            if rn < 1e-9:
+                return
+        right_unit = right / rn
+        # Re-orthogonalise: the user-supplied view_up may not be
+        # perfectly ⟂ to view (VTK does not enforce it).  ``up_unit``
+        # = right × view is always exactly ⟂ to both.
+        up_unit = np.cross(right_unit, view_unit)
+        upn = float(np.linalg.norm(up_unit))
+        if upn < 1e-9:
+            return
+        up_unit = up_unit / upn
+
+        # Radius / half-extent in world units, screen-scaled.
+        cam_to_pt = cam_pos - pt_3d
+        dist = float(np.linalg.norm(cam_to_pt))
+        if dist < 1e-9:
+            dist = 1e-9
+        r = dist * self.scfg.HOVER_MARKER_SCREEN_SCALE
+
+        # Circumference: pt + r·(cosθ·right + sinθ·up) for θ ∈ [0, 2π].
+        # The pre-computed cos/sin tables avoid the trig call per refresh.
+        circle_buf = self._curve_hover_circle_buf
+        np.multiply.outer(self._curve_hover_cos, right_unit, out=circle_buf)
+        circle_buf += np.multiply.outer(self._curve_hover_sin, up_unit)
+        circle_buf *= r
+        circle_buf += pt_3d
+        self._curve_hover_circle_pd.points = circle_buf
+        self._curve_hover_circle_pd.Modified()
+
+        # Crosshair: 4 points at pt ± r·right, pt ± r·up.
+        cross_buf = self._curve_hover_cross_buf
+        r_right = r * right_unit
+        r_up = r * up_unit
+        cross_buf[0] = pt_3d - r_right
+        cross_buf[1] = pt_3d + r_right
+        cross_buf[2] = pt_3d - r_up
+        cross_buf[3] = pt_3d + r_up
+        self._curve_hover_cross_pd.points = cross_buf
+        self._curve_hover_cross_pd.Modified()
 
     def _update_hover_marker(self, info: dict | None,
                              pt_3d: np.ndarray | None) -> bool:
@@ -2062,25 +2526,39 @@ class GeodesicSplineApp(MidpointShooterApp):
         Returns True when the visibility or position changed and the
         caller should issue a render.
         """
-        if info is not None:
+        if info is not None and pt_3d is not None:
             self.curve_hover_info = info
-            buf = self._curve_hover_pt_buf
-            buf[0] = pt_3d
-            self._curve_hover_pd.points = buf
-            self._curve_hover_pd.Modified()
+            self._orient_hover_marker(pt_3d)
+            # Stash the geometry inputs so the camera-orbit hook can
+            # re-orient the marker without re-running curve hover
+            # detection.  Tangent is no longer needed (the marker is
+            # billboarded to camera, not aligned to the curve) but
+            # ``info['tangent']`` stays in the payload — other consumers
+            # may rely on it and recomputing in the orient hook is free.
+            self._curve_hover_state = {
+                'pt': np.array(pt_3d, dtype=float),
+            }
             color_map = {
                 LayerKind.BLUE: self.scfg.SPAN_COLOR,
                 LayerKind.ORANGE: self.scfg.GEO_COLOR,
                 LayerKind.INTERP: self.scfg.INTERP_COLOR,
             }
-            self._curve_hover_actor.GetProperty().SetColor(color_map[info['layer']])
-            self._curve_hover_actor.SetVisibility(True)
+            color = color_map[info['layer']]
+            self._curve_hover_circle_actor.GetProperty().SetColor(*color)
+            self._curve_hover_cross_actor.GetProperty().SetColor(*color)
+            self._curve_hover_circle_actor.SetVisibility(True)
+            self._curve_hover_cross_actor.SetVisibility(True)
             return True  # always render — position moved
         self.curve_hover_info = None
-        if self._curve_hover_actor.GetVisibility():
-            self._curve_hover_actor.SetVisibility(False)
-            return True
-        return False
+        self._curve_hover_state = None
+        changed = False
+        if self._curve_hover_circle_actor.GetVisibility():
+            self._curve_hover_circle_actor.SetVisibility(False)
+            changed = True
+        if self._curve_hover_cross_actor.GetVisibility():
+            self._curve_hover_cross_actor.SetVisibility(False)
+            changed = True
+        return changed
 
     def _cycle_gizmo_opacity(self) -> None:
         """Cycles the opacity of all auxiliary visuals (nodes, tangent lines,
@@ -2247,6 +2725,9 @@ class GeodesicSplineApp(MidpointShooterApp):
         self.plotter.add_key_event('r', self._rebuild_all_orange)
         self.plotter.add_key_event('v', self._on_export_vtk)
         self.plotter.add_key_event('d', self._toggle_didactic)
+        # Note: 'x' is wired below as a raw VTK press/release pair (not
+        # ``add_key_event``) so the handler can distinguish hold from
+        # tap — see ``_on_key_press_guides`` / ``_on_key_release_guides``.
         # Capture the tags into the parent's ``_observer_tags`` list
         # so ``cleanup()`` detaches them.  Without this the lambdas /
         # bound methods keep ``self`` alive after the window is closed.
@@ -2257,6 +2738,24 @@ class GeodesicSplineApp(MidpointShooterApp):
         # does not support modifier keys).
         self._observer_tags.append((_vtki, _vtki.AddObserver(
             'KeyPressEvent', self._on_key_press_ctrl, 1.0)))
+        # Node-index labels: 'n' must be a hold-to-show shortcut, not a
+        # toggle, so PyVista's add_key_event (press-only) is not enough.
+        # Raw VTK observers on both press AND release let us track the
+        # held state precisely.  Press fires repeatedly under OS key-
+        # repeat (~30 Hz) — ``_show_node_labels`` is idempotent and
+        # cheap so that's fine and also keeps labels positioned when
+        # the user drags a node while holding 'n'.
+        self._observer_tags.append((_vtki, _vtki.AddObserver(
+            'KeyPressEvent', self._on_key_press_labels, 1.0)))
+        self._observer_tags.append((_vtki, _vtki.AddObserver(
+            'KeyReleaseEvent', self._on_key_release_labels, 1.0)))
+        # Guide polylines: 'x' is hold-to-preview-opaque + release-to-
+        # toggle.  Same raw-observer pattern as 'n' for the same
+        # reason — PyVista's ``add_key_event`` is press-only.
+        self._observer_tags.append((_vtki, _vtki.AddObserver(
+            'KeyPressEvent', self._on_key_press_guides, 1.0)))
+        self._observer_tags.append((_vtki, _vtki.AddObserver(
+            'KeyReleaseEvent', self._on_key_release_guides, 1.0)))
 
     # Single source of truth for the editor's keybinding help.  Used
     # both by the on-screen panel (``_HELP_TEXT``, narrow column) and
@@ -2279,6 +2778,8 @@ class GeodesicSplineApp(MidpointShooterApp):
         ("l",               "Load splines from JSON"),
         ("v",               "Export orange curve to .vtk"),
         ("d",               "Toggle didactic scaffold (t=0.5)"),
+        ("Ctrl+X / X (hold)", "Import guides / hold X for opaque preview, release toggles"),
+        ("n (hold)",        "Show node-index labels while pressed"),
         ("e",               "Export paths"),
         ("w",               "Wireframe"),
         ("a",               "Surface opacity"),
@@ -2346,6 +2847,29 @@ class GeodesicSplineApp(MidpointShooterApp):
         # Reposition "?" label
         self._help_label.SetPosition(hx + 5, cb_y + 2)
 
+        fmx = self._fm_x
+        self._fm_widget.GetRepresentation().PlaceWidget(
+            [float(fmx), float(fmx + sz), float(cb_y), float(cb_y + sz), 0.0, 0.0])
+        self._fm_label.SetPosition(fmx + 2, cb_y + 2)
+
+    def _toggle_full_mesh_orange(self, value: bool) -> None:
+        """Toggles ``SplineConfig.ORANGE_USE_FULL_MESH``.
+
+        Does **not** trigger a rebuild — the user re-issues ``R`` when
+        ready to recompute the orange polylines with the new setting.
+        Rationale: rebuilding all spans is multi-second on big sessions
+        and the user typically wants to compare before/after side-by-
+        side, which requires staging the toggle without paying the
+        compute cost yet.
+
+        HUD message includes the rebuild reminder so the user is not
+        confused by the on-screen orange not changing immediately.
+        """
+        self.scfg.ORANGE_USE_FULL_MESH = value
+        key = "orange_fullmesh_on" if value else "orange_fullmesh_off"
+        self._set_hud(_t(key), 'orange', sticky_seconds=4.0)
+        self.plotter.render()
+
     def _toggle_help_panel(self, visible: bool) -> None:
         """Toggles the on-screen shortcut reference panel."""
         if visible and self._help_panel is None:
@@ -2361,7 +2885,12 @@ class GeodesicSplineApp(MidpointShooterApp):
         self.plotter.render()
 
     def _on_key_press_ctrl(self, obj, event) -> None:
-        """Raw VTK KeyPress handler for Ctrl+Z (undo) and Ctrl+Y (redo).
+        """Raw VTK KeyPress handler for Ctrl-modified shortcuts.
+
+        Recognised combinations:
+          - Ctrl+Z — undo
+          - Ctrl+Y — redo
+          - Ctrl+X — import guide polylines (see ``_on_load_guides``)
 
         Used instead of PyVista's ``add_key_event`` because the latter
         does not support modifier keys.
@@ -2374,6 +2903,37 @@ class GeodesicSplineApp(MidpointShooterApp):
             self._on_undo_ctrl_z()
         elif key in ('y', 'Y'):
             self._on_redo()
+        elif key in ('x', 'X'):
+            self._on_load_guides()
+
+    def _on_key_press_labels(self, obj, event) -> None:
+        """Raw VTK KeyPress handler for the 'n' hold-to-show shortcut.
+
+        Fires on every key-press tick (incl. OS key-repeat) — that
+        cadence is convenient because it refreshes label positions
+        when the user drags a node while holding 'n'.  Skips when a
+        modifier is held so 'n' is unambiguously the labels gesture
+        (Ctrl+N / Shift+N stay free for future use without surprise
+        side effects).
+        """
+        iren = self.plotter.iren.interactor
+        if iren.GetControlKey() or iren.GetAltKey():
+            return
+        key = iren.GetKeySym()
+        if key in ('n', 'N'):
+            self._show_node_labels()
+
+    def _on_key_release_labels(self, obj, event) -> None:
+        """Raw VTK KeyRelease handler — hides node-index labels when
+        the user releases 'n'.  See ``_on_key_press_labels`` for the
+        held-down counterpart and the rationale for the modifier
+        check."""
+        iren = self.plotter.iren.interactor
+        if iren.GetControlKey() or iren.GetAltKey():
+            return
+        key = iren.GetKeySym()
+        if key in ('n', 'N'):
+            self._hide_node_labels()
 
     # --- Helpers ---
 
@@ -2381,7 +2941,7 @@ class GeodesicSplineApp(MidpointShooterApp):
     def _active_nodes(self) -> list[GeodesicSegment]:
         return self.splines[self.active_spline_idx]
 
-    def _iter_all_nodes(self) -> tuple[int, int, GeodesicSegment]:
+    def _iter_all_nodes(self) -> Iterator[tuple[int, int, GeodesicSegment]]:
         """Yields ``(spline_idx, node_idx, node)`` for every node across all splines."""
         for s_idx, nodes in enumerate(self.splines):
             for n_idx, node in enumerate(nodes):
@@ -2742,7 +3302,7 @@ class GeodesicSplineApp(MidpointShooterApp):
         # / path_b after every drag (_update_symmetric_ray ensures this).
         # On reload pick whichever is available; if both, average so a
         # tiny solver asymmetry doesn't bias one side.
-        lengths = []
+        lengths: list[float] = []
         for path in (seg.path_b, seg.path_a):
             if path is not None and len(path) >= 2:
                 lengths.append(float(np.sum(
@@ -2761,10 +3321,12 @@ class GeodesicSplineApp(MidpointShooterApp):
         """
         tangent_dir, h_length = self._decompose_tangent(tangent_full)
         seg.h_length = h_length
-        seg.path_b = self.geo.compute_shoot(origin, tangent_dir, h_length, face_idx)
-        seg.path_a = self.geo.compute_shoot(origin, -tangent_dir, h_length, face_idx)
-        seg.p_b = seg.path_b[-1] if seg.path_b is not None else None
-        seg.p_a = seg.path_a[-1] if seg.path_a is not None else None
+        path_b = self.geo.compute_shoot(origin, tangent_dir, h_length, face_idx)
+        path_a = self.geo.compute_shoot(origin, -tangent_dir, h_length, face_idx)
+        seg.path_b = path_b
+        seg.path_a = path_a
+        seg.p_b = path_b[-1] if path_b is not None else None
+        seg.p_a = path_a[-1] if path_a is not None else None
 
     def _node_from_record(self, record: dict) -> GeodesicSegment:
         """Creates a new ``GeodesicSegment`` from a serialized node record (v1 or v2)."""
@@ -3306,7 +3868,7 @@ class GeodesicSplineApp(MidpointShooterApp):
             self._push_undo()
             self._insert_node_at_curve(self.curve_hover_info)
             self.curve_hover_info = None
-            self._curve_hover_actor.SetVisibility(False)
+            self._hide_curve_hover_marker()
             return
 
         pt, cid = self._pick()
@@ -3740,7 +4302,7 @@ class GeodesicSplineApp(MidpointShooterApp):
                 best_info = (ia, ib, t)
         return best_pt, best_info
 
-    def _on_move(self, obj, event) -> None:
+    def _on_move(self, obj, event, *, pick_override=None) -> None:
         """Spline-aware move handler.
 
         Picks once per frame and passes the result to the parent via
@@ -3751,8 +4313,13 @@ class GeodesicSplineApp(MidpointShooterApp):
 
         Processing order (when not dragging or hovering a handle):
           1. Parent: hover detection, cursor, render.
-          2. Stitch preview update (vertex-snapped geodesic).
-          3. Curve hover: ``_detect_curve_hover`` finds the closest
+          2. Schedule ``'stitch_exact'`` debounce — every move resets
+             the timer; fires the topology-inserted refinement
+             (``_fire_stitch_exact``) once the cursor settles.
+          3. Stitch preview fast update (vertex-snapped geodesic),
+             gated by ``STITCH_SKIP_PX`` so sub-pixel twitches are
+             cheap.  See ``_update_stitch`` for the two-tier pipeline.
+          4. Curve hover: ``_detect_curve_hover`` finds the closest
              visible curve segment (blue/orange/interp), positions a
              colored marker, and stores metadata in ``curve_hover_info``
              for future node insertion.
@@ -3772,7 +4339,7 @@ class GeodesicSplineApp(MidpointShooterApp):
             pick_result = (None, None)
             super()._on_move(obj, event)
         else:
-            pick_result = self._pick()
+            pick_result = pick_override if pick_override is not None else self._pick()
             snap_indicator_pt: np.ndarray | None = None
             if dragged:
                 iren = self.plotter.iren.interactor
@@ -3799,7 +4366,7 @@ class GeodesicSplineApp(MidpointShooterApp):
                     elif iren.GetControlKey():
                         snapped, info = self._snap_point_to_edge(
                             pick_result[0], pick_result[1])
-                        if snapped is not None:
+                        if snapped is not None and info is not None:
                             pick_result = (snapped,
                                            self.geo.find_face(snapped))
                             va, vb, t = info
@@ -3814,7 +4381,7 @@ class GeodesicSplineApp(MidpointShooterApp):
         if dragged:
             # Recompute spans after the parent processed the drag geometry.
             self._recompute_spans(node=dragged)
-            self._curve_hover_actor.SetVisibility(False)
+            self._hide_curve_hover_marker()
             self.curve_hover_info = None
             return
 
@@ -3824,11 +4391,23 @@ class GeodesicSplineApp(MidpointShooterApp):
 
         # Skip stitch preview and curve hover when hovering a handle marker
         if hovering_marker:
-            self._curve_hover_actor.SetVisibility(False)
+            self._hide_curve_hover_marker()
             self.curve_hover_info = None
+            # Hide the grey stitch too — when the cursor lands on a
+            # node / handle the stitch becomes a distracting third
+            # visual that no longer indicates "next insertion".
+            self._stitch_actor.SetVisibility(False)
             return
 
-        # Stitch preview — screen-pixel threshold (squared, no sqrt)
+        # Schedule the exact-stitch refinement on every mouse-move event
+        # (cheap dict update).  The Master Clock fires it once the cursor
+        # has been still for STITCH_EXACT_DEBOUNCE_SEC.  Done before the
+        # 3-px gate so a sub-3-px twitch still resets the timer.
+        self._schedule_stitch_exact(pick_result[0])
+
+        # Stitch preview — screen-pixel threshold (squared, no sqrt).
+        # Skip the fast vertex-to-vertex redraw + curve-hover detection
+        # on sub-3 px moves to avoid wasted work on tiny mouse twitches.
         x, y = self.plotter.iren.get_event_position()
         sdx = x - self._last_stitch_screen[0]
         sdy = y - self._last_stitch_screen[1]
@@ -3840,6 +4419,15 @@ class GeodesicSplineApp(MidpointShooterApp):
 
         # Curve hover detection — show marker on nearest visible curve
         curve_changed = self._detect_curve_hover(x, y)
+        # When the curve hover marker takes over, suppress the grey
+        # stitch — the cursor is no longer on a "free" surface point
+        # so the "from last node to here" preview becomes misleading
+        # (the next click inserts at the curve's hover point, not at
+        # the surface position the stitch would advertise).  Fast
+        # path: only touch the actor when it is actually visible.
+        if self.curve_hover_info is not None and self._stitch_actor.GetVisibility():
+            self._stitch_actor.SetVisibility(False)
+            curve_changed = True
         if curve_changed:
             self.plotter.render()
 
@@ -3996,6 +4584,9 @@ class GeodesicSplineApp(MidpointShooterApp):
             if self.state.hover_seg is node:
                 self.state.hover_seg = None
                 self.state.hover_marker = None
+            if self.state.pending_hover_revert_seg is node:
+                self.state.pending_hover_revert_seg = None
+                self.state.pending_debounces.pop('hover_revert', None)
             self._hover_dirty = True
             self._rebuild_node_index()
             removed_idx = len(nodes)
@@ -4041,6 +4632,69 @@ class GeodesicSplineApp(MidpointShooterApp):
         self._stitch_origin_cache = self.geo.prepare_origin(last.origin)
         self._stitch_origin_node_id = nid
 
+    def _schedule_stitch_exact(self, q: np.ndarray | None) -> None:
+        """Registers the exact-stitch refinement in the Master Clock.
+
+        The fast vertex-to-vertex stitch is drawn synchronously on every
+        mouse-move (see ``_update_stitch``).  This method overwrites the
+        ``'stitch_exact'`` debounce entry with a fresh deadline, so the
+        callback only fires once the cursor has been still for
+        ``STITCH_EXACT_DEBOUNCE_SEC``.  Cheap (single dict update); called
+        on every mouse-move event regardless of the 3-px stitch gate.
+        """
+        if q is None or self.state.active_seg is not None:
+            self.state.pending_debounces.pop('stitch_exact', None)
+            self._stitch_pending_q = None
+            return
+        nodes = self._active_nodes
+        if not nodes or self.splines_closed[self.active_spline_idx]:
+            self.state.pending_debounces.pop('stitch_exact', None)
+            self._stitch_pending_q = None
+            return
+        self._stitch_pending_q = np.asarray(q, dtype=float).copy()
+        self.state.pending_debounces['stitch_exact'] = (
+            time.perf_counter() + self.scfg.STITCH_EXACT_DEBOUNCE_SEC,
+            self._fire_stitch_exact,
+        )
+
+    def _fire_stitch_exact(self) -> None:
+        """Replaces the fast stitch with the exact origin→cursor geodesic.
+
+        Fires from the Master Clock after the cursor has been still for
+        ``STITCH_EXACT_DEBOUNCE_SEC``.  Uses
+        ``compute_endpoint_from_origin`` (~25 ms): topology-inserted
+        origin from the cache + topology-inserted endpoint at the exact
+        cursor position, no vertex snap.  ``_on_poll_timer`` batches the
+        render — do not call ``render()`` here.
+
+        Defensive checks abort the refinement if spline state has
+        changed since the task was scheduled (drag started, spline
+        closed, last node removed, etc.) or if the solver returned a
+        degraded path; in those cases the fast vertex-snapped line stays
+        on screen unchanged.
+        """
+        q = self._stitch_pending_q
+        self._stitch_pending_q = None
+        if q is None or self.state.active_seg is not None:
+            return
+        nodes = self._active_nodes
+        if not nodes or self.splines_closed[self.active_spline_idx]:
+            return
+        cache = self._stitch_origin_cache
+        if cache is None or self._stitch_origin_node_id != id(nodes[-1]):
+            return
+        # Fast stitch must already be on-screen — refine, don't conjure.
+        if not self._stitch_actor.GetVisibility():
+            return
+        try:
+            pts, was_fallback = self.geo.compute_endpoint_from_origin(cache, q)
+        except (RuntimeError, ValueError, TypeError, IndexError) as exc:
+            log.debug("stitch exact refinement failed: %s", exc)
+            return
+        if was_fallback or pts is None or len(pts) < 2:
+            return
+        update_line_inplace(self._stitch_pd, pts)
+
     def _invalidate_stitch_cache(self) -> None:
         """Forces stitch cache rebuild on next ``_refresh_stitch_cache``."""
         self._stitch_origin_cache = None
@@ -4065,10 +4719,23 @@ class GeodesicSplineApp(MidpointShooterApp):
     def _update_stitch(self, q=None) -> None:
         """Updates the prospective-span preview from last node to cursor.
 
-        Uses the topologically-inserted origin (via ``prepare_origin``
-        cache) for the start point, and vertex-snap for the cursor
-        endpoint.  This gives an exact geodesic departure from the node
-        while keeping per-frame cost at ~0.01 ms.
+        Two-tier pipeline:
+
+          1. **Fast vertex-snap** (this method, ~0.01 ms): exact
+             topology-inserted origin via the ``prepare_origin`` cache,
+             cursor endpoint snapped to its nearest mesh vertex.  Runs
+             on every qualifying mouse-move (gated by ``STITCH_SKIP_PX``).
+          2. **Exact refinement** (``_fire_stitch_exact``, ~25 ms): fires
+             from the Master Clock after the cursor has been still for
+             ``STITCH_EXACT_DEBOUNCE_SEC``.  Replaces the vertex-snapped
+             endpoint with a topology-inserted endpoint at the exact
+             cursor position via ``compute_endpoint_from_origin``.
+             Scheduled in ``_on_move`` independently of the 3-px gate, so
+             sub-pixel movement still resets the timer.
+
+        The Master Clock task key is ``'stitch_exact'``; it is overwritten
+        on every move and discarded by defensive checks if spline state
+        has changed since scheduling.
 
         Parameters
         ----------
@@ -4204,15 +4871,15 @@ class GeodesicSplineApp(MidpointShooterApp):
             sc = self.scfg
             prop = actor.GetProperty()
             if degraded:
-                prop.SetColor(sc.SPAN_FALLBACK_COLOR)
+                prop.SetColor(*sc.SPAN_FALLBACK_COLOR)
                 prop.SetLineWidth(sc.SPAN_LINE_WIDTH)
                 prop.SetOpacity(1.0)
             elif dragging:
-                prop.SetColor(sc.SPAN_DRAG_COLOR)
+                prop.SetColor(*sc.SPAN_DRAG_COLOR)
                 prop.SetLineWidth(sc.SPAN_DRAG_LINE_WIDTH)
                 prop.SetOpacity(sc.SPAN_DRAG_OPACITY)
             else:
-                prop.SetColor(sc.SPAN_COLOR)
+                prop.SetColor(*sc.SPAN_COLOR)
                 prop.SetLineWidth(sc.SPAN_LINE_WIDTH)
                 prop.SetOpacity(1.0)
         actor.SetVisibility(self._layer_visible['blue'])
@@ -4411,7 +5078,7 @@ class GeodesicSplineApp(MidpointShooterApp):
             actor = self.plotter.add_mesh(pd, lighting=False, pickable=False)
             sc = self.scfg
             prop = actor.GetProperty()
-            prop.SetColor(sc.INTERP_COLOR)
+            prop.SetColor(*sc.INTERP_COLOR)
             prop.SetLineWidth(sc.INTERP_LINE_WIDTH)
             prop.SetOpacity(sc.INTERP_OPACITY)
             self._set_depth_priority(actor, sc.DEPTH_INTERP)
@@ -4594,7 +5261,7 @@ class GeodesicSplineApp(MidpointShooterApp):
             actor = self.plotter.add_mesh(pd, lighting=False, pickable=False)
             sc = self.scfg
             prop = actor.GetProperty()
-            prop.SetColor(sc.GEO_COLOR)
+            prop.SetColor(*sc.GEO_COLOR)
             prop.SetLineWidth(sc.GEO_LINE_WIDTH)
             prop.SetOpacity(sc.GEO_OPACITY)
 
@@ -4614,11 +5281,11 @@ class GeodesicSplineApp(MidpointShooterApp):
         # Color priority: fallback > computing > final.
         prop = actor.GetProperty()
         if key in self._degraded_spans:
-            prop.SetColor(sc.SPAN_FALLBACK_COLOR)
+            prop.SetColor(*sc.SPAN_FALLBACK_COLOR)
         elif computing:
-            prop.SetColor(sc.GEO_COLOR_COMPUTING)
+            prop.SetColor(*sc.GEO_COLOR_COMPUTING)
         else:
-            prop.SetColor(sc.GEO_COLOR)
+            prop.SetColor(*sc.GEO_COLOR)
         actor.SetVisibility(self._layer_visible['orange'])
 
     def _submit_geodesic_spans(self, node: GeodesicSegment | None = None,
@@ -4659,7 +5326,8 @@ class GeodesicSplineApp(MidpointShooterApp):
                 subdiv_tol_factor=sc.ORANGE_SUBDIV_TOL_FACTOR,
                 subdiv_max_depth=sc.ORANGE_SUBDIV_MAX_DEPTH,
                 chord_bridging=sc.ORANGE_CHORD_BRIDGING,
-                submesh_subdiv=sc.ORANGE_SUBMESH_SUBDIV)
+                submesh_subdiv=sc.ORANGE_SUBMESH_SUBDIV,
+                use_full_mesh=sc.ORANGE_USE_FULL_MESH)
 
     def _rebuild_all_orange(self) -> None:
         """Resubmits the fully-geodesic (orange) workers for **every** span
@@ -4713,6 +5381,388 @@ class GeodesicSplineApp(MidpointShooterApp):
             self.state.pending_debounces.pop('didactic_t', None)
             self._set_hud("DIDACTIC OFF", 'grey', sticky_seconds=1.5)
         self.plotter.render()
+
+    # --- Imported guide polylines (Ctrl+X load, X toggle) ---
+
+    def _clear_guides(self) -> None:
+        """Removes every imported guide actor from the plotter.
+
+        Called by ``_on_load_guides`` before importing a fresh set so
+        re-imports do not accumulate stale actors.  ``safe_remove_actor``
+        tolerates already-detached actors (e.g. after a partial cleanup).
+        """
+        for actor in self._guide_actors:
+            safe_remove_actor(self.plotter, actor)
+        self._guide_pds.clear()
+        self._guide_actors.clear()
+
+    def _on_load_guides(self) -> None:
+        """Ctrl+X: import one or more VTK polydata files as guide curves.
+
+        Opens a multi-select file dialog (anything pyvista can read:
+        .vtk, .vtp, .ply, .stl, .obj).  Replaces any previously-loaded
+        guides.  Only **line cells** are rendered — polygonal cells in
+        the same file are dropped via ``pv.PolyData(points=..., lines=...)``
+        reconstruction, so a mesh file with a few annotation polylines
+        will not display the mesh surface as a wireframe.
+
+        Container types handled (chosen by ``pv.read`` based on the file
+        header, not the file extension — many tools write legacy ``.vtk``
+        with a 1-D ``UnstructuredGrid`` header when the data is purely
+        line cells):
+          * ``PolyData``        — used directly.
+          * ``UnstructuredGrid``— converted via ``vtkGeometryFilter``
+            (preserves all line cells, drops volumetric cells).
+          * ``MultiBlock``      — first PolyData block is taken; if the
+            block is itself an UnstructuredGrid the same conversion
+            applies.
+
+        A file with zero line cells is skipped with a HUD warning; the
+        rest of the selection still loads.
+        """
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        fpaths = filedialog.askopenfilenames(
+            title="Load guide polylines (cell type 3 / 4)",
+            filetypes=[
+                ("PyVista-readable", "*.vtk *.vtp *.ply *.stl *.obj"),
+                ("All files", "*.*"),
+            ],
+        )
+        root.destroy()
+        if not fpaths:
+            return
+
+        self._clear_guides()
+
+        # Always start a fresh import in the "visible (low opacity)"
+        # state, regardless of where the previous toggle left
+        # ``_guide_visible``.  Cancel any in-flight hold/fade so the
+        # new actors don't inherit an ongoing animation aimed at the
+        # actors we just discarded.
+        self._guide_visible = True
+        self._x_hold_was_visible = None
+        self._guides_fade_start_t = None
+        self.state.pending_debounces.pop('guides_fade', None)
+
+        sc = self.scfg
+        total_segs = 0
+        loaded_files = 0
+        last_err: str | None = None
+        for fpath in fpaths:
+            try:
+                pd_raw = pv.read(fpath)
+            except (OSError, RuntimeError, ValueError) as exc:
+                log.error("guide load failed for %s: %s", fpath, exc)
+                self._set_hud(_t("guides_load_failed",
+                                 fname=os.path.basename(fpath),
+                                 err=type(exc).__name__),
+                              'red', sticky_seconds=4.0)
+                last_err = str(exc)
+                continue
+
+            # Flatten MultiBlock — many "PolyData" .vtk files actually
+            # arrive wrapped in a single-block container.
+            if isinstance(pd_raw, pv.MultiBlock):
+                blocks = [b for b in pd_raw
+                          if isinstance(b, (pv.PolyData, pv.UnstructuredGrid))]
+                if not blocks:
+                    self._set_hud(_t("guides_empty",
+                                     fname=os.path.basename(fpath)),
+                                  'red', sticky_seconds=4.0)
+                    continue
+                pd_raw = blocks[0]
+
+            # Promote UnstructuredGrid → PolyData via vtkGeometryFilter.
+            # Tools that write legacy ``.vtk`` with only line cells often
+            # emit a ``vtkUnstructuredGrid`` header even when the content
+            # could legally be a ``vtkPolyData``.  ``vtkGeometryFilter``
+            # is the canonical conversion: line / triangle / poly cells
+            # are preserved as the corresponding PolyData cell types,
+            # while 3-D cells (tetra, hexa, ...) are dropped to their
+            # boundary faces — fine for our use, which then strips
+            # everything except line cells two steps below.
+            if isinstance(pd_raw, pv.UnstructuredGrid):
+                gf = vtk.vtkGeometryFilter()
+                gf.SetInputData(pd_raw)
+                gf.Update()
+                pd_raw = pv.wrap(gf.GetOutput())
+
+            if not isinstance(pd_raw, pv.PolyData) or pd_raw.lines.size == 0:
+                self._set_hud(_t("guides_empty",
+                                 fname=os.path.basename(fpath)),
+                              'red', sticky_seconds=4.0)
+                continue
+
+            # Strip everything except line cells so polygonal data in
+            # the source file does not render as a wireframe overlay.
+            pd_lines = pv.PolyData()
+            pd_lines.points = pd_raw.points
+            pd_lines.lines = pd_raw.lines
+            n_segs = pd_lines.n_cells
+
+            actor = self.plotter.add_mesh(
+                pd_lines, color=sc.GUIDE_COLOR_HEX,
+                line_width=sc.GUIDE_LINE_WIDTH, opacity=sc.GUIDE_OPACITY,
+                lighting=False, pickable=False,
+                name=f"guide_{os.path.basename(fpath)}",
+            )
+            self._set_depth_priority(actor, sc.DEPTH_GUIDE)
+            actor.SetVisibility(self._guide_visible)
+            self._guide_pds.append(pd_lines)
+            self._guide_actors.append(actor)
+            total_segs += n_segs
+            loaded_files += 1
+
+        if loaded_files:
+            self._set_hud(_t("guides_loaded",
+                             n_files=loaded_files, n_segs=total_segs),
+                          'lime', sticky_seconds=3.0)
+            # Curves+guides changed the on-screen line set — invalidate
+            # the curve-hover cache so guide segments are not picked up
+            # as hoverable spline points.
+            self._hover_curve_dirty = True
+        elif last_err is None:
+            # Nothing loaded and no error path triggered — every file
+            # was skipped via the "empty" branch; HUD already explained.
+            pass
+
+        self.plotter.render()
+
+    # --- Node-index labels (visible while 'n' key is held) ---
+
+    def _ensure_node_labels(self) -> None:
+        """Resize the label pool to match the current node count and
+        update every label's position + text.
+
+        Multi-spline scenes get a ``"s{sid}:{n_idx}"`` prefix so the
+        user can tell two same-indexed nodes apart; with a single
+        spline the label is just the node index.  Pooling avoids the
+        per-press churn of creating / destroying ``vtkActor``s as the
+        user repeatedly checks node IDs.
+        """
+        sc = self.scfg
+        all_nodes = list(self._iter_all_nodes())
+        n_needed = len(all_nodes)
+        n_have = len(self._node_labels)
+        multi_spline = len(self.splines) > 1
+        # Resolve label colour once (config stores hex; vtkTextProperty
+        # wants an RGB triple in [0, 1]).
+        rgb = pv.Color(sc.NODE_LABEL_COLOR_HEX).float_rgb
+
+        # Grow the pool — each new actor inherits the same font / colour
+        # so the only per-frame work is position + text.
+        for _ in range(n_needed - n_have):
+            actor = vtk.vtkBillboardTextActor3D()
+            actor.SetDisplayOffset(*sc.NODE_LABEL_OFFSET_PX)
+            prop = actor.GetTextProperty()
+            prop.SetFontSize(sc.NODE_LABEL_FONT_SIZE)
+            prop.SetColor(*rgb)
+            prop.SetBold(True)
+            prop.SetJustificationToCentered()
+            prop.SetVerticalJustificationToBottom()
+            actor.SetVisibility(False)
+            # Attach to the overlay renderer (layer 1) — see
+            # ``__init__`` for the rationale.  The main renderer
+            # never owns the label actors, so they cannot be occluded
+            # pixel-wise by the mesh in the z-buffer.
+            self._overlay_renderer.AddViewProp(actor)
+            self._node_labels.append(actor)
+
+        # Update or hide pre-existing actors.
+        for i, label in enumerate(self._node_labels):
+            if i >= n_needed:
+                label.SetVisibility(False)
+                continue
+            s_idx, n_idx, node = all_nodes[i]
+            label.SetPosition(node.origin[0], node.origin[1], node.origin[2])
+            # 1-based indexing for human readability — matches the
+            # ``// node N`` comments emitted in the session JSON.  Code-
+            # facing references (HUD messages, span keys, log lines)
+            # remain 0-based; this is purely a presentation choice for
+            # the label overlay.
+            if multi_spline:
+                label.SetInput(f"s{s_idx + 1}:{n_idx + 1}")
+            else:
+                label.SetInput(str(n_idx + 1))
+
+    def _refresh_node_label_visibility(self) -> None:
+        """Toggles each label on/off according to the matching node's
+        occlusion state in the main renderer's z-buffer.
+
+        Labels are rendered in an overlay layer that ignores depth,
+        so without this filter every label would show even for nodes
+        on the far side of the mesh — defeating the "find node #4 on
+        what I'm looking at" use case.  Ray-cast via
+        ``_is_marker_occluded`` (already used for handle visibility):
+        if the first mesh hit between camera and node is closer than
+        the node itself, the node is hidden by the mesh and we drop
+        its label.  Cost: one VTK locator query per node — same hot
+        path the handle hover already uses, so it scales.
+        """
+        all_nodes = list(self._iter_all_nodes())
+        for i, label in enumerate(self._node_labels):
+            if i >= len(all_nodes):
+                label.SetVisibility(False)
+                continue
+            _, _, node = all_nodes[i]
+            if self._is_marker_occluded(node.origin):
+                label.SetVisibility(False)
+            else:
+                label.SetVisibility(True)
+
+    def _show_node_labels(self) -> None:
+        """Make every visible node's index label appear (called on 'n'
+        KeyPress).
+
+        Idempotent — repeated calls from OS key-repeat refresh
+        positions (so labels track a node being dragged while 'n' is
+        held) AND re-evaluate per-label occlusion, which matters if
+        the user pans / orbits while keeping 'n' pressed.
+        """
+        self._ensure_node_labels()
+        self._refresh_node_label_visibility()
+        self._node_labels_visible = True
+        self.plotter.render()
+
+    def _hide_node_labels(self) -> None:
+        """Hide every node-index label (called on 'n' KeyRelease).
+
+        Idempotent.  Does nothing when no labels have ever been
+        created — the first 'n' press lazily populates the pool.
+        """
+        if not self._node_labels_visible:
+            return
+        for label in self._node_labels:
+            label.SetVisibility(False)
+        self._node_labels_visible = False
+        self.plotter.render()
+
+    def _set_guides_opacity(self, alpha: float) -> None:
+        """Applies *alpha* to every imported guide actor.  Cheap (one
+        ``SetOpacity`` per actor); does not issue a render — the caller
+        decides when to flush."""
+        for actor in self._guide_actors:
+            actor.GetProperty().SetOpacity(alpha)
+
+    def _on_key_press_guides(self, obj, event) -> None:
+        """Raw VTK KeyPress handler for the 'x' hold-to-preview shortcut.
+
+        First press of a hold cycle (``_x_hold_was_visible is None``)
+        captures the logical visibility, cancels any in-flight fade,
+        and forces every guide actor to opacity 1.0 + visible.  OS
+        key-repeats arrive on this same handler — they are gated by
+        the captured-state check so the snapshot is taken exactly once.
+        Skips when a modifier is held so Ctrl+X (import) and Shift+X
+        stay free.
+        """
+        iren = self.plotter.iren.interactor
+        if iren.GetControlKey() or iren.GetAltKey() or iren.GetShiftKey():
+            return
+        key = iren.GetKeySym()
+        if key not in ('x', 'X'):
+            return
+        if not self._guide_actors:
+            # Match the legacy single-press feedback: tell the user
+            # there is nothing to preview.  Idempotent under key-repeat
+            # (HUD just stays sticky).
+            self._set_hud(_t("guides_none"), 'grey', sticky_seconds=2.0)
+            self.plotter.render()
+            return
+        if self._x_hold_was_visible is not None:
+            return  # OS key-repeat — initial press already handled
+        self._x_hold_was_visible = self._guide_visible
+        # Cancel any in-flight fade so the press snaps to opaque
+        # without a competing animation tick overwriting the alpha.
+        self.state.pending_debounces.pop('guides_fade', None)
+        self._guides_fade_start_t = None
+        self._guide_visible = True
+        for actor in self._guide_actors:
+            actor.SetVisibility(True)
+        self._set_guides_opacity(1.0)
+        self.plotter.render()
+
+    def _on_key_release_guides(self, obj, event) -> None:
+        """Raw VTK KeyRelease handler — finalises the X hold cycle.
+
+        Reads the captured pre-press state:
+          - was *visible*  →  hide the guides outright (state toggles
+            to hidden), reset opacity back to ``GUIDE_OPACITY`` so the
+            next show starts from the resting alpha.
+          - was *hidden*  →  keep visible and start a 500 ms ease-out
+            fade from 1.0 down to ``GUIDE_OPACITY``.
+
+        Modifier check mirrors the press path.  See
+        ``_on_key_press_guides`` for the captured-state semantics.
+        """
+        iren = self.plotter.iren.interactor
+        if iren.GetControlKey() or iren.GetAltKey() or iren.GetShiftKey():
+            return
+        key = iren.GetKeySym()
+        if key not in ('x', 'X'):
+            return
+        if self._x_hold_was_visible is None:
+            return  # release without a captured press (e.g. modifier was held)
+        was_visible = self._x_hold_was_visible
+        self._x_hold_was_visible = None
+        if was_visible:
+            # Toggle to hidden.  Reset the resting alpha so the next
+            # show / load cycle starts at ``GUIDE_OPACITY``.
+            self._guide_visible = False
+            for actor in self._guide_actors:
+                actor.SetVisibility(False)
+            self._set_guides_opacity(self.scfg.GUIDE_OPACITY)
+            self._set_hud(_t("guides_off"), 'grey', sticky_seconds=1.5)
+        else:
+            # Toggle to visible — fade from the current opaque preview
+            # back down to ``GUIDE_OPACITY`` so the appearance is
+            # smooth, not a sudden dim.
+            self._guide_visible = True
+            self._guides_fade_start_t = time.perf_counter()
+            self.state.pending_debounces['guides_fade'] = (
+                self._guides_fade_start_t,
+                self._tick_guides_fade,
+            )
+            self._set_hud(_t("guides_on"), 'lime', sticky_seconds=1.5)
+        self.plotter.render()
+
+    def _tick_guides_fade(self) -> None:
+        """Master Clock callback that animates the post-release fade.
+
+        Lerps every guide actor's opacity from 1.0 towards
+        ``GUIDE_OPACITY`` over ``GUIDE_FADE_DURATION_SEC`` using an
+        ease-out quadratic (1-(1-t)²).  Reschedules itself on the
+        Master Clock until the elapsed fraction reaches 1.0; the poll
+        timer issues ``render()`` after every fired callback so the
+        animation runs at the heartbeat cadence (~50 ms ≈ 10 frames).
+        Cancelling the fade is just ``pending_debounces.pop`` plus
+        clearing ``_guides_fade_start_t``.
+        """
+        start = self._guides_fade_start_t
+        if start is None:
+            return
+        duration = self.scfg.GUIDE_FADE_DURATION_SEC
+        t = (time.perf_counter() - start) / duration if duration > 0 else 1.0
+        if t >= 1.0:
+            self._set_guides_opacity(self.scfg.GUIDE_OPACITY)
+            self._guides_fade_start_t = None
+            return
+        if t < 0.0:
+            t = 0.0
+        # Ease-out quadratic: 1 - (1-t)²
+        eased = 1.0 - (1.0 - t) * (1.0 - t)
+        target = self.scfg.GUIDE_OPACITY
+        alpha = 1.0 + (target - 1.0) * eased
+        self._set_guides_opacity(alpha)
+        # Reschedule on the next heartbeat tick.  Deadline == now means
+        # ``_on_poll_timer`` fires us on its next iteration (~50 ms).
+        self.state.pending_debounces['guides_fade'] = (
+            time.perf_counter(),
+            self._tick_guides_fade,
+        )
 
     def _resolve_didactic_sid(self) -> int:
         """Spline index whose last span the didactic scaffold visualises.
@@ -5154,7 +6204,16 @@ class GeodesicSplineApp(MidpointShooterApp):
             self._set_hud(_t("orange_done"), 'lime')
 
     def _refresh_arrows_on_camera_change(self) -> bool:
-        """Refreshes fixed-screen-size handle arrows on camera movement.
+        """Refreshes fixed-screen-size visuals on camera movement.
+
+        Two things depend on camera distance / orientation:
+          - **Handle arrows** (A / B cones) — fixed screen-size, so the
+            world-space scale must update when the camera zooms / orbits.
+          - **Curve-hover quad** — oriented per frame to face the camera
+            with one axis on the curve tangent.  If the user grabs the
+            view (right-drag) while hovering over a curve, the quad
+            would otherwise stay frozen in the old orientation and go
+            edge-on to the camera.
 
         Runs irrespective of whether workers produced results — the user
         may simply be orbiting after finishing edits.  Returns True when
@@ -5166,6 +6225,19 @@ class GeodesicSplineApp(MidpointShooterApp):
         self._last_cam_pos = cam
         for _, _, node in self._iter_all_nodes():
             node.refresh_arrows(self.plotter)
+        # Re-orient the hover quad against the new camera position.
+        # Cheap (a handful of vector ops on a 4-point buffer); skip
+        # when no hover is active to avoid touching VTK state needlessly.
+        hover_state = self._curve_hover_state
+        if (hover_state is not None
+                and self._curve_hover_circle_actor.GetVisibility()):
+            self._orient_hover_marker(hover_state['pt'])
+        # Re-evaluate per-label occlusion while 'n' is held: as the
+        # user orbits, nodes that move behind the mesh in the new view
+        # need their labels hidden, and vice-versa.  Cheap (one locator
+        # query per node, same path used by hover detection).
+        if self._node_labels_visible:
+            self._refresh_node_label_visibility()
         return True
 
     def _apply_orange_progress(self) -> bool:
@@ -5216,6 +6288,50 @@ class GeodesicSplineApp(MidpointShooterApp):
 
     # --- Save / Load ---
 
+    def _next_session_filename(self, ext: str) -> str:
+        """Return an unused filename in CWD with the requested extension.
+
+        Strategy depends on ``self._session_name``:
+
+          * **Set** (a session JSON has been loaded): base = session
+            stem.  Always probes ``<stem>_NN<ext>`` starting at
+            ``NN=01`` so the originally-loaded JSON is preserved
+            verbatim — saves and VTK exports never overwrite it.
+            Skipping the no-suffix probe is intentional and the
+            difference vs the timestamp branch.
+          * **None** (fresh session): base =
+            ``yyyymmdd_HHMMSS`` per the legacy strategy.  Probes the
+            no-suffix filename first; only adds ``_NN`` on collision
+            (matters when the user holds ``S`` and key autorepeat
+            fires multiple saves within a second).
+
+        Both branches share the suffix-search loop so behaviour is
+        symmetric where it can be: caller doesn't need to know which
+        branch ran.
+
+        Parameters
+        ----------
+        ext
+            Extension including the leading dot (``'.json'``,
+            ``'.vtk'``).
+        """
+        if self._session_name:
+            base = self._session_name
+            suffix = 1
+            while True:
+                fname = f"{base}_{suffix:02d}{ext}"
+                if not Path(fname).exists():
+                    return fname
+                suffix += 1
+        else:
+            base = datetime.now().strftime('%Y%m%d_%H%M%S')
+            fname = f"{base}{ext}"
+            suffix = 1
+            while Path(fname).exists():
+                fname = f"{base}_{suffix:02d}{ext}"
+                suffix += 1
+            return fname
+
     def _on_save(self) -> None:
         """Saves all splines to a timestamped JSON file (atomic, UTF-8).
 
@@ -5261,8 +6377,17 @@ class GeodesicSplineApp(MidpointShooterApp):
                 'closed': self.splines_closed[sid],
                 'nodes': [],
             }
-            for node in nodes:
+            for nid, node in enumerate(nodes):
+                # ``id`` is purely cosmetic: 1-based, matches the
+                # node-index labels shown under the 'n' hot-key.  It is
+                # NOT consumed by ``_load_from_data`` — the loader uses
+                # list position to assign indices, so the field can be
+                # missing (legacy v1 / v2 sessions) or stale (user
+                # edited the JSON by hand) without changing behaviour.
+                # Stored as the first key per node so manually skimming
+                # the file is straightforward.
                 spline_data['nodes'].append({
+                    'id': nid + 1,
                     'origin': node.origin.tolist(),
                     'p_a': node.p_a.tolist() if node.p_a is not None else None,
                     'p_b': node.p_b.tolist() if node.p_b is not None else None,
@@ -5271,16 +6396,7 @@ class GeodesicSplineApp(MidpointShooterApp):
 
         # numpy .tolist() produces Python floats which json.dump writes
         # with full repr precision (~17 significant digits) by default.
-        # Resolve filename collisions: holding 's' triggers VTK key
-        # autorepeat which fires this method many times within a
-        # single second, all colliding on ``yyyymmdd_HHMMSS.json``.
-        # Append ``_NN`` only when the base name already exists.
-        base = datetime.now().strftime('%Y%m%d_%H%M%S')
-        fname = f"{base}.json"
-        suffix = 1
-        while Path(fname).exists():
-            fname = f"{base}_{suffix:02d}.json"
-            suffix += 1
+        fname = self._next_session_filename('.json')
         try:
             self._atomic_write_json(fname, data)
         except OSError as exc:
@@ -5297,7 +6413,7 @@ class GeodesicSplineApp(MidpointShooterApp):
 
     @staticmethod
     def _format_session_json(data: dict) -> str:
-        """Render the session dict with 3-line aligned nodes::
+        """Render the session dict with aligned per-node blocks::
 
             {
               "version": 2,
@@ -5306,10 +6422,12 @@ class GeodesicSplineApp(MidpointShooterApp):
                 {
                   "closed": false,
                   "nodes": [
-                    {"origin": [x, y, z],
+                    {"id":     1,
+                     "origin": [x, y, z],
                      "p_a":    [x, y, z],
                      "p_b":    [x, y, z]},
-                    {"origin": [x, y, z],
+                    {"id":     2,
+                     "origin": [x, y, z],
                      "p_a":    [x, y, z],
                      "p_b":    [x, y, z]}
                   ]
@@ -5317,14 +6435,17 @@ class GeodesicSplineApp(MidpointShooterApp):
               ]
             }
 
-        Each node spans one line per coordinate field with the colons
-        aligned (``"origin":`` is the longest known key; ``"p_a"`` /
-        ``"p_b"`` get extra spaces after the colon to match).
-        Continuation lines align under the opening ``{`` of the first
-        line so the values form a clean visual column.
+        Each node spans one line per field with the colons aligned
+        (``"origin":`` is the longest known key; shorter keys like
+        ``"id"`` / ``"p_a"`` / ``"p_b"`` get extra spaces after the
+        colon to match).  Continuation lines align under the opening
+        ``{`` of the first line so the values form a clean visual
+        column.  ``id`` (when present) is rendered first as an inline
+        scalar; it is purely cosmetic — see ``_on_save`` for the
+        rationale.
 
         Compared to ``json.dump(indent=2)``'s 12 lines per node, this
-        emits 3 lines per node and keeps the coordinate triplets
+        emits 4 lines per node and keeps the coordinate triplets
         inline — typical sessions shrink ~3×.
 
         The output is still valid JSON: every value goes through
@@ -5364,10 +6485,12 @@ class GeodesicSplineApp(MidpointShooterApp):
             return '[' + ', '.join(
                 json.dumps(float(x), allow_nan=False) for x in vec) + ']'
 
-        # Canonical key order inside a node.  Anything not in this
-        # tuple is appended at the end (forward-compat for future
-        # schema extensions).
-        NODE_CANON = ('origin', 'tangent', 'p_a', 'p_b')
+        # Canonical key order inside a node.  ``id`` (when present) is
+        # rendered first as a single inline key so the human eye lands
+        # on the node identifier before the coordinate triplets.
+        # Anything not in this tuple is appended at the end (forward-
+        # compat for future schema extensions).
+        NODE_CANON = ('id', 'origin', 'tangent', 'p_a', 'p_b')
 
         def _node_lines(node: dict, indent: str, is_last: bool) -> list[str]:
             """Render *node* as N lines (one per key) with colons
@@ -5396,10 +6519,14 @@ class GeodesicSplineApp(MidpointShooterApp):
                 val = node[k]
                 if val is None:
                     rendered = 'null'
-                elif k in NODE_CANON:
+                elif k in NODE_CANON and isinstance(val, (list, tuple)):
+                    # Coordinate triplet (origin / tangent / p_a / p_b).
                     rendered = _arr(val)
                 else:
-                    # Unknown extras: defer to default json encoding.
+                    # Scalar canonical keys (``id``) and forward-compat
+                    # extras both fall through to default JSON encoding
+                    # — single-token output keeps the per-node block
+                    # within its aligned column.
                     rendered = json.dumps(val)
                 prefix = (kr + ':').ljust(pad_to)
                 if i == 0:
@@ -5550,7 +6677,7 @@ class GeodesicSplineApp(MidpointShooterApp):
         # path clean for users who never press 'v'.
         from spline_export import compute_orange, write_vtk
 
-        fname = datetime.now().strftime('%Y%m%d_%H%M%S') + '.vtk'
+        fname = self._next_session_filename('.vtk')
         n_splines = len(self.splines)
         # Sticky long enough that the message survives any render
         # batching during the blocking compute.  10 minutes is a generous
@@ -5725,7 +6852,17 @@ class GeodesicSplineApp(MidpointShooterApp):
         try:
             with open(fpath, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-        except (OSError, json.JSONDecodeError) as exc:
+        except json.JSONDecodeError as exc:
+            log.error("invalid JSON in %s: line %d col %d: %s",
+                      fpath, exc.lineno, exc.colno, exc.msg)
+            hint = _json_decode_hint(exc)
+            self._set_hud(
+                _t("load_failed_json", line=exc.lineno, col=exc.colno,
+                   msg=exc.msg, hint=hint),
+                'red', sticky_seconds=5.0)
+            self.plotter.render()
+            return
+        except OSError as exc:
             log.error("failed to read %s: %s", fpath, exc)
             self._set_hud(_t("load_failed"), 'red', sticky_seconds=4.0)
             self.plotter.render()
@@ -5748,6 +6885,9 @@ class GeodesicSplineApp(MidpointShooterApp):
 
         self._push_undo()
         n_nodes = self._load_from_data(data)
+        # Inherit the JSON's stem as the session name so subsequent
+        # saves / VTK exports share the base filename.
+        self._session_name = Path(fpath).stem
         self._set_hud(_t("loaded", n=n_nodes, fname=fpath), 'lime')
         log.info("loaded %d nodes across %d splines from %s",
                  n_nodes, len(self.splines), fpath)
@@ -5798,6 +6938,8 @@ class GeodesicSplineApp(MidpointShooterApp):
         self.segments.clear()
         self.state.hover_seg = None
         self.state.hover_marker = None
+        self.state.pending_hover_revert_seg = None
+        self.state.pending_debounces.pop('hover_revert', None)
         self.state.active_seg = None
         self._hover_dirty = True
 
@@ -5880,7 +7022,6 @@ class GeodesicSplineApp(MidpointShooterApp):
         # ValueError / AttributeError from VTK so this is safe even if
         # the plotter has already torn down.
         aux_actors = [
-            self._curve_hover_actor,
             self._snap_indicator_actor,
             self._stitch_actor,
             self._coord_preview_actor,
@@ -5889,6 +7030,39 @@ class GeodesicSplineApp(MidpointShooterApp):
             self._didactic_point_actor,
         ]
         aux_actors.extend(self._didactic_actors)
+        # Curve-hover marker actors live in the overlay renderer, so
+        # ``safe_remove_actor`` (which targets ``self.plotter.remove_actor``)
+        # would silently miss them.  Detach explicitly before the
+        # overlay-renderer teardown below.
+        overlay = getattr(self, '_overlay_renderer', None)
+        if overlay is not None:
+            for hover_actor in (self._curve_hover_circle_actor,
+                                self._curve_hover_cross_actor):
+                try:
+                    overlay.RemoveViewProp(hover_actor)
+                except (AttributeError, RuntimeError):
+                    pass
+        # Node-index labels share the overlay renderer's lifetime —
+        # drain the pool AND detach the overlay renderer from the
+        # render window so a re-instantiated app does not inherit
+        # phantom billboards / a stale layer-1 renderer.  They were
+        # added via ``overlay_renderer.AddViewProp`` (not
+        # ``add_mesh``), so ``safe_remove_actor`` would silently skip
+        # them — explicit ``RemoveViewProp`` is required.
+        overlay = getattr(self, '_overlay_renderer', None)
+        if overlay is not None:
+            for label in self._node_labels:
+                try:
+                    overlay.RemoveViewProp(label)
+                except (AttributeError, RuntimeError):
+                    pass
+            try:
+                rwin = self.plotter.render_window
+                if rwin is not None:
+                    rwin.RemoveRenderer(overlay)
+            except (AttributeError, RuntimeError):
+                pass
+        self._node_labels.clear()
         for actor in aux_actors:
             safe_remove_actor(self.plotter, actor)
 
@@ -6031,17 +7205,36 @@ def _is_icosahedron_label(label: str) -> bool:
     return label in (BUILTIN_ICOSAHEDRON, _LEGACY_ICOSAHEDRON)
 
 
-def _resolve_mesh(arg: str | None) -> tuple[object, str, str | None]:
+def _resolve_mesh(arg: str | None,
+                  mesh_override: str | None = None
+                  ) -> tuple[object, str, str | None]:
     """Resolves the CLI ``arg`` into ``(mesh_or_path, mesh_label, json_path)``.
 
     Behaviour:
       - ``None`` -> default mesh ``fandisk.obj`` if present in the
         current directory, otherwise the in-memory icosahedron.
-      - ``*.json`` -> reads the session, recurses on its ``mesh_file``.
+      - ``*.json`` -> reads the session.  When *mesh_override* is given
+        the session's ``mesh_file`` is replaced with it before loading;
+        otherwise the session's own ``mesh_file`` is used.
       - any other path -> treated as a mesh file (PyVista handles
-        ``.ply``, ``.obj``, ``.stl`` and other VTK-supported formats).
+        ``.ply``, ``.obj``, ``.stl``, ``.vtk`` and other VTK-supported
+        formats).  *mesh_override* is rejected here — you can't override
+        a mesh with another mesh, only a session's mesh reference.
+
+    *mesh_override* lets the user export / inspect a session against a
+    different geometry from the one it was saved against — e.g. the
+    same anatomy resampled at higher resolution, or a registered
+    counterpart.  Sessions persist positions, not vertex indices, so
+    the splines remap onto the alternate surface via the same
+    ``project_to_surface`` path used during load.  Quality of the
+    result depends on how close the two meshes are; nothing in the
+    schema enforces compatibility.
     """
     if arg is None:
+        if mesh_override is not None:
+            log.error("mesh override given without a session JSON; "
+                      "the first arg must be a *.json file when using the override")
+            sys.exit(1)
         if os.path.exists(DEFAULT_MESH_FILENAME):
             log.info("default mesh: %s", DEFAULT_MESH_FILENAME)
             return DEFAULT_MESH_FILENAME, DEFAULT_MESH_FILENAME, None
@@ -6053,9 +7246,23 @@ def _resolve_mesh(arg: str | None) -> tuple[object, str, str | None]:
         if not os.path.exists(arg):
             log.error("JSON file not found: %s", arg)
             sys.exit(1)
-        with open(arg, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        label = data.get('mesh_file', '')
+        try:
+            with open(arg, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except json.JSONDecodeError as exc:
+            log.error("invalid JSON in %s: line %d col %d: %s%s",
+                      arg, exc.lineno, exc.colno, exc.msg,
+                      _json_decode_hint(exc))
+            sys.exit(1)
+        if mesh_override is not None:
+            if not os.path.exists(mesh_override):
+                log.error("override mesh not found: %s", mesh_override)
+                sys.exit(1)
+            log.info("mesh override: %s (replacing session's '%s')",
+                     mesh_override, data.get('mesh_file', '<unset>'))
+            label = mesh_override
+        else:
+            label = data.get('mesh_file', '')
         if _is_icosahedron_label(label):
             return _make_icosahedron(radius=10.0), BUILTIN_ICOSAHEDRON, arg
         if not label or not os.path.exists(label):
@@ -6063,28 +7270,114 @@ def _resolve_mesh(arg: str | None) -> tuple[object, str, str | None]:
             sys.exit(1)
         return label, label, arg
 
+    if mesh_override is not None:
+        log.error("mesh override given but first arg is not a session JSON: %s", arg)
+        sys.exit(1)
     if not os.path.exists(arg):
         log.error("mesh file not found: %s", arg)
         sys.exit(1)
     return arg, arg, None
 
 
+def _print_env_banner() -> None:
+    """Print runtime interpreter + key dependency versions at startup.
+
+    The editor's projection / picking / JIT behaviour can drift silently
+    between Python installs on the same machine when ``numpy`` / ``vtk``
+    / ``pyvista`` resolve to different majors.  Surfacing the env
+    up-front catches "tested in 3.12 but launched in 3.10" mismatches
+    in one glance.  Import failures are swallowed — the banner is
+    diagnostic, not a hard requirement.
+    """
+    import importlib.metadata as _md
+    print(f"python  : {sys.executable} {sys.version.split()[0]}")
+    for label, modname, distname in (
+        ('vtk',     'vtk',          'vtk'),
+        ('pyvista', 'pyvista',      'pyvista'),
+        ('numpy',   'numpy',        'numpy'),
+        ('scipy',   'scipy',        'scipy'),
+        ('numba',   'numba',        'numba'),
+        ('pp3d',    'potpourri3d',  'potpourri3d'),
+    ):
+        try:
+            mod = __import__(modname)
+        except ImportError:
+            print(f"{label:<8}: NOT INSTALLED")
+            continue
+        ver = getattr(mod, '__version__', None)
+        if ver is None:
+            try:
+                ver = _md.version(distname)
+            except _md.PackageNotFoundError:
+                ver = '?'
+        print(f"{label:<8}: {ver}")
+
+
 def _cli_main() -> None:
-    """Entry point for the ``geo-splines`` console script."""
+    """Entry point for the ``geo-splines`` console script.
+
+    Usage::
+
+        python geo_splines.py
+        python geo_splines.py <mesh.{obj,ply,stl,vtk}>
+        python geo_splines.py <session.json>
+        python geo_splines.py <session.json> <mesh.{obj,ply,stl,vtk}>
+
+    The four forms cover the typical workflows:
+
+      1. No args — opens with ``fandisk.obj`` if present, else a
+         built-in subdivided icosahedron.  Useful for a quick
+         "is the editor running" sanity check.
+      2. One mesh arg — opens the editor on that mesh, no splines.
+      3. One JSON arg — loads the session and its referenced mesh
+         (``mesh_file`` field in the JSON).
+      4. JSON + mesh — loads the session BUT replaces the JSON's
+         ``mesh_file`` with the explicit second argument.  Use when
+         you want to view / edit the same splines on a different
+         geometry (registered counterpart, higher-res version, etc.).
+         Splines are persisted as 3-D positions, not vertex indices,
+         so they remap onto the alternate surface via the normal
+         load-time projection.  Quality depends on how close the two
+         meshes are.
+
+    Help: pass ``-h`` or ``--help`` to print this usage block.
+    """
+    if len(sys.argv) > 1 and sys.argv[1] in ('-h', '--help'):
+        # argparse-style help without pulling in argparse for two
+        # positional args.  Same body as the docstring above so the
+        # console help and ``pydoc`` stay in sync without duplication.
+        print(_cli_main.__doc__.strip())  # type: ignore[union-attr]
+        sys.exit(0)
+
+    _print_env_banner()
     log.info(
-        "Usage: python geo_splines.py [<mesh.{obj,ply,stl}> | <session.json>]"
+        "Usage: python geo_splines.py "
+        "[<mesh.{obj,ply,stl,vtk}> | <session.json> [<mesh.{obj,ply,stl,vtk}>]]"
     )
     arg = sys.argv[1] if len(sys.argv) > 1 else None
-    mesh_or_path, mesh_label, json_path = _resolve_mesh(arg)
+    mesh_override = sys.argv[2] if len(sys.argv) > 2 else None
+    if len(sys.argv) > 3:
+        log.error("too many arguments; expected at most "
+                  "<session.json> <mesh_override>")
+        sys.exit(1)
+    mesh_or_path, mesh_label, json_path = _resolve_mesh(arg, mesh_override)
 
     app: GeodesicSplineApp | None = None
     try:
         app = GeodesicSplineApp(mesh_or_path, mesh_label=mesh_label)
 
         if json_path is not None:
-            with open(json_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            if data.get('version') not in (1, 2):
+            try:
+                with open(json_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+            except json.JSONDecodeError as exc:
+                log.error("invalid JSON in %s: line %d col %d: %s%s",
+                          json_path, exc.lineno, exc.colno, exc.msg,
+                          _json_decode_hint(exc))
+                data = None
+            if data is None:
+                pass  # error already logged; skip the load step
+            elif data.get('version') not in (1, 2):
                 log.error("unknown JSON version: %s", data.get('version'))
             else:
                 try:
@@ -6093,6 +7386,8 @@ def _cli_main() -> None:
                     log.error("invalid session JSON %s: %s", json_path, exc)
                 else:
                     n_nodes = app._load_from_data(data)
+                    # CLI session-load: same name-inheritance as ``L``.
+                    app._session_name = Path(json_path).stem
                     log.info("loaded %d nodes from %s", n_nodes, json_path)
 
         app.run()

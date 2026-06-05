@@ -44,4 +44,7 @@ jobs:
           pip install --upgrade pip
           pip install numpy scipy pytest
       - name: Run pure-Python tests
-        run: pytest tests/ -m "not gpu and not gui" -q
+        # ``benchmark`` needs the full deps (vtk/pyvista/potpourri3d) + a
+        # mesh, none of which are installed here — excluded explicitly in
+        # addition to its own skip guard.
+        run: pytest tests/ -m "not gpu and not gui and not benchmark" -q

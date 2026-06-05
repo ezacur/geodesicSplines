@@ -63,3 +63,8 @@ disable_error_code = ["attr-defined", "arg-type", "assignment"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra -q"
+markers = [
+    "benchmark: in-process perf benchmark for the geodesic core; needs full deps (vtk/pyvista/potpourri3d) + a mesh, so excluded from the slim CI matrix.",
+    "gpu: requires a GPU / hardware-accelerated VTK context.",
+    "gui: requires an interactive plotter window.",
+]

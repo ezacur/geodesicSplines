@@ -118,6 +118,14 @@ ARROW_SCREEN_SCALE = 0.01
 # arrows).  Cycled by the 't' key in geo_splines.py.
 GIZMO_OPACITY = 0.2
 
+# Z-buffer offsets (polygon offset) for gizmo actors.  Negative = closer
+# to camera = drawn on top.  When *any* sub-element of a gizmo (P / A /
+# B) is hovered, the whole gizmo is bumped to ``GIZMO_DEPTH_HOVER`` so
+# it draws on top of orange / blue / black spline curves and the
+# curve-hover sight (DEPTH_CURVE_HOVER = -24 in geo_splines.py).
+GIZMO_DEPTH_NORMAL: float = -8.0
+GIZMO_DEPTH_HOVER: float = -26.0
+
 # Cached pv.Color().float_rgb lookups — avoids per-frame Color object allocation.
 _COLOR_CACHE: dict[str, tuple[float, float, float]] = {}
 
@@ -395,6 +403,8 @@ class SegmentData:
         but the endpoint may be off by up to one edge length.
         """
         cache = self._origin_cache
+        if cache is None:
+            return None
         idx_s = cache['idx']
         _, idx_e = cache['kdtree'].query(target)
         idx_e = int(idx_e)
@@ -600,12 +610,12 @@ class SegmentData:
 
         v_3d = self.local_v[0] * self.u + self.local_v[1] * self.v
         fast = self.is_preview
-        self.path_b = geo.compute_shoot(self.origin, v_3d, self.h_length, self.face_idx, fast_mode=fast)
-        self.path_a = geo.compute_shoot(self.origin, -v_3d, self.h_length, self.face_idx, fast_mode=fast)
-        self.p_b = (np.array(self.path_b[-1], dtype=float)
-                    if self.path_b is not None else None)
-        self.p_a = (np.array(self.path_a[-1], dtype=float)
-                    if self.path_a is not None else None)
+        path_b = geo.compute_shoot(self.origin, v_3d, self.h_length, self.face_idx, fast_mode=fast)
+        path_a = geo.compute_shoot(self.origin, -v_3d, self.h_length, self.face_idx, fast_mode=fast)
+        self.path_b = path_b
+        self.path_a = path_a
+        self.p_b = np.array(path_b[-1], dtype=float) if path_b is not None else None
+        self.p_a = np.array(path_a[-1], dtype=float) if path_a is not None else None
 
     def _rotate_basis(self, new_normal: np.ndarray) -> None:
         """Rodrigues rotation of (u, v, normal) basis to align with new_normal.
@@ -757,12 +767,14 @@ class GeodesicSegment(SegmentData):
     @classmethod
     def _ensure_cone_template(cls) -> tuple[np.ndarray, np.ndarray]:
         """Lazily creates the shared cone template (base at origin, tip at +X)."""
-        if cls._cone_tpl_pts is None:
+        if cls._cone_tpl_pts is None or cls._cone_tpl_faces is None:
             cone = pv.Cone(center=(0.5, 0, 0), direction=(1, 0, 0),
                            height=1.0, radius=0.3, resolution=8, capping=True)
             cls._cone_tpl_pts = np.array(cone.points, dtype=float)
             cls._cone_tpl_faces = np.array(cone.faces)
-        return cls._cone_tpl_pts, cls._cone_tpl_faces
+        pts, faces = cls._cone_tpl_pts, cls._cone_tpl_faces
+        assert pts is not None and faces is not None
+        return pts, faces
 
     def _update_handle_arrow(self, plotter, tag: str, pt, color) -> None:
         """Renders handle A or B as a directional cone aligned with the
@@ -810,6 +822,13 @@ class GeodesicSegment(SegmentData):
             scale = self.h_length * 0.2
 
         is_hovered = (self.hover_marker == tag)
+        # Opacity bump is *per-node*, not per-marker: when the user
+        # hovers any sub-element of this gizmo (P / A / B) the whole
+        # node — its tangent line + both handle arrows — brightens to
+        # 1.0 so the user can see the full geometry of the node they
+        # are aiming at.  Per-marker affordances (color + scale ×1.4)
+        # still mark *which* marker is the active drag target.
+        node_hovered = (self.hover_marker is not None)
         actual_col = 'black' if is_hovered else color
         final_scale = scale * 1.4 if is_hovered else scale
 
@@ -841,14 +860,19 @@ class GeodesicSegment(SegmentData):
         # Always update position (endpoint moves during drag)
         buf_translated = buf + pt
 
-        # Hovered arrows go fully opaque
-        opacity = 1.0 if is_hovered else GIZMO_OPACITY
+        # Hover-bumped opacity for the whole node — see ``node_hovered``
+        # comment above.  Even the non-target handle (e.g. arrow B
+        # while the cursor is on A) becomes fully opaque so the user
+        # reads the entire gizmo at a glance.  The same flag also
+        # raises the actor's z-buffer priority so it draws on top of
+        # orange / blue / black curves.
+        opacity = 1.0 if node_hovered else GIZMO_OPACITY
+        depth = GIZMO_DEPTH_HOVER if node_hovered else GIZMO_DEPTH_NORMAL
 
         if pd is None:
             pd = pv.PolyData(buf_translated.copy(), tpl_faces.copy())
             act = plotter.add_mesh(pd, color=actual_col, lighting=True,
                                    opacity=opacity)
-            self._apply_depth_priority(act, -8.0)
             self._handle_pd[tag] = pd
             self._handle_act[tag] = act
         else:
@@ -858,6 +882,7 @@ class GeodesicSegment(SegmentData):
             prop.SetColor(_color_rgb(actual_col))
             prop.SetOpacity(opacity)
             act.SetVisibility(True)
+        self._apply_depth_priority(act, depth)
 
     def _update_handle(self, plotter, tag: str, pt, color):
         """Unified sync for control markers, keyed by handle tag ('p', 'a', 'b').
@@ -878,8 +903,12 @@ class GeodesicSegment(SegmentData):
             if act: act.SetVisibility(False)
             return
 
-        # Style logic: Contrast marker on hover
+        # Style logic: per-marker visual cue (color + size) for the
+        # *exact* marker under the cursor, but the opacity bump applies
+        # to every handle of the node — see the arrow path's
+        # ``node_hovered`` comment for the rationale.
         is_hovered = (self.hover_marker == tag)
+        node_hovered = (self.hover_marker is not None)
         if is_hovered:
             actual_col = 'darkred' if tag == 'p' else 'black'
             sz = 11 if tag == 'p' else 10
@@ -890,15 +919,19 @@ class GeodesicSegment(SegmentData):
         buf = self._handle_pt_buf
         buf[0, 0] = pt[0]; buf[0, 1] = pt[1]; buf[0, 2] = pt[2]
 
-        # Hovered handles go fully opaque for visual prominence
-        opacity = 1.0 if is_hovered else GIZMO_OPACITY
+        # Opacity bumps the whole node when *any* of its sub-elements
+        # is hovered (P / A / B) — not just the marker under the
+        # cursor.  Lets the user read the full tangent geometry.  The
+        # same flag also raises the actor's z-buffer priority so the
+        # handle draws on top of orange / blue / black curves.
+        opacity = 1.0 if node_hovered else GIZMO_OPACITY
+        depth = GIZMO_DEPTH_HOVER if node_hovered else GIZMO_DEPTH_NORMAL
 
-        if pd is None:
+        if pd is None or act is None:
             pd = pv.PolyData(buf.copy())
             act = plotter.add_mesh(pd, color=actual_col, point_size=sz,
                                    render_points_as_spheres=True, lighting=False,
                                    opacity=opacity)
-            self._apply_depth_priority(act, -8.0)
             self._handle_pd[tag] = pd
             self._handle_act[tag] = act
         else:
@@ -908,6 +941,7 @@ class GeodesicSegment(SegmentData):
             prop.SetPointSize(sz)
             prop.SetOpacity(opacity)
             act.SetVisibility(True)
+        self._apply_depth_priority(act, depth)
 
     def update_visuals(self, plotter: pv.Plotter, line_width: int = 2) -> None:
         """Refreshes the visual representation with state-dependent styling.
@@ -916,6 +950,16 @@ class GeodesicSegment(SegmentData):
           - **dimmed**: inactive spline — gray, thin, translucent.
           - **preview**: drag in motion — red, thin (lw-1), 60% opacity.
           - **normal / consolidated**: full width, full opacity.
+
+        Inside the **normal** branch a hover bump is layered on top:
+        when ``self.hover_marker`` is set (cursor on P / A / B), the
+        tangent line AND both handle markers go to opacity 1.0 so the
+        user reads the entire gizmo at once.  Per-marker affordances
+        (the hovered marker's colour flip and ×1.4 scale) still flag
+        which sub-element is the drag target.  Dimmed / preview
+        branches deliberately ignore hover — those states carry their
+        own semantic meaning ("inactive spline" / "drag in motion")
+        that the bump would muddle.
 
         Uses ``_line_buf`` (pre-allocated in ``__init__``) to concatenate
         path_a and path_b without per-frame ``np.vstack`` allocation.
@@ -930,7 +974,14 @@ class GeodesicSegment(SegmentData):
             lw = max(1, line_width - 1)
         else:
             line_color = 'red'
-            line_opacity = GIZMO_OPACITY
+            # Node-level hover bump: when the cursor is on any handle
+            # of this segment (P / A / B) the tangent line itself goes
+            # fully opaque too, so the user sees the geodesic arc that
+            # belongs to the gizmo under the cursor.  Dimmed / preview
+            # branches above keep their own opacity unchanged — those
+            # states communicate "inactive spline" or "drag in motion"
+            # and a hover bump there would muddle the signal.
+            line_opacity = 1.0 if self.hover_marker is not None else GIZMO_OPACITY
             lw = line_width
 
         # 1. Main Geodesic Path — write into pre-allocated buffer.
@@ -952,12 +1003,21 @@ class GeodesicSegment(SegmentData):
             self._line_buf = np.empty((needed * 2, 3), dtype=float)
 
         n = 0
-        if na > 0:
+        if na > 0 and self.path_a is not None:
             self._line_buf[:na] = self.path_a[::-1]
             n = na
-        if nb > 0:
+        if nb > 0 and self.path_b is not None:
             self._line_buf[n:n + nb] = self.path_b[1:]
             n += nb
+
+        # Hover bump also raises the tangent line's z-buffer priority
+        # so the whole gizmo (line + handles) draws on top of orange /
+        # blue / black curves.  Dimmed / preview branches keep the
+        # default depth — see the per-marker render paths for the same
+        # logic.
+        line_hovered = (not self.is_dimmed and not self.is_preview
+                        and self.hover_marker is not None)
+        line_depth = GIZMO_DEPTH_HOVER if line_hovered else GIZMO_DEPTH_NORMAL
 
         if n > 0:
             pts_arr = self._line_buf[:n]
@@ -967,13 +1027,13 @@ class GeodesicSegment(SegmentData):
                 self._act_line = plotter.add_mesh(
                     self._pd_line, color=line_color, line_width=lw,
                     opacity=line_opacity, lighting=False)
-                self._apply_depth_priority(self._act_line, -8.0)
             else:
                 update_line_inplace(self._pd_line, pts_arr)
                 prop = self._act_line.GetProperty()
                 prop.SetColor(_color_rgb(line_color))
                 prop.SetOpacity(line_opacity)
                 prop.SetLineWidth(lw)
+            self._apply_depth_priority(self._act_line, line_depth)
             self._act_line.SetVisibility(True)
         elif self._act_line:
             self._act_line.SetVisibility(False)

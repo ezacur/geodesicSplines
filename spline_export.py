@@ -3,13 +3,55 @@
 spline_export.py — Command-line exporter for geodesic spline curves.
 
 Reads a spline JSON file (saved by geo_splines.py) and outputs the
-curve points for a selected layer (blue/orange/interp) to stdout.
+curve points for a selected layer (blue/orange/interp) to stdout (CSV)
+or to a file on disk (OBJ / VTK).
 
-Usage::
+Usage
+-----
 
-    python spline_export.py <splines.json> <b|o|k> [--samples N]
+::
 
-Output format (CSV, one point per line):
+    python spline_export.py <session.json> [layer] [mesh_override] \\
+                            [--samples N] [--obj | --vtk]
+
+Positional arguments:
+
+  * ``session.json``     Required.  Path to a session file produced by
+                         ``geo_splines.py`` (v1 or v2 schema).
+  * ``layer``            Optional.  Curve layer letter — one of
+                         ``b`` (blue / semi-geodesic), ``o`` (orange /
+                         fully geodesic, the default), or ``k`` (black /
+                         scipy interp through node origins).
+  * ``mesh_override``    Optional.  Path to a mesh file
+                         (``.vtk``/``.obj``/``.ply``/``.stl``) used in
+                         place of the session's ``mesh_file`` field.
+                         Lets you export the same splines onto a
+                         different geometry — registered counterpart,
+                         higher-res resampling, alternative mesh —
+                         since the JSON stores 3-D positions, not
+                         vertex indices.
+
+Layer and mesh_override are **order-agnostic**: ``b L.vtk`` and
+``L.vtk b`` are equivalent.  ``--mesh PATH`` is an explicit
+alternative to the positional form.
+
+Options:
+
+  * ``--samples N``      Minimum samples per span (>= 2, default 60).
+  * ``--obj``            Write ``<basename>.obj`` instead of CSV.
+                         Mutually exclusive with ``--vtk``.
+  * ``--vtk``            Write ``<basename>.vtk`` (binary legacy
+                         UnstructuredGrid) instead of CSV.  Mutually
+                         exclusive with ``--obj``.
+  * ``-h``, ``--help``   Show argparse-generated help and exit.
+
+Without ``--obj`` / ``--vtk`` the export is CSV to stdout; pipe or
+redirect to capture it.
+
+Output format (CSV, one point per line)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+::
 
     x , y , z          — curve point
     NaN , NaN , NaN    — break between splines
@@ -18,7 +60,8 @@ Output format (CSV, one point per line):
     NaN , NaN , NaN
 
 Landmarks are node origins wrapped in NaN sentinels so downstream
-tools can distinguish them from curve points.
+tools (Matplotlib, R, MATLAB) cut polylines cleanly at the breaks
+without joining disjoint splines.
 
 Layers
 ------
@@ -30,11 +73,42 @@ Layers
   - **k** (black): interpolation B-spline through node origins (scipy
     splprep/splev), projected onto the surface.  Fastest; no handles.
 
-Examples::
+Diagnostics
+-----------
 
-    python spline_export.py 20260414_153022.json b > blue_curve.csv
+All ``log.info`` / ``log.error`` go to **stderr** with the
+``[LEVEL] spline_export: ...`` prefix.  Stdout stays clean for the
+CSV stream.  ``GEO_SPLINES_DEBUG=1`` in the environment raises the
+log level to DEBUG.
+
+Exit codes:
+
+  * ``0`` success.
+  * ``2`` JSON missing / unreadable / malformed / failing schema
+    validation, or override mesh missing.
+
+Examples
+--------
+
+::
+
+    # Default orange layer, CSV to stdout, redirected to a file:
+    python spline_export.py 20260414_153022.json > orange.csv
+
+    # Blue layer:
+    python spline_export.py 20260414_153022.json b > blue.csv
+
+    # Orange with 50 samples / span:
     python spline_export.py 20260414_153022.json o --samples 50
-    python spline_export.py 20260414_153022.json k > interp_curve.csv
+
+    # Same session but exported against a different mesh:
+    python spline_export.py 20260414_153022.json L_hires.vtk --vtk
+
+    # Order-agnostic positionals + interp layer to OBJ:
+    python spline_export.py 20260414_153022.json k other_mesh.obj --obj
+
+    # Explicit --mesh option (equivalent to a positional .vtk):
+    python spline_export.py 20260414_153022.json --mesh L_hires.vtk --vtk
 """
 
 from __future__ import annotations
@@ -43,6 +117,16 @@ import argparse
 import json
 import logging
 import os
+
+# Disable Intel Fortran's Win32 Console Control Handler before MKL
+# loads (via numpy/scipy/pp3d below).  Without this, Ctrl+C on the
+# parent or any worker triggers ``libifcoremd.dll``'s ``forrtl: error
+# (200)`` traceback + ``abort()`` before Python can run KeyboardInterrupt
+# cleanup, hanging the terminal with four interleaved tracebacks.
+# Mirror of the same assignment in ``geo_splines.py``; see that file
+# for the full rationale.
+os.environ.setdefault('FOR_DISABLE_CONSOLE_CTRL_HANDLER', '1')
+
 import sys
 from concurrent.futures import ProcessPoolExecutor
 
@@ -359,6 +443,11 @@ def _orange_worker_init(v: np.ndarray, f: np.ndarray) -> None:
     so we pass ``build_locator=False`` to skip the ~250 ms locator
     construction per worker.
     """
+    # Belt-and-braces against MKL's Console Control Handler — same
+    # rationale as in ``geo_splines._process_initializer``.  Re-assert
+    # the env var in case a custom launcher cleared it between fork
+    # and the worker initializer.
+    os.environ.setdefault('FOR_DISABLE_CONSOLE_CTRL_HANDLER', '1')
     import signal as _signal
     _signal.signal(_signal.SIGINT, _signal.SIG_IGN)
 
@@ -412,7 +501,7 @@ def _orange_span_worker(task_data):
     cum_12, total_12 = GeodesicMesh.compute_path_lengths(path_12)
 
     n = len(t_grid)
-    span_pts = [None] * n
+    span_pts: list[np.ndarray] = [np.empty(0)] * n
     # Pre-seed endpoints with the literal node origins (matches editor).
     span_pts[0]  = np.asarray(P0, dtype=float)
     span_pts[-1] = np.asarray(P1, dtype=float)
@@ -490,7 +579,7 @@ def compute_orange(geo, nodes, closed, n_samples,
         return []
 
     n_spans = n_nodes if closed else n_nodes - 1
-    tasks = []
+    tasks: list[tuple | None] = []
 
     for i in range(n_spans):
         n0 = nodes[i]
@@ -522,7 +611,7 @@ def compute_orange(geo, nodes, closed, n_samples,
 
     log.info("computing %d spans in parallel...", n_spans)
 
-    all_pts = [None] * n_spans
+    all_pts: list[np.ndarray | None] = [None] * n_spans
     valid_task_indices = [i for i, t in enumerate(tasks) if t is not None]
     valid_tasks = [tasks[i] for i in valid_task_indices]
 
@@ -702,26 +791,60 @@ def format_point(pt):
     return f"{pt[0]:.16e} , {pt[1]:.16e} , {pt[2]:.16e}"
 
 
+_MESH_EXTS = ('.vtk', '.obj', '.ply', '.stl')
+_LAYER_CHOICES = ('b', 'o', 'k')
+
+
 def main():
     if len(sys.argv) == 1:
-        print("Usage: python spline_export.py <splines.json> [layer] [--samples N] [--obj]")
-        print("\nExport geodesic spline curves from a JSON session file.")
-        print("\nArguments:")
-        print("  json_file     Path to the splines JSON file")
-        print("  layer         Curve layer: b=blue(semi-geodesic), o=orange(exact), k=interp(black)")
-        print("                (default: o)")
-        print("\nOptions:")
-        print("  --samples N   Minimum samples per span (default: 60)")
-        print("  --obj         Export as .obj file instead of CSV to stdout")
-        print("  --vtk         Export as binary legacy .vtk file instead of CSV to stdout")
-        print("  -h, --help    Show this help message and exit")
+        # ``argparse``'s ``--help`` is the canonical reference; this
+        # condensed banner is the quick reminder when the user types
+        # ``spline_export.py`` with no args at all (a common
+        # "wait, what did this take again" moment).
+        print("Usage: python spline_export.py <session.json> [layer] "
+              "[mesh_override] [--samples N] [--obj | --vtk]")
+        print()
+        print("Export geodesic spline curves from a JSON session file.")
+        print()
+        print("Positional:")
+        print("  session.json   Path to the JSON session (v1 or v2 schema).")
+        print("  layer          Curve layer letter (order-agnostic with mesh_override):")
+        print("                   b  blue   — semi-geodesic Bezier")
+        print("                   o  orange — fully geodesic de Casteljau (default)")
+        print("                   k  black  — scipy interp through node origins")
+        print("  mesh_override  Optional .vtk/.obj/.ply/.stl mesh used in place of the")
+        print("                 session's mesh_file field.  Lets you export the same")
+        print("                 splines onto a different geometry.")
+        print()
+        print("Options:")
+        print("  --samples N    Minimum samples per span (>= 2, default: 60).")
+        print("  --mesh PATH    Explicit mesh override (alternative to positional).")
+        print("  --obj          Write <basename>.obj instead of CSV to stdout.")
+        print("  --vtk          Write <basename>.vtk instead of CSV to stdout.")
+        print("  -h, --help     Show the full argparse help and exit.")
+        print()
+        print("Default output is CSV to stdout — pipe or redirect to capture it.")
         sys.exit(0)
 
     parser = argparse.ArgumentParser(
-        description="Export geodesic spline curves from a JSON session file.")
-    parser.add_argument('json_file', help="Path to the splines JSON file")
-    parser.add_argument('layer', nargs='?', choices=['b', 'o', 'k'], default='o',
-                        help="Curve layer: b=blue(semi-geodesic), o=orange(exact), k=interp(black) (default: o)")
+        description=(
+            "Export geodesic spline curves from a JSON session file.  "
+            "Positional 'layer' (b/o/k) and 'mesh_override' (path to "
+            ".vtk/.obj/.ply/.stl) are order-agnostic and both optional; "
+            "the default layer is 'o' (orange / fully geodesic)."),
+        epilog=(
+            "Examples: "
+            "spline_export.py s.json b > b.csv  |  "
+            "spline_export.py s.json o --samples 80 --vtk  |  "
+            "spline_export.py s.json L_hires.vtk k --obj"))
+    parser.add_argument('json_file',
+                        help="Path to the JSON session (v1 or v2 schema).")
+    parser.add_argument(
+        'extras', nargs='*',
+        metavar='LAYER_OR_MESH',
+        help=("Up to two optional positionals, order-agnostic: a layer "
+              "letter ('b'/'o'/'k') and/or a mesh path "
+              "(.vtk/.obj/.ply/.stl) to override session's mesh_file."))
 
     def _samples_type(value: str) -> int:
         # ``int(value)`` itself raises ArgumentTypeError-equivalent if
@@ -735,18 +858,62 @@ def main():
         return n
 
     parser.add_argument('--samples', type=_samples_type, default=60,
-                        help="Minimum samples per span (>= 2, default: 60)")
+                        help="Minimum samples per span (>= 2, default: 60).")
+    parser.add_argument('--mesh', dest='mesh_option', metavar='PATH',
+                        default=None,
+                        help=("Mesh file (.vtk/.obj/.ply/.stl) to use in "
+                              "place of the session's mesh_file.  Equivalent "
+                              "to passing the same path as a positional "
+                              "argument."))
     # Mutually-exclusive output formats.  Without the group, passing
     # both ``--obj --vtk`` silently dispatched to ``--obj`` because of
     # the ``elif`` chain in main() — surprising and undocumented.
     out_group = parser.add_mutually_exclusive_group()
     out_group.add_argument('--obj', action='store_true',
-                           help="Export to .obj file (basename.obj)")
+                           help="Export to .obj file (basename.obj).")
     out_group.add_argument('--vtk', action='store_true',
-                           help="Export to binary legacy .vtk file (basename.vtk)")
+                           help=("Export to binary legacy .vtk "
+                                 "(basename.vtk).  Note this is the OUTPUT "
+                                 "format flag — to override the INPUT mesh, "
+                                 "pass the .vtk path as a positional or "
+                                 "use --mesh."))
     args = parser.parse_args()
 
+    # Disambiguate ``extras`` by extension / value.  A layer letter and
+    # a mesh path are both optional and order-agnostic, so the loop
+    # routes each into its own slot and errors clearly on duplicates
+    # or unrecognised tokens.
+    layer = 'o'
+    mesh_override = args.mesh_option
+    seen_layer = False
+    for x in args.extras:
+        xl = x.lower()
+        if xl.endswith(_MESH_EXTS):
+            if mesh_override is not None and mesh_override != x:
+                parser.error(
+                    f"two mesh overrides given: {mesh_override!r} and {x!r}")
+            mesh_override = x
+        elif x in _LAYER_CHOICES:
+            if seen_layer:
+                parser.error(f"layer specified twice: {x!r}")
+            layer = x
+            seen_layer = True
+        else:
+            parser.error(
+                f"unrecognised argument {x!r}: expected a layer letter "
+                f"({'/'.join(_LAYER_CHOICES)}) or a mesh path with one of "
+                f"{', '.join(_MESH_EXTS)}")
+    args.layer = layer
+    args.mesh_override = mesh_override
+
     data = load_json(args.json_file)
+    if args.mesh_override is not None:
+        if not os.path.exists(args.mesh_override):
+            log.error("override mesh not found: %s", args.mesh_override)
+            sys.exit(2)
+        log.info("mesh override: %s (replacing session's '%s')",
+                 args.mesh_override, data.get('mesh_file', '<unset>'))
+        data['mesh_file'] = args.mesh_override
     geo, splines, splines_closed = rebuild_mesh_and_nodes(data)
 
     compute_fn = {'b': compute_blue, 'o': compute_orange,

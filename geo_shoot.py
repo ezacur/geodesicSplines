@@ -144,8 +144,12 @@ To register a new debounce task from anywhere in the code::
 
 To cancel: ``self.state.pending_debounces.pop('my_task', None)``.
 
-The drag consolidation uses task id ``'drag_exact'`` — see
-``_schedule_debounce`` and ``_fire_debounce``.
+Task IDs currently registered:
+  - ``'drag_exact'`` (this module) — handle drag consolidation; see
+    ``_schedule_debounce`` and ``_fire_debounce``.
+  - ``'stitch_exact'`` (``GeodesicSplineApp``) — cursor-stillness
+    refinement of the gray stitch line; see ``_schedule_stitch_exact``
+    and ``_fire_stitch_exact`` in ``geo_splines.py``.
 
 Implementation details:
   - The timer is created from a one-shot ``RenderEvent`` callback in
@@ -374,6 +378,13 @@ class SessionState:
     """
     hover_seg: GeodesicSegment | None = None
     hover_marker: str | None = None
+
+    # Segment whose hover styling is still active during the post-hover
+    # grace period.  Set when the cursor leaves the handles to (None,
+    # None); cleared by ``_fire_hover_revert`` once the debounce expires,
+    # or sooner if the cursor returns to any handle.  Lets the user
+    # twitch off a handle without an instant opacity / z-buffer flicker.
+    pending_hover_revert_seg: GeodesicSegment | None = None
 
     active_seg: GeodesicSegment | None = None
     drag_marker: str | None = None
@@ -671,6 +682,11 @@ class MidpointShooterApp:
     # Maximum capacity for hover marker buffers.  Doubled on overflow.
     _HOVER_CAPACITY: int = 512
 
+    # Grace period before reverting a gizmo's hover styling (opacity +
+    # z-buffer bump) when the cursor leaves the handles.  Absorbs tiny
+    # cursor twitches off a handle without an instant visual flicker.
+    _HOVER_REVERT_SEC: float = 0.3
+
     def __init__(self, mesh_path: str):
         self._load_mesh(mesh_path)
         self.cfg = UIConfig()
@@ -859,8 +875,7 @@ class MidpointShooterApp:
             (vtki, vtki.AddObserver(
                 vtk.vtkCommand.TimerEvent, self._on_poll_timer, 1.0)))
 
-    @staticmethod
-    def _print_help() -> None:
+    def _print_help(self) -> None:
         print("""
 ========================================
 --- MIDPOINT GEODESIC SHOOTER ---
@@ -961,6 +976,8 @@ class MidpointShooterApp:
         cx, cy, cz = self.plotter.camera.position
         cam_pos[0] = cx; cam_pos[1] = cy; cam_pos[2] = cz
         # Ray cast from camera to marker
+        if self.geo.locator is None:
+            return False
         hit = self.geo.locator.IntersectWithLine(
             cam_pos, marker_pos, 0.0001,
             self._pick_t, self._pick_pt, self._pick_pcoords,
@@ -1099,13 +1116,15 @@ class MidpointShooterApp:
         Callers that need to persist the result must ``.copy()`` it.
         """
         self._refresh_vp_cache()
+        M = self.state._vp_matrix
+        assert M is not None  # _refresh_vp_cache populates it on first call
         n = len(pts_3d)
 
         if n > self._screen_buf.shape[0]:
             self._screen_buf = np.empty((n * 2, 2), dtype=float)
 
         screen = self._screen_buf[:n]
-        _to_screen_kernel(pts_3d, self.state._vp_matrix,
+        _to_screen_kernel(pts_3d, M,
                           self.state._vp_w, self.state._vp_h,
                           self.state._vp_ox, self.state._vp_oy, screen)
         return screen
@@ -1123,6 +1142,7 @@ class MidpointShooterApp:
         """
         self._refresh_vp_cache()
         M = self.state._vp_matrix
+        assert M is not None  # _refresh_vp_cache populates it on first call
         x, y, z = float(pt3d[0]), float(pt3d[1]), float(pt3d[2])
         cx = M[0, 0]*x + M[0, 1]*y + M[0, 2]*z + M[0, 3]
         cy = M[1, 0]*x + M[1, 1]*y + M[1, 2]*z + M[1, 3]
@@ -1378,16 +1398,66 @@ class MidpointShooterApp:
 
         needs_render = False
         if (new_h_s, new_h_m) != (self.state.hover_seg, self.state.hover_marker):
-            if self.state.hover_seg:
-                self.state.hover_seg.hover_marker = None
-                self.state.hover_seg.update_visuals(self.plotter)
-            self.state.hover_seg, self.state.hover_marker = new_h_s, new_h_m
-            if self.state.hover_seg:
-                self.state.hover_seg.hover_marker = self.state.hover_marker
-                self.state.hover_seg.update_visuals(self.plotter)
+            if new_h_s is None:
+                # Cursor left all handles.  When idle (no drag), defer
+                # the visual revert by ``_HOVER_REVERT_SEC`` so a brief
+                # twitch off the handle doesn't flicker — the Master
+                # Clock fires ``_fire_hover_revert`` on expiry, and a
+                # subsequent hover entry cancels the pending revert
+                # below.  When a drag is in progress the deferral is
+                # skipped: the drag-preview style takes over and a
+                # lingering hover bump would be misleading.  Logical
+                # ``state.hover_seg`` is cleared immediately in both
+                # paths so HUD / curve-hover read the correct
+                # "off-handle" state.
+                if self.state.hover_seg is not None:
+                    if self.state.active_seg is not None:
+                        self.state.hover_seg.hover_marker = None
+                        self.state.hover_seg.update_visuals(self.plotter)
+                    else:
+                        self.state.pending_hover_revert_seg = self.state.hover_seg
+                        self.state.pending_debounces['hover_revert'] = (
+                            time.perf_counter() + self._HOVER_REVERT_SEC,
+                            self._fire_hover_revert,
+                        )
+                self.state.hover_seg, self.state.hover_marker = None, None
+            else:
+                # New hover entered (from None or from another handle).
+                # Cancel any pending revert and resolve which segment
+                # owned the previous hover styling: either the live
+                # ``state.hover_seg`` or, if we're inside the grace
+                # period, the segment captured in
+                # ``pending_hover_revert_seg``.
+                self.state.pending_debounces.pop('hover_revert', None)
+                pending_seg = self.state.pending_hover_revert_seg
+                self.state.pending_hover_revert_seg = None
+                prev_seg = self.state.hover_seg or pending_seg
+                if prev_seg is not None and prev_seg is not new_h_s:
+                    prev_seg.hover_marker = None
+                    prev_seg.update_visuals(self.plotter)
+                self.state.hover_seg, self.state.hover_marker = new_h_s, new_h_m
+                new_h_s.hover_marker = new_h_m
+                new_h_s.update_visuals(self.plotter)
             needs_render = True
 
         return new_h_s, new_h_m, needs_render
+
+    def _fire_hover_revert(self) -> None:
+        """Reverts a gizmo's hover styling after the grace period expires.
+
+        Registered by ``_detect_hover`` when the cursor leaves all
+        handles.  Reads the captured segment from
+        ``state.pending_hover_revert_seg`` — that slot is cleared early
+        if a fresh hover entry cancels the debounce, so by the time
+        this fires the segment is still the right one to revert.
+        ``_on_poll_timer`` issues a ``render()`` after the callback.
+        """
+        seg = self.state.pending_hover_revert_seg
+        self.state.pending_hover_revert_seg = None
+        if seg is None:
+            return
+        seg.hover_marker = None
+        seg.update_visuals(self.plotter)
 
     def _on_move(self, obj, event, *, pick_override=None) -> None:
         """Main interaction loop: hover detection, surface cursor, drag handling.
@@ -1500,7 +1570,7 @@ class MidpointShooterApp:
 
             if needs_render:
                 if self.state.active_seg is None:
-                    if self.state.hover_seg:
+                    if self.state.hover_seg and self.state.hover_marker is not None:
                         self._set_hud(f"READY: {self.state.hover_marker.upper()}", 'white')
                     else:
                         self._set_hud("READY", 'white')
@@ -1792,6 +1862,21 @@ class MidpointShooterApp:
                 self._render_observer_tag = None
         except (AttributeError, RuntimeError):
             pass
+
+        # Close the plotter window itself.  ``show()`` returns when VTK
+        # exits its event loop (window X button, ``q`` key, or VTK's own
+        # "Caught a Ctrl-C" handler) but does **not** destroy the render
+        # window — the OS-level window stays visible until the
+        # ``vtkRenderWindow`` is released.  Explicit ``close()`` makes
+        # the window vanish immediately so the user gets visual
+        # confirmation that the app is shutting down, even if Python's
+        # atexit chain blocks on a slow finalizer below.  Idempotent on
+        # PyVista: a second close after the window is already gone is a
+        # no-op.
+        try:
+            self.plotter.close()
+        except (AttributeError, RuntimeError) as exc:
+            log.debug("plotter.close during cleanup: %s", exc)
 
     def run(self) -> None:
         """Starts the application.  Creates the master clock timer from inside
