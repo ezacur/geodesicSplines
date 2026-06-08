@@ -220,7 +220,10 @@ import pyvista as pv
 import vtk
 
 from geodesics import GeodesicMesh
-from gizmo import GeodesicSegment, WARN_SHOOT, _color_rgb, safe_remove_actor
+from gizmo import (
+    GeodesicSegment, WARN_SHOOT, _color_rgb, safe_remove_actor,
+    set_depth_priority,
+)
 
 
 # Module-level logger.  No handler is attached here; geo_splines
@@ -324,10 +327,8 @@ def _closest_seg_on_polyline_2d(screen_pts, n_pts, mx, my):
 class UIConfig:
     """Centralized visual tokens and thresholds."""
     # Colors
-    COLOR_MESH: str = 'white'
     COLOR_CURSOR: str = 'darkgoldenrod'
     COLOR_CROSSHAIR: str = 'darkslategrey'
-    COLOR_HOVER: str = 'black'
     
     # Appearance
     CURSOR_OPACITY: float = 0.8
@@ -502,10 +503,7 @@ class SurfaceCursor:
 
         for actor in [self._circle_actor, self._lines_actor]:
             actor.SetVisibility(False)
-            mapper = actor.GetMapper()
-            mapper.SetResolveCoincidentTopologyToPolygonOffset()
-            mapper.SetRelativeCoincidentTopologyLineOffsetParameters(0, -6.0)
-            mapper.SetRelativeCoincidentTopologyPointOffsetParameter(-6.0)
+            set_depth_priority(actor)
 
         n_circle = len(self._circle_template.points)
         self._circle_pts_buf = np.empty((n_circle, 3), dtype=float)
@@ -890,10 +888,7 @@ class MidpointShooterApp:
     @staticmethod
     def _set_depth_priority(actor, offset: float = -6.0) -> None:
         """Shifts an actor closer to the camera in z-buffer so it draws on top of surfaces."""
-        mapper = actor.GetMapper()
-        mapper.SetResolveCoincidentTopologyToPolygonOffset()
-        mapper.SetRelativeCoincidentTopologyLineOffsetParameters(0, offset)
-        mapper.SetRelativeCoincidentTopologyPointOffsetParameter(offset)
+        set_depth_priority(actor, offset)
 
     def _create_aux_actor(
             self, *, kind: str, color: str, depth: float,

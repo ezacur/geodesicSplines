@@ -85,8 +85,9 @@ uses a different strategy — oversized pre-allocated buffers:
     original vertex.  Handles the case where newly inserted vertices are
     invisible to the original-mesh KDTree.
   * **Near-edge nudge** (``_add_point_buf``): when a point's barycentric
-    coordinates place it very close to an edge (min coord < 1e-3), the
-    point is shifted ~0.1% toward the face centroid before subdivision.
+    coordinates place it very close to an edge (min coord < 1e-7), the
+    point is shifted ~1% of the shortest edge toward the face centroid
+    before subdivision.
     This prevents sliver triangles with near-zero area that cause NaNs
     in the solver's cotan/area computations.
   * **Retry with nudge** (``compute_endpoint``): if the solver rejects
@@ -109,14 +110,15 @@ The smoothing pipeline:
 
   1. ``_face_normals`` — raw, geometric face normals (cross product).
      Used by ``compute_shoot``'s inner loop for exact ray–edge math.
-  2. ``_smooth_face_normals`` — Laplacian-smoothed face normals (N
-     iterations, default 5).  Two weighting strategies are available,
-     selected by the class variable ``COTANGENT_WEIGHTS``:
+  2. ``_smooth_face_normals`` — Laplacian-smoothed face normals.  Two
+     weighting strategies are available, selected by the class variable
+     ``COTANGENT_WEIGHTS`` (default cotangent at 2 iterations; the
+     uniform variant runs 5):
 
-       - **Uniform** (default, ``COTANGENT_WEIGHTS = False``): each
+       - **Uniform** (``COTANGENT_WEIGHTS = False``): each
          neighbor has equal weight.  Fast; assumes roughly equilateral
          triangles.
-       - **Cotangent** (``COTANGENT_WEIGHTS = True``): classical
+       - **Cotangent** (default, ``COTANGENT_WEIGHTS = True``): classical
          Pinkall-Polthier weights — for each shared edge, the dual-edge
          weight is ``½ · (cot α + cot β)`` where α and β are the
          angles **opposite** to the shared edge in each triangle.
@@ -127,7 +129,7 @@ The smoothing pipeline:
          triangles where uniform weights bias the smoothed normals
          toward densely-tessellated regions.
 
-  3. ``_vertex_normals`` — area-weighted averages of *smooth* face
+  3. ``_vertex_normals`` — angle-weighted averages of *smooth* face
      normals, not raw ones.  Clean by construction.
 
 ``get_interpolated_normal`` selects the appropriate source:
@@ -236,7 +238,7 @@ Next steps
     instead of Euclidean + projection at levels 2–3).
   - Geodesic offset curves (equidistant from a spline, on surface).
   - [DONE] Cotangent-weight Laplacian for normal smoothing
-    (``COTANGENT_WEIGHTS = True``).  Off by default.
+    (``COTANGENT_WEIGHTS = True``).  On by default.
   - [DONE] Numba JIT compilation of ``compute_shoot`` inner loop,
     ``_ray_edge_crossing``, ``_parallel_transport``, and
     ``project_smooth_batch`` projection kernel.  Falls back to pure
@@ -1314,7 +1316,7 @@ class GeodesicMesh:
             normals = normals / np.where(norms < 1e-15, 1.0, norms)
         return normals
 
-    def _smooth_face_normals_cotangent(self, iterations: int = 5) -> F64Array:
+    def _smooth_face_normals_cotangent(self, iterations: int = 2) -> F64Array:
         """Cotangent-Laplacian smoothing of face normals (Pinkall-Polthier).
 
         Classical discrete Laplace-Beltrami discretization applied to the
@@ -1358,7 +1360,8 @@ class GeodesicMesh:
         clipped, or boundary triangles with one side missing) get an
         identity self-loop so their normal survives the smoothing pass.
 
-        Activated by setting ``COTANGENT_WEIGHTS = True`` on the class.
+        Selected by ``COTANGENT_WEIGHTS = True`` on the class (the
+        default; set it to ``False`` for the uniform-weight variant).
         """
         from scipy.sparse import coo_matrix, diags
 
@@ -2206,25 +2209,6 @@ class GeodesicMesh:
             for adj_fi in self._vf_data[start:end]:
                 result.add(int(adj_fi))
         return result
-
-    def _expand_face_region(self, seed_faces,
-                            k_rings: int) -> np.ndarray:
-        """BFS expansion of a face seed set by *k_rings* topological rings.
-
-        Plain uni-directional BFS (simpler and faster than the old
-        bidirectional variant since the seed is already a dense "tube"
-        along the expected geodesic path — the two fronts are already
-        connected).  Returns a sorted int32 array of face indices.
-
-        This one-shot helper rebuilds the BFS state from scratch.
-        ``compute_endpoint_local``'s retry loop instead drives
-        ``_bfs_init`` + ``_bfs_advance`` directly, advancing the same
-        ``visited`` / ``frontier`` state by ring *increments* across
-        phases A / B / C so each escalation only walks the new rings.
-        """
-        visited, frontier = self._bfs_init(seed_faces)
-        self._bfs_advance(visited, frontier, k_rings)
-        return np.array(sorted(visited), dtype=np.int32)
 
     def _bfs_init(self, seed_faces) -> tuple[set[int], set[int]]:
         """Initial BFS state from the seed: ``(visited, frontier)``.
@@ -4246,4 +4230,97 @@ class GeodesicMesh:
             out = self.project_smooth_batch(out)
 
         return out
+
+
+def eval_cascade_at_t(
+    geo, t: float,
+    path_b: np.ndarray, cum_b: np.ndarray, total_b: float,
+    path_a_rev: np.ndarray, cum_a: np.ndarray, total_a: float,
+    path_12: np.ndarray, cum_12: np.ndarray, total_12: float,
+    submesh_subdiv: int = 0,
+    use_full_mesh: bool = False,
+) -> tuple[np.ndarray, bool]:
+    """Evaluate one full de Casteljau cascade level at parameter *t*.
+
+    Shared by the editor's orange worker (geo_splines) and the headless
+    exporter (spline_export) so both produce the identical fully-geodesic
+    curve.  Returns ``(point, degraded)`` where ``degraded`` is True if any
+    of the three inner solver calls fell back to a straight-line polyline
+    (component break, solver failure).
+
+    The cascade structure:
+      level 1  →  b01 = lerp(path_b, t)
+                  b12 = lerp(path_12, t)   (path_12 is shared / cached)
+                  b23 = lerp(path_a_rev, t)
+      level 2  →  path_c0 = geodesic(b01, b12)  → c0 = lerp(path_c0, t)
+                  path_c1 = geodesic(b12, b23)  → c1 = lerp(path_c1, t)
+      level 3  →  path_final = geodesic(c0, c1)  → result = lerp(path_final, t)
+
+    Solver dispatch:
+
+    * ``use_full_mesh=False`` (default) — uses ``compute_endpoint_local``
+      with the supplied *submesh_subdiv*.  Fast (~25-100 ms per call)
+      but the submesh extraction can return topologically different
+      paths for slightly-perturbed inputs at certain ``t``, producing
+      visible jumps in the rendered curve.
+    * ``use_full_mesh=True`` — uses ``compute_endpoint`` instead.
+      ~3-5× slower because the solver is built on the augmented full
+      mesh, but the answer is stable: equal inputs → equal outputs,
+      modulo only floating-point noise.  Eliminates submesh-extraction
+      artifacts.  Genuine cascade-topology jumps (where ``c0`` and
+      ``c1`` themselves cross a saddle vertex as ``t`` advances)
+      persist — no solver swap can fix those.
+    """
+    log_w = logging.getLogger("geo_splines.worker")
+    degraded = False
+
+    if use_full_mesh:
+        def _solve(p_a, p_b):
+            return geo.compute_endpoint(p_a, p_b)
+    else:
+        def _solve(p_a, p_b):
+            return geo.compute_endpoint_local(
+                p_a, p_b, submesh_subdiv=submesh_subdiv)
+
+    b01 = GeodesicMesh.geodesic_lerp(path_b, t, cum_b, total_b)
+    b12 = GeodesicMesh.geodesic_lerp(path_12, t, cum_12, total_12)
+    b23 = GeodesicMesh.geodesic_lerp(path_a_rev, t, cum_a, total_a)
+
+    try:
+        path_c0, fb_c0 = _solve(b01, b12)
+        if fb_c0:
+            degraded = True
+    except (RuntimeError, ValueError, TypeError, IndexError) as exc:
+        log_w.debug("solver(b01, b12) failed: %s", exc)
+        path_c0, degraded = np.array([b01, b12]), True
+    if path_c0 is None or len(path_c0) < 2:
+        path_c0, degraded = np.array([b01, b12]), True
+
+    try:
+        path_c1, fb_c1 = _solve(b12, b23)
+        if fb_c1:
+            degraded = True
+    except (RuntimeError, ValueError, TypeError, IndexError) as exc:
+        log_w.debug("solver(b12, b23) failed: %s", exc)
+        path_c1, degraded = np.array([b12, b23]), True
+    if path_c1 is None or len(path_c1) < 2:
+        path_c1, degraded = np.array([b12, b23]), True
+
+    cum_c0, total_c0 = GeodesicMesh.compute_path_lengths(path_c0)
+    cum_c1, total_c1 = GeodesicMesh.compute_path_lengths(path_c1)
+    c0 = GeodesicMesh.geodesic_lerp(path_c0, t, cum_c0, total_c0)
+    c1 = GeodesicMesh.geodesic_lerp(path_c1, t, cum_c1, total_c1)
+
+    try:
+        path_final, fb_f = _solve(c0, c1)
+        if fb_f:
+            degraded = True
+    except (RuntimeError, ValueError, TypeError, IndexError) as exc:
+        log_w.debug("solver(c0, c1) failed: %s", exc)
+        path_final, degraded = np.array([c0, c1]), True
+    if path_final is None or len(path_final) < 2:
+        path_final, degraded = np.array([c0, c1]), True
+
+    cum_f, total_f = GeodesicMesh.compute_path_lengths(path_final)
+    return GeodesicMesh.geodesic_lerp(path_final, t, cum_f, total_f), degraded
 

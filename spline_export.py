@@ -131,7 +131,7 @@ import sys
 from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
-from geodesics import GeodesicMesh
+from geodesics import GeodesicMesh, eval_cascade_at_t
 
 
 NAN_LINE = "NaN , NaN , NaN"
@@ -506,45 +506,15 @@ def _orange_span_worker(task_data):
     span_pts[0]  = np.asarray(P0, dtype=float)
     span_pts[-1] = np.asarray(P1, dtype=float)
 
-    # Inner indices only — endpoints are already seeded.
+    # Inner indices only — endpoints are already seeded.  Delegates to the
+    # shared cascade (``geodesics.eval_cascade_at_t``) — the exact routine
+    # the editor's orange worker runs — for bit-for-bit parity.
     for idx in range(1, n - 1):
         t = float(t_grid[idx])
-
-        b01 = GeodesicMesh.geodesic_lerp(path_b, t, cum_b, total_b)
-        b12 = GeodesicMesh.geodesic_lerp(path_12, t, cum_12, total_12)
-        b23 = GeodesicMesh.geodesic_lerp(path_a_rev, t, cum_a, total_a)
-
-        try:
-            path_c0, _ = geo.compute_endpoint_local(b01, b12)
-        except (RuntimeError, ValueError) as exc:
-            log.debug("compute_endpoint_local(b01, b12) failed: %s", exc)
-            path_c0 = np.array([b01, b12])
-        if path_c0 is None or len(path_c0) < 2:
-            path_c0 = np.array([b01, b12])
-
-        try:
-            path_c1, _ = geo.compute_endpoint_local(b12, b23)
-        except (RuntimeError, ValueError) as exc:
-            log.debug("compute_endpoint_local(b12, b23) failed: %s", exc)
-            path_c1 = np.array([b12, b23])
-        if path_c1 is None or len(path_c1) < 2:
-            path_c1 = np.array([b12, b23])
-
-        cum_c0, total_c0 = GeodesicMesh.compute_path_lengths(path_c0)
-        cum_c1, total_c1 = GeodesicMesh.compute_path_lengths(path_c1)
-        c0 = GeodesicMesh.geodesic_lerp(path_c0, t, cum_c0, total_c0)
-        c1 = GeodesicMesh.geodesic_lerp(path_c1, t, cum_c1, total_c1)
-
-        try:
-            path_f, _ = geo.compute_endpoint_local(c0, c1)
-        except (RuntimeError, ValueError) as exc:
-            log.debug("compute_endpoint_local(c0, c1) failed: %s", exc)
-            path_f = np.array([c0, c1])
-        if path_f is None or len(path_f) < 2:
-            path_f = np.array([c0, c1])
-
-        cum_f, total_f = GeodesicMesh.compute_path_lengths(path_f)
-        span_pts[idx] = GeodesicMesh.geodesic_lerp(path_f, t, cum_f, total_f)
+        span_pts[idx], _ = eval_cascade_at_t(
+            geo, t, path_b, cum_b, total_b,
+            path_a_rev, cum_a, total_a,
+            path_12, cum_12, total_12)
 
     return np.array(span_pts)
 

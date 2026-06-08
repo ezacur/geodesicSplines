@@ -310,6 +310,14 @@ def safe_remove_actor(plotter: pv.Plotter, actor) -> None:
         pass
 
 
+def set_depth_priority(actor, offset: float = -6.0) -> None:
+    """Shifts an actor closer to the camera in z-buffer so it draws on top of surfaces."""
+    mapper = actor.GetMapper()
+    mapper.SetResolveCoincidentTopologyToPolygonOffset()
+    mapper.SetRelativeCoincidentTopologyLineOffsetParameters(0, offset)
+    mapper.SetRelativeCoincidentTopologyPointOffsetParameter(offset)
+
+
 class SegmentData:
     """Pure geometric state and computation for a geodesic segment.
 
@@ -732,14 +740,6 @@ class GeodesicSegment(SegmentData):
         # when direction and scale haven't changed
         self._arrow_cache: dict[str, tuple[np.ndarray, float, bool]] = {}
 
-    @staticmethod
-    def _apply_depth_priority(actor, offset: float = -6.0) -> None:
-        """Shifts an actor closer to camera in z-buffer so it draws on top."""
-        mapper = actor.GetMapper()
-        mapper.SetResolveCoincidentTopologyToPolygonOffset()
-        mapper.SetRelativeCoincidentTopologyLineOffsetParameters(0, offset)
-        mapper.SetRelativeCoincidentTopologyPointOffsetParameter(offset)
-
     def clear_actors(self, plotter: pv.Plotter) -> None:
         """Removes all internal actors from the VTK scene.
 
@@ -882,7 +882,7 @@ class GeodesicSegment(SegmentData):
             prop.SetColor(_color_rgb(actual_col))
             prop.SetOpacity(opacity)
             act.SetVisibility(True)
-        self._apply_depth_priority(act, depth)
+        set_depth_priority(act, depth)
 
     def _update_handle(self, plotter, tag: str, pt, color):
         """Unified sync for control markers, keyed by handle tag ('p', 'a', 'b').
@@ -941,7 +941,7 @@ class GeodesicSegment(SegmentData):
             prop.SetPointSize(sz)
             prop.SetOpacity(opacity)
             act.SetVisibility(True)
-        self._apply_depth_priority(act, depth)
+        set_depth_priority(act, depth)
 
     def update_visuals(self, plotter: pv.Plotter, line_width: int = 2) -> None:
         """Refreshes the visual representation with state-dependent styling.
@@ -1033,7 +1033,7 @@ class GeodesicSegment(SegmentData):
                 prop.SetColor(_color_rgb(line_color))
                 prop.SetOpacity(line_opacity)
                 prop.SetLineWidth(lw)
-            self._apply_depth_priority(self._act_line, line_depth)
+            set_depth_priority(self._act_line, line_depth)
             self._act_line.SetVisibility(True)
         elif self._act_line:
             self._act_line.SetVisibility(False)

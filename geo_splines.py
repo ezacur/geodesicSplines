@@ -100,7 +100,7 @@ import pyvista as pv
 import vtk
 
 from geo_shoot import MidpointShooterApp, _closest_seg_on_polyline_2d
-from geodesics import GeodesicMesh, HAS_NUMBA
+from geodesics import GeodesicMesh, HAS_NUMBA, eval_cascade_at_t
 
 
 # ---------------------------------------------------------------
@@ -583,17 +583,18 @@ class SplineConfig:
     #       ``ORANGE_SUBDIV_MAX_DEPTH``.  The deviation criterion is
     #       selected by ``ORANGE_DEVIATION_MODE``:
     #         'cascade' → measure |chord_mid − cascade(t_mid)|.  Honest
-    #             metric (deviation from the true curve).  Default.
+    #             metric (deviation from the true curve).
     #         'surface' → measure |chord_mid − project(chord_mid)|.
-    #             Cheaper (no extra cascade evaluation per chord) but
-    #             only catches mesh-piercing chords, not curve drift on
-    #             flat regions where the cascade still curls.
+    #             Default.  Cheaper (no extra cascade evaluation per
+    #             chord) but only catches mesh-piercing chords, not
+    #             curve drift on flat regions where the cascade still
+    #             curls.
     #   Phase 3 (geodesic chord-bridging): each consecutive sample pair
     #       in the densified polyline is connected by an exact mesh
     #       geodesic (``short_geodesic`` if the endpoints are in
     #       adjacent triangles — fast — else ``compute_endpoint_local``).
     #       Disabled by ``ORANGE_CHORD_BRIDGING = False``.
-    ORANGE_DEVIATION_MODE: str = 'surface'   # 'cascade' (default) | 'surface'
+    ORANGE_DEVIATION_MODE: str = 'surface'   # 'surface' (default) | 'cascade'
     ORANGE_SUBDIV_TOL_FACTOR: float = 0.01   # fraction of mean edge length
     ORANGE_SUBDIV_MAX_DEPTH: int = 6         # recursion cap for densification
     ORANGE_CHORD_BRIDGING: bool = True       # phase-3 short-geodesic polyline
@@ -772,99 +773,6 @@ def _hierarchical_inner_order(total: int) -> list[int]:
     return order
 
 
-def _eval_cascade_at_t(
-    geo, t: float,
-    path_b: np.ndarray, cum_b: np.ndarray, total_b: float,
-    path_a_rev: np.ndarray, cum_a: np.ndarray, total_a: float,
-    path_12: np.ndarray, cum_12: np.ndarray, total_12: float,
-    submesh_subdiv: int = 0,
-    use_full_mesh: bool = False,
-) -> tuple[np.ndarray, bool]:
-    """Evaluate one full de Casteljau cascade level at parameter *t*.
-
-    Used by the orange worker for both phase-1 (canonical t-grid samples)
-    and phase-2 (densification at midpoint t-values).  Returns
-    ``(point, degraded)`` where ``degraded`` is True if any of the three
-    inner solver calls fell back to a straight-line polyline (component
-    break, solver failure).
-
-    The cascade structure:
-      level 1  →  b01 = lerp(path_b, t)
-                  b12 = lerp(path_12, t)   (path_12 is shared / cached)
-                  b23 = lerp(path_a_rev, t)
-      level 2  →  path_c0 = geodesic(b01, b12)  → c0 = lerp(path_c0, t)
-                  path_c1 = geodesic(b12, b23)  → c1 = lerp(path_c1, t)
-      level 3  →  path_final = geodesic(c0, c1)  → result = lerp(path_final, t)
-
-    Solver dispatch:
-
-    * ``use_full_mesh=False`` (default) — uses ``compute_endpoint_local``
-      with the supplied *submesh_subdiv*.  Fast (~25-100 ms per call)
-      but the submesh extraction can return topologically different
-      paths for slightly-perturbed inputs at certain ``t``, producing
-      visible jumps in the rendered curve.
-    * ``use_full_mesh=True`` — uses ``compute_endpoint`` instead.
-      ~3-5× slower because the solver is built on the augmented full
-      mesh, but the answer is stable: equal inputs → equal outputs,
-      modulo only floating-point noise.  Eliminates submesh-extraction
-      artifacts.  Genuine cascade-topology jumps (where ``c0`` and
-      ``c1`` themselves cross a saddle vertex as ``t`` advances)
-      persist — no solver swap can fix those.
-    """
-    log_w = logging.getLogger("geo_splines.worker")
-    degraded = False
-
-    if use_full_mesh:
-        def _solve(p_a, p_b):
-            return geo.compute_endpoint(p_a, p_b)
-    else:
-        def _solve(p_a, p_b):
-            return geo.compute_endpoint_local(
-                p_a, p_b, submesh_subdiv=submesh_subdiv)
-
-    b01 = GeodesicMesh.geodesic_lerp(path_b, t, cum_b, total_b)
-    b12 = GeodesicMesh.geodesic_lerp(path_12, t, cum_12, total_12)
-    b23 = GeodesicMesh.geodesic_lerp(path_a_rev, t, cum_a, total_a)
-
-    try:
-        path_c0, fb_c0 = _solve(b01, b12)
-        if fb_c0:
-            degraded = True
-    except (RuntimeError, ValueError, TypeError, IndexError) as exc:
-        log_w.debug("solver(b01, b12) failed: %s", exc)
-        path_c0, degraded = np.array([b01, b12]), True
-    if path_c0 is None or len(path_c0) < 2:
-        path_c0, degraded = np.array([b01, b12]), True
-
-    try:
-        path_c1, fb_c1 = _solve(b12, b23)
-        if fb_c1:
-            degraded = True
-    except (RuntimeError, ValueError, TypeError, IndexError) as exc:
-        log_w.debug("solver(b12, b23) failed: %s", exc)
-        path_c1, degraded = np.array([b12, b23]), True
-    if path_c1 is None or len(path_c1) < 2:
-        path_c1, degraded = np.array([b12, b23]), True
-
-    cum_c0, total_c0 = GeodesicMesh.compute_path_lengths(path_c0)
-    cum_c1, total_c1 = GeodesicMesh.compute_path_lengths(path_c1)
-    c0 = GeodesicMesh.geodesic_lerp(path_c0, t, cum_c0, total_c0)
-    c1 = GeodesicMesh.geodesic_lerp(path_c1, t, cum_c1, total_c1)
-
-    try:
-        path_final, fb_f = _solve(c0, c1)
-        if fb_f:
-            degraded = True
-    except (RuntimeError, ValueError, TypeError, IndexError) as exc:
-        log_w.debug("solver(c0, c1) failed: %s", exc)
-        path_final, degraded = np.array([c0, c1]), True
-    if path_final is None or len(path_final) < 2:
-        path_final, degraded = np.array([c0, c1]), True
-
-    cum_f, total_f = GeodesicMesh.compute_path_lengths(path_final)
-    return GeodesicMesh.geodesic_lerp(path_final, t, cum_f, total_f), degraded
-
-
 def _build_chord_geodesic(
     geo, p_left: np.ndarray, p_right: np.ndarray,
     submesh_subdiv: int = 0,
@@ -1031,7 +939,7 @@ def _geodesic_decasteljau_worker(
 
         for idx in inner_order:
             t = float(t_grid[idx])
-            point, deg = _eval_cascade_at_t(
+            point, deg = eval_cascade_at_t(
                 geo, t, *eval_args,
                 submesh_subdiv=submesh_subdiv,
                 use_full_mesh=use_full_mesh)
@@ -1076,7 +984,7 @@ def _geodesic_decasteljau_worker(
                     if not needs_split[i]:
                         continue
                     t_mid = (t_list[i] + t_list[i + 1]) * 0.5
-                    pt, deg = _eval_cascade_at_t(
+                    pt, deg = eval_cascade_at_t(
                         geo, t_mid, *eval_args,
                         submesh_subdiv=submesh_subdiv,
                         use_full_mesh=use_full_mesh)
@@ -1088,7 +996,7 @@ def _geodesic_decasteljau_worker(
                 any_split = False
                 for i in range(n_pairs):
                     t_mid = (t_list[i] + t_list[i + 1]) * 0.5
-                    pt, deg = _eval_cascade_at_t(
+                    pt, deg = eval_cascade_at_t(
                         geo, t_mid, *eval_args,
                         submesh_subdiv=submesh_subdiv,
                         use_full_mesh=use_full_mesh)
@@ -1991,7 +1899,7 @@ class GeodesicSplineApp(MidpointShooterApp):
             "?", position=(self._help_x + 5, 52),
             font_size=7, color='white', shadow=True, name="label_help")
 
-        # Full-mesh orange toggle: when on, ``_eval_cascade_at_t`` swaps
+        # Full-mesh orange toggle: when on, ``eval_cascade_at_t`` swaps
         # ``compute_endpoint_local`` for ``compute_endpoint`` in level-2
         # / level-3 calls, eliminating submesh-extraction artifacts at
         # ~3-5× per-evaluation cost.  Toggling does NOT trigger a
@@ -5896,16 +5804,6 @@ class GeodesicSplineApp(MidpointShooterApp):
         # Cancel any obsolete debounce from the legacy fast/exact
         # alternating implementation — defensive cleanup.
         self.state.pending_debounces.pop('didactic_t', None)
-
-    def _didactic_t_consolidate(self) -> None:
-        """No-op kept for backwards compatibility.
-
-        Was the debounced exact recompute fired ~100 ms after the
-        last slider tick.  No longer needed: ``_on_didactic_t_change``
-        now uses ``fast=False`` directly so the cache holds the
-        exact answer continuously and there is nothing to settle to.
-        """
-        return
 
     def _compute_didactic(self, fast: bool = False) -> None:
         """Build the 4 auxiliary geodesic lines for the resolved
