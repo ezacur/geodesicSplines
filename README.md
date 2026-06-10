@@ -1,5 +1,9 @@
 # Geodesic Spline Editor
 
+[![CI](https://github.com/ezacur/geodesicSplines/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ezacur/geodesicSplines/actions/workflows/ci.yml)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
+[![License: GPL v3](https://img.shields.io/badge/license-GPL%20v3-blue.svg)](LICENSE)
+
 Interactive multi-spline editor for 3D triangulated meshes. Combines exact
 discrete geodesic computation with cubic Bezier interpolation to produce
 smooth curves that lie precisely on the surface.
@@ -306,3 +310,7 @@ fandisk.obj            Bundled sample mesh (~6.6k faces).  The
                        the repo so the editor has an immediately
                        usable demo without external downloads.
 ```
+
+## License
+
+This project is licensed under the [GNU General Public License v3](LICENSE).
