@@ -81,6 +81,7 @@ import os
 # the var is read only by ``libifcoremd.dll``.
 os.environ.setdefault('FOR_DISABLE_CONSOLE_CTRL_HANDLER', '1')
 
+import bisect
 import signal
 import sys
 import tempfile
@@ -810,6 +811,154 @@ def _build_chord_geodesic(
     return seg
 
 
+def _phase1_canonical(
+    geo, span_key: SpanKey,
+    P0: np.ndarray, P1: np.ndarray,
+    t_grid: np.ndarray, inner_order: list[int],
+    eval_args: tuple, writer, *,
+    submesh_subdiv: int, use_full_mesh: bool,
+) -> tuple[list[float], list[np.ndarray], bool]:
+    """Phase 1 of the orange worker: canonical *t_grid* samples.
+
+    Evaluates the de Casteljau cascade at every inner index of *t_grid*
+    in *inner_order* (hierarchical: midpoint → quarters → eighths …),
+    sending each as ``('point', span_key, t, point)``.  Returns the
+    worker-side t-sorted polyline state ``(t_list, p_list)`` plus the
+    degraded flag.
+    """
+    # Worker-side sorted polyline state, mirrored on the parent.
+    # Endpoints are seeded so phase-2 chord pairs starting at idx 0
+    # and ending at idx N-1 are well-defined from the first iter.
+    t_list: list[float] = [float(t_grid[0]), float(t_grid[-1])]
+    p_list: list[np.ndarray] = [np.asarray(P0, dtype=float),
+                                np.asarray(P1, dtype=float)]
+    degraded = False
+
+    for idx in inner_order:
+        t = float(t_grid[idx])
+        point, deg = eval_cascade_at_t(
+            geo, t, *eval_args,
+            submesh_subdiv=submesh_subdiv,
+            use_full_mesh=use_full_mesh)
+        if deg:
+            degraded = True
+        # Insert in t-sorted order on the worker side too — phase 2
+        # walks consecutive pairs and needs them ordered.
+        pos = bisect.bisect_left(t_list, t)
+        t_list.insert(pos, t)
+        p_list.insert(pos, point)
+        writer.send(('point', span_key, t, point))
+
+    return t_list, p_list, degraded
+
+
+def _phase2_densify(
+    geo, span_key: SpanKey,
+    t_list: list[float], p_list: list[np.ndarray],
+    eval_args: tuple, writer, *,
+    deviation_mode: str, subdiv_tol_factor: float, subdiv_max_depth: int,
+    submesh_subdiv: int, use_full_mesh: bool,
+) -> bool:
+    """Phase 2 of the orange worker: cascade densification.
+
+    Walks consecutive sample pairs of the t-sorted state, decides which
+    to subdivide per *deviation_mode* (see the worker docstring), and
+    inserts fresh cascade evaluations at midpoint *t*-values — each sent
+    immediately as ``('point', span_key, t_mid, pt)`` and merged into
+    *t_list* / *p_list* in place.  Returns the degraded flag.
+    """
+    degraded = False
+    mean_edge = float(np.sqrt(geo._face_edge_len2.mean()))
+    tol_sq = (mean_edge * subdiv_tol_factor) ** 2
+
+    for _level in range(subdiv_max_depth):
+        n_pairs = len(t_list) - 1
+        if n_pairs <= 0:
+            break
+
+        # Build per-pair midpoints in 3D (chord midpoints) and
+        # decide which need a cascade insertion.
+        pts_arr = np.asarray(p_list)
+        mids = (pts_arr[:-1] + pts_arr[1:]) * 0.5
+
+        # Where to evaluate the cascade.  Done per-pair below; in
+        # 'cascade' mode every pair is evaluated; in 'surface' mode
+        # only the pairs flagged by the projection test.
+        inserts: list[tuple[float, np.ndarray]] = []
+
+        if deviation_mode == 'surface':
+            projected = geo.project_smooth_batch(mids)
+            diff = projected - mids
+            dev_sq = np.sum(diff * diff, axis=1)
+            needs_split = dev_sq > tol_sq
+            if not needs_split.any():
+                break
+            for i in range(n_pairs):
+                if not needs_split[i]:
+                    continue
+                t_mid = (t_list[i] + t_list[i + 1]) * 0.5
+                pt, deg = eval_cascade_at_t(
+                    geo, t_mid, *eval_args,
+                    submesh_subdiv=submesh_subdiv,
+                    use_full_mesh=use_full_mesh)
+                if deg:
+                    degraded = True
+                inserts.append((t_mid, pt))
+                writer.send(('point', span_key, t_mid, pt))
+        else:  # 'cascade' (default)
+            any_split = False
+            for i in range(n_pairs):
+                t_mid = (t_list[i] + t_list[i + 1]) * 0.5
+                pt, deg = eval_cascade_at_t(
+                    geo, t_mid, *eval_args,
+                    submesh_subdiv=submesh_subdiv,
+                    use_full_mesh=use_full_mesh)
+                if deg:
+                    degraded = True
+                diff = pt - mids[i]
+                if float(np.dot(diff, diff)) > tol_sq:
+                    inserts.append((t_mid, pt))
+                    writer.send(('point', span_key, t_mid, pt))
+                    any_split = True
+            if not any_split:
+                break
+
+        # Merge inserts into the sorted state — bisect each so the
+        # invariant is preserved without a full re-sort.
+        for t_mid, pt in inserts:
+            pos = bisect.bisect_left(t_list, t_mid)
+            t_list.insert(pos, t_mid)
+            p_list.insert(pos, pt)
+
+    return degraded
+
+
+def _phase3_chord_bridge(
+    geo, span_key: SpanKey,
+    p_list: list[np.ndarray], writer, *,
+    submesh_subdiv: int,
+) -> None:
+    """Phase 3 of the orange worker: geodesic chord bridging.
+
+    Connects every consecutive sample pair with an exact mesh geodesic
+    (:func:`_build_chord_geodesic`) and sends the concatenated polyline
+    once as ``('chord_geo', span_key, polyline)``.
+    """
+    polyline_segs: list[np.ndarray] = []
+    for i in range(len(p_list) - 1):
+        seg = _build_chord_geodesic(geo, p_list[i], p_list[i + 1],
+                                    submesh_subdiv=submesh_subdiv)
+        polyline_segs.append(seg)
+    # Concatenate, dropping the duplicated joint between
+    # consecutive segments so the polyline has no zero-length
+    # segments.
+    full = [polyline_segs[0]]
+    for seg in polyline_segs[1:]:
+        full.append(seg[1:])
+    polyline = np.concatenate(full, axis=0)
+    writer.send(('chord_geo', span_key, polyline))
+
+
 def _geodesic_decasteljau_worker(
     span_key: SpanKey,
     ctrl: list[np.ndarray],
@@ -835,7 +984,8 @@ def _geodesic_decasteljau_worker(
     Three-phase pipeline
     ====================
 
-    **Phase 1 — canonical samples.**  Evaluates the de Casteljau cascade
+    **Phase 1 — canonical samples** (:func:`_phase1_canonical`).
+    Evaluates the de Casteljau cascade
     at every position of *t_grid* (length ``n_samples``, default 33),
     visiting indices in *inner_order* (hierarchical refinement: midpoint
     → quarters → eighths …) so the parent can render the curve coarse-
@@ -843,7 +993,8 @@ def _geodesic_decasteljau_worker(
     The two endpoints (idx 0, idx N-1) are NOT computed by the worker —
     they coincide with node origins and are pre-seeded by the parent.
 
-    **Phase 2 — cascade densification.**  Walks all consecutive sample
+    **Phase 2 — cascade densification** (:func:`_phase2_densify`).
+    Walks all consecutive sample
     pairs, decides which to subdivide using *deviation_mode*, and
     inserts new cascade samples at the midpoint *t*-value.  Each
     insertion is sent immediately as ``('point', span_key, t_mid,
@@ -866,7 +1017,8 @@ def _geodesic_decasteljau_worker(
 
     Tolerance: ``tol = mean_edge_length * subdiv_tol_factor``.
 
-    **Phase 3 — chord bridging.**  Once all densification is complete,
+    **Phase 3 — chord bridging** (:func:`_phase3_chord_bridge`).
+    Once all densification is complete,
     every consecutive sample pair is connected by an exact mesh
     geodesic via :func:`_build_chord_geodesic` (``short_geodesic`` fast
     path, ``compute_endpoint_local`` fallback).  The polyline is sent
@@ -890,8 +1042,6 @@ def _geodesic_decasteljau_worker(
     surfaces in the editor's HUD / stderr instead of the parent's
     drain loop seeing a mysterious "pipe broken" warning.
     """
-    import bisect
-
     try:
         geo = _process_geo
         assert geo is not None, "_process_initializer must run before _geodesic_decasteljau_worker"
@@ -927,113 +1077,24 @@ def _geodesic_decasteljau_worker(
                      path_a_rev, cum_a, total_a,
                      path_12, cum_12, total_12)
 
-        # ------------------------------------------------------------
-        # Phase 1 — canonical N=GEO_SAMPLES grid
-        # ------------------------------------------------------------
-        # Worker-side sorted polyline state, mirrored on the parent.
-        # Endpoints are seeded so phase-2 chord pairs starting at idx 0
-        # and ending at idx N-1 are well-defined from the first iter.
-        t_list: list[float] = [float(t_grid[0]), float(t_grid[-1])]
-        p_list: list[np.ndarray] = [np.asarray(P0, dtype=float),
-                                    np.asarray(P1, dtype=float)]
+        # Phase 1 — canonical N=GEO_SAMPLES grid.
+        t_list, p_list, deg = _phase1_canonical(
+            geo, span_key, P0, P1, t_grid, inner_order, eval_args, writer,
+            submesh_subdiv=submesh_subdiv, use_full_mesh=use_full_mesh)
+        degraded_any |= deg
 
-        for idx in inner_order:
-            t = float(t_grid[idx])
-            point, deg = eval_cascade_at_t(
-                geo, t, *eval_args,
-                submesh_subdiv=submesh_subdiv,
-                use_full_mesh=use_full_mesh)
-            if deg:
-                degraded_any = True
-            # Insert in t-sorted order on the worker side too — phase 2
-            # walks consecutive pairs and needs them ordered.
-            pos = bisect.bisect_left(t_list, t)
-            t_list.insert(pos, t)
-            p_list.insert(pos, point)
-            writer.send(('point', span_key, t, point))
+        # Phase 2 — cascade densification (mutates t_list / p_list).
+        degraded_any |= _phase2_densify(
+            geo, span_key, t_list, p_list, eval_args, writer,
+            deviation_mode=deviation_mode,
+            subdiv_tol_factor=subdiv_tol_factor,
+            subdiv_max_depth=subdiv_max_depth,
+            submesh_subdiv=submesh_subdiv, use_full_mesh=use_full_mesh)
 
-        # ------------------------------------------------------------
-        # Phase 2 — cascade densification
-        # ------------------------------------------------------------
-        mean_edge = float(np.sqrt(geo._face_edge_len2.mean()))
-        tol_sq = (mean_edge * subdiv_tol_factor) ** 2
-
-        for _level in range(subdiv_max_depth):
-            n_pairs = len(t_list) - 1
-            if n_pairs <= 0:
-                break
-
-            # Build per-pair midpoints in 3D (chord midpoints) and
-            # decide which need a cascade insertion.
-            pts_arr = np.asarray(p_list)
-            mids = (pts_arr[:-1] + pts_arr[1:]) * 0.5
-
-            # Where to evaluate the cascade.  Done per-pair below; in
-            # 'cascade' mode every pair is evaluated; in 'surface' mode
-            # only the pairs flagged by the projection test.
-            inserts: list[tuple[float, np.ndarray]] = []
-
-            if deviation_mode == 'surface':
-                projected = geo.project_smooth_batch(mids)
-                diff = projected - mids
-                dev_sq = np.sum(diff * diff, axis=1)
-                needs_split = dev_sq > tol_sq
-                if not needs_split.any():
-                    break
-                for i in range(n_pairs):
-                    if not needs_split[i]:
-                        continue
-                    t_mid = (t_list[i] + t_list[i + 1]) * 0.5
-                    pt, deg = eval_cascade_at_t(
-                        geo, t_mid, *eval_args,
-                        submesh_subdiv=submesh_subdiv,
-                        use_full_mesh=use_full_mesh)
-                    if deg:
-                        degraded_any = True
-                    inserts.append((t_mid, pt))
-                    writer.send(('point', span_key, t_mid, pt))
-            else:  # 'cascade' (default)
-                any_split = False
-                for i in range(n_pairs):
-                    t_mid = (t_list[i] + t_list[i + 1]) * 0.5
-                    pt, deg = eval_cascade_at_t(
-                        geo, t_mid, *eval_args,
-                        submesh_subdiv=submesh_subdiv,
-                        use_full_mesh=use_full_mesh)
-                    if deg:
-                        degraded_any = True
-                    diff = pt - mids[i]
-                    if float(np.dot(diff, diff)) > tol_sq:
-                        inserts.append((t_mid, pt))
-                        writer.send(('point', span_key, t_mid, pt))
-                        any_split = True
-                if not any_split:
-                    break
-
-            # Merge inserts into the sorted state — bisect each so the
-            # invariant is preserved without a full re-sort.
-            for t_mid, pt in inserts:
-                pos = bisect.bisect_left(t_list, t_mid)
-                t_list.insert(pos, t_mid)
-                p_list.insert(pos, pt)
-
-        # ------------------------------------------------------------
-        # Phase 3 — chord bridging via short / full geodesics
-        # ------------------------------------------------------------
+        # Phase 3 — chord bridging via short / full geodesics.
         if chord_bridging and len(p_list) >= 2:
-            polyline_segs: list[np.ndarray] = []
-            for i in range(len(p_list) - 1):
-                seg = _build_chord_geodesic(geo, p_list[i], p_list[i + 1],
-                                            submesh_subdiv=submesh_subdiv)
-                polyline_segs.append(seg)
-            # Concatenate, dropping the duplicated joint between
-            # consecutive segments so the polyline has no zero-length
-            # segments.
-            full = [polyline_segs[0]]
-            for seg in polyline_segs[1:]:
-                full.append(seg[1:])
-            polyline = np.concatenate(full, axis=0)
-            writer.send(('chord_geo', span_key, polyline))
+            _phase3_chord_bridge(geo, span_key, p_list, writer,
+                                 submesh_subdiv=submesh_subdiv)
 
         writer.send(('done', span_key, degraded_any))
     except (BrokenPipeError, OSError):
