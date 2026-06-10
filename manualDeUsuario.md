@@ -3,8 +3,9 @@
 Este manual es la referencia práctica del editor interactivo.  Recorre
 todas las funcionalidades que puedes manejar desde el ratón, el teclado
 y la línea de comandos.  Si buscas algoritmos, notas de rendimiento o
-cómo está organizado el código, consulta [`README.md`](README.md) —
-ese documento está orientado a desarrolladores.
+cómo está organizado el código, consulta
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — ese documento está
+orientado a desarrolladores.
 
 ---
 
@@ -731,9 +732,10 @@ inicio de `geo_splines.py` por si quieres ajustarlas.
 ## 17. A dónde ir después
 
 - **Desarrolladores** que quieran extender el editor o entender los
-  algoritmos: `README.md` — cubre kernels JIT, el debounce de
-  master-clock, el pipeline de workers, schema del JSON en
-  profundidad, etc.
+  algoritmos: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — cubre
+  kernels JIT, el debounce de master-clock, el pipeline de workers,
+  etc.  El schema del JSON está documentado en el
+  [`README.md`](README.md).
 - **Exportación batch desde CLI**: ver §14 más arriba y
   `spline_export.py --help`.
 - **Reportes de bugs / peticiones de feature**: abre un issue con un

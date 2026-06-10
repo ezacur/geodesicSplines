@@ -153,6 +153,9 @@ memory and enable a non-linear history tree.
 - Snapshots are already tiny.  Each node persists `(origin: 3 floats,
   tangent: 3 floats)`.  At the configured 50-level cap × 100 nodes
   that is ~30 KB total.  Memory is not a problem.
+  *(Update 2026-06-10: snapshots now use the v2 schema — `origin` +
+  `p_a` + `p_b`, ~96 bytes/node, i.e. ~2× the figure above.  Still
+  far below anything that matters; the rejection stands unchanged.)*
 - The diff-restore in
   [`_can_use_diff_restore`](../geo_splines.py#L1571) +
   [`_restore_snapshot`](../geo_splines.py#L1590) already avoids

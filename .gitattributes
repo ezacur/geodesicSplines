@@ -26,3 +26,4 @@
 *.ply    binary
 *.stl    binary
 *.vtk    binary
+*.gif binary

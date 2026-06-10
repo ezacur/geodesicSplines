@@ -14,10 +14,11 @@ sits on top of ``MidpointShooterApp`` (geo_shoot.py) and adds:
   - Imported guide polylines (Ctrl+X to load, X to toggle).
   - Hold-to-show node-index labels (key 'n').
 
-For the user-facing description (interaction model, three curve layers,
-geodesic algorithms, performance notes, save/load format, dependencies)
-see README.md — that is the canonical reference and this module avoids
-duplicating it to prevent rot.
+For the user-facing description (interaction model, curve layers,
+save/load format, dependencies) see README.md and userManual.md; for
+the internals (geodesic algorithms, worker pipeline, performance notes)
+see docs/ARCHITECTURE.md.  Those are the canonical references and this
+module avoids duplicating them to prevent rot.
 
 CLI usage
 ---------

@@ -50,8 +50,8 @@ kernels for screen-space and rendering work — ``_to_screen_kernel``,
 ``_hover_argmin_sq``, ``_closest_seg_on_polyline_2d`` (in
 ``geo_shoot.py``) and ``_rotation_x_to_jit`` (in ``gizmo.py``).  They
 follow the same scalar-inlined conventions as the ones below.  The
-README's "Numba JIT Kernels" table lists all eight with measured
-speedups.
+"Numba JIT Kernels" table in ``docs/ARCHITECTURE.md`` lists all eight
+with measured speedups.
 
 All four kernels follow the same conventions — the scalar-inlined style
 that was originally motivated by Python interpreter overhead remains

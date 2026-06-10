@@ -3,8 +3,9 @@
 This manual is the practical reference for the interactive editor.  It
 walks through every feature you can drive from the mouse, the keyboard,
 and the command line.  If you are looking for algorithms, performance
-notes, or how the codebase is organised, see [`README.md`](README.md)
-instead — that document targets developers.
+notes, or how the codebase is organised, see
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) instead — that document
+targets developers.
 
 ---
 
@@ -695,8 +696,9 @@ telescopic-sight radius; line widths are
 ## 17. Where to go next
 
 - **Developers** wanting to extend the editor or understand
-  algorithms: `README.md` — covers JIT kernels, the master-clock
-  debounce, worker pipeline, JSON schema in depth, etc.
+  algorithms: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — covers
+  JIT kernels, the master-clock debounce, worker pipeline, etc.
+  The JSON schema is documented in the [`README.md`](README.md).
 - **CLI batch export**: see §14 above and `spline_export.py --help`.
 - **Bug reports / feature requests**: file an issue with a minimal
   session JSON + the mesh, plus the HUD message at the moment things
