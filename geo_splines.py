@@ -99,10 +99,16 @@ from typing import Any
 import numpy as np
 import pyvista as pv
 import vtk
+from scipy.interpolate import splev, splprep
 
 from geo_shoot import MidpointShooterApp, _closest_seg_on_polyline_2d
-from geodesics import GeodesicMesh, HAS_NUMBA, eval_cascade_at_t
-
+from geodesics import HAS_NUMBA, GeodesicMesh, eval_cascade_at_t
+from gizmo import (
+    GeodesicSegment,
+    safe_remove_actor,
+    update_dashed_line_inplace,
+    update_line_inplace,
+)
 
 # ---------------------------------------------------------------
 # Type aliases
@@ -115,13 +121,6 @@ from geodesics import GeodesicMesh, HAS_NUMBA, eval_cascade_at_t
 # documents the intent — "tuple" alone could mean RGB, screen coords,
 # or anything else.
 SpanKey = tuple[int, int]
-from scipy.interpolate import splprep, splev
-from gizmo import (
-    GeodesicSegment,
-    update_line_inplace,
-    update_dashed_line_inplace,
-    safe_remove_actor,
-)
 
 
 # ---------------------------------------------------------------
@@ -1774,7 +1773,7 @@ class _SpanWorkManager:
     # manager in ``with _SpanWorkManager(...) as wm:`` and be sure the
     # process pool + shared memory are released on exit, including on
     # KeyboardInterrupt / unhandled exception.
-    def __enter__(self) -> "_SpanWorkManager":
+    def __enter__(self) -> _SpanWorkManager:
         return self
 
     def __exit__(self, exc_type, exc_value, tb) -> None:
@@ -1870,7 +1869,7 @@ class GeodesicSplineApp(MidpointShooterApp):
         # would silently return the OLD spline index for the new
         # object.  Weak refs let the entry vanish automatically the
         # moment the segment is freed.
-        self._node_to_spline: 'weakref.WeakKeyDictionary[GeodesicSegment, int]' = (
+        self._node_to_spline: weakref.WeakKeyDictionary[GeodesicSegment, int] = (
             weakref.WeakKeyDictionary())
         self._pre_drag_spline_idx: int | None = None
         self._last_cam_pos: tuple = (0.0, 0.0, 0.0)  # for arrow scale refresh
@@ -1941,7 +1940,7 @@ class GeodesicSplineApp(MidpointShooterApp):
             x_pos = 11 + i * 22
             self._cb_x_positions.append(x_pos)
             widget = self.plotter.add_checkbox_button_widget(
-                lambda v, l=layer: self._toggle_layer(l, v),
+                lambda v, lyr=layer: self._toggle_layer(lyr, v),
                 value=defaults[layer],
                 position=(x_pos, 50), size=self._cb_size, border_size=2,
                 color_on=color, color_off='grey')
@@ -2804,7 +2803,7 @@ class GeodesicSplineApp(MidpointShooterApp):
         # Checkboxes: 20 px above slider
         cb_y = slider_y_px + 20
 
-        for i, (layer, widget) in enumerate(self._layer_widgets.items()):
+        for i, (_layer, widget) in enumerate(self._layer_widgets.items()):
             x = self._cb_x_positions[i]
             widget.GetRepresentation().PlaceWidget(
                 [float(x), float(x + sz), float(cb_y), float(cb_y + sz), 0.0, 0.0])
@@ -4892,7 +4891,7 @@ class GeodesicSplineApp(MidpointShooterApp):
         return result
 
     def _iter_affected_spans(self, sid: int,
-                             node: 'GeodesicSegment | None'):
+                             node: GeodesicSegment | None):
         """Yield ``(i, n0, n1)`` for every span whose endpoints depend
         on *node* (or every span when *node* is None).
 
@@ -6034,7 +6033,7 @@ class GeodesicSplineApp(MidpointShooterApp):
         path_final = _pair_path(c0, c1)
 
         for pd, path in zip(self._didactic_pds,
-                            (path_12, path_c0, path_c1, path_final)):
+                            (path_12, path_c0, path_c1, path_final), strict=False):
             update_line_inplace(pd, path)
 
         # Evaluate the cascade's collapse point — geodesic_lerp on
@@ -6474,7 +6473,7 @@ class GeodesicSplineApp(MidpointShooterApp):
 
             lines: list[str] = []
             n = len(keys)
-            for i, (k, kr) in enumerate(zip(keys, key_reprs)):
+            for i, (k, kr) in enumerate(zip(keys, key_reprs, strict=False)):
                 val = node[k]
                 if val is None:
                     rendered = 'null'
@@ -6634,7 +6633,7 @@ class GeodesicSplineApp(MidpointShooterApp):
         """
         # spline_export imports lazily — keeps geo_splines start-up
         # path clean for users who never press 'v'.
-        from spline_export import compute_orange, write_vtk
+        from spline_export import write_vtk
 
         fname = self._next_session_filename('.vtk')
         n_splines = len(self.splines)
@@ -6809,7 +6808,7 @@ class GeodesicSplineApp(MidpointShooterApp):
             return
 
         try:
-            with open(fpath, 'r', encoding='utf-8') as f:
+            with open(fpath, encoding='utf-8') as f:
                 data = json.load(f)
         except json.JSONDecodeError as exc:
             log.error("invalid JSON in %s: line %d col %d: %s",
@@ -7206,7 +7205,7 @@ def _resolve_mesh(arg: str | None,
             log.error("JSON file not found: %s", arg)
             sys.exit(1)
         try:
-            with open(arg, 'r', encoding='utf-8') as f:
+            with open(arg, encoding='utf-8') as f:
                 data = json.load(f)
         except json.JSONDecodeError as exc:
             log.error("invalid JSON in %s: line %d col %d: %s%s",
@@ -7327,7 +7326,7 @@ def _cli_main() -> None:
 
         if json_path is not None:
             try:
-                with open(json_path, 'r', encoding='utf-8') as f:
+                with open(json_path, encoding='utf-8') as f:
                     data = json.load(f)
             except json.JSONDecodeError as exc:
                 log.error("invalid JSON in %s: line %d col %d: %s%s",

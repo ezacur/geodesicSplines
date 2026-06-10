@@ -252,10 +252,9 @@ from typing import TypedDict
 
 import numpy as np
 import numpy.typing as npt
+import potpourri3d as pp3d
 import vtk
 from scipy.spatial import KDTree
-import potpourri3d as pp3d
-
 
 # Module-level logger for solver diagnostics.  Stays at WARNING by
 # default so a normal session is silent; set the parent logger to
@@ -3493,7 +3492,10 @@ class GeodesicMesh:
                 # into the same component.
                 parent: dict[int, int] = {int(fi): int(fi) for fi in faces_v}
 
-                def _find(x: int) -> int:
+                # ``parent`` is bound as a default arg: the closure is
+                # rebuilt (and used) within this loop iteration only, but
+                # the explicit bind silences B023 and makes that obvious.
+                def _find(x: int, parent: dict[int, int] = parent) -> int:
                     while parent[x] != x:
                         parent[x] = parent[parent[x]]
                         x = parent[x]
@@ -4018,7 +4020,7 @@ class GeodesicMesh:
         if n < 3:
             return np.linspace(0.0, 1.0, max(n, 1))
 
-        P0, H_out, H_in, P1 = [np.asarray(p, dtype=float) for p in ctrl]
+        P0, H_out, H_in, P1 = (np.asarray(p, dtype=float) for p in ctrl)
 
         # Compute turning angles at H_out and H_in
         d01 = H_out - P0
@@ -4168,7 +4170,7 @@ class GeodesicMesh:
         ``project_smooth_batch`` call per level instead of per sample,
         reducing Python↔VTK overhead from 4N calls to 4 batch calls.
         """
-        P0, H_out, H_in, P1 = [np.asarray(p, dtype=float) for p in ctrl]
+        P0, H_out, H_in, P1 = (np.asarray(p, dtype=float) for p in ctrl)
         path_in_rev = path_in[::-1] if path_in is not None and len(path_in) > 1 else None
         do_proj = not fast
 

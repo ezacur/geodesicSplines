@@ -221,10 +221,12 @@ import vtk
 
 from geodesics import GeodesicMesh
 from gizmo import (
-    GeodesicSegment, WARN_SHOOT, _color_rgb, safe_remove_actor,
+    WARN_SHOOT,
+    GeodesicSegment,
+    _color_rgb,
+    safe_remove_actor,
     set_depth_priority,
 )
-
 
 # Module-level logger.  No handler is attached here; geo_splines
 # configures the root for the editor session.  Keep WARNING by default
@@ -329,13 +331,13 @@ class UIConfig:
     # Colors
     COLOR_CURSOR: str = 'darkgoldenrod'
     COLOR_CROSSHAIR: str = 'darkslategrey'
-    
+
     # Appearance
     CURSOR_OPACITY: float = 0.8
     CROSSHAIR_OPACITY: float = 0.5
     CURSOR_LINE_WIDTH: float = 1.5
     CROSSHAIR_LINE_WIDTH: float = 1.0
-    
+
     # Interaction
     PICK_TOLERANCE: int = 15
     CURSOR_SCALE: float = 0.012            # Relative to camera dist
@@ -765,13 +767,13 @@ class MidpointShooterApp:
         self.plotter = pv.Plotter(title="Midpoint Geodesic Shooter")
         self.plotter.remove_all_lights()
         self.plotter.add_light(pv.Light(light_type='headlight', intensity=1.0))
-        
+
         # Main Surface
         self.mesh_actor = self.plotter.add_mesh(
-            self.mesh, color='white', opacity=1.0, 
+            self.mesh, color='white', opacity=1.0,
             interpolation='gouraud', pickable=True
         )
-        
+
         # Boundary edges
         self._edge_mesh = self.mesh.extract_feature_edges(
             boundary_edges=True, non_manifold_edges=True,
@@ -1264,7 +1266,7 @@ class MidpointShooterApp:
     def _closest_marker_under_cursor(
             self, x: int, y: int,
             allowed_tags: tuple[str, ...] | None = None,
-    ) -> tuple['GeodesicSegment', str] | None:
+    ) -> tuple[GeodesicSegment, str] | None:
         """Pure hit-test against the hover cache — returns ``(seg, tag)``
         for the nearest marker under ``(x, y)`` that is within
         ``PICK_TOLERANCE_SQ`` and not occluded by the mesh; ``None``

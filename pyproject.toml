@@ -43,7 +43,20 @@ extend-exclude = ["build", "dist", ".venv", "tests/_data"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B"]
-ignore = ["E501"]
+ignore = [
+    "E501",  # long lines: docstrings/comments routinely exceed 100 cols
+    # The scalar JIT kernels lay out one vector operation per line with
+    # the x/y/z components separated by semicolons
+    # (``p1x = ...;  p1y = ...;  p1z = ...`` — see _parallel_transport).
+    # That SIMD-style grouping is deliberate and more legible than
+    # tripling the line count; E701/E702 would force the expansion.
+    "E701",
+    "E702",
+    # ``isinstance(x, (A, B))`` is faster than the PEP 604 union form
+    # (no ``__instancecheck__`` on a types.UnionType) and UP038 was
+    # later deprecated upstream for exactly that reason.
+    "UP038",
+]
 
 [tool.mypy]
 python_version = "3.10"

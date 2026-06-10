@@ -75,8 +75,12 @@ Performance conventions
 
 from __future__ import annotations
 
-from math import sqrt as _math_sqrt, acos as _math_acos, sin as _math_sin, cos as _math_cos
+from math import acos as _math_acos
+from math import cos as _math_cos
+from math import sin as _math_sin
+from math import sqrt as _math_sqrt
 from typing import TYPE_CHECKING
+
 import numpy as np
 import pyvista as pv
 
@@ -373,7 +377,7 @@ class SegmentData:
         v_b = self.path_b[1] - self.path_b[0]
         vn = np.linalg.norm(v_b)
         if vn < 1e-12: return
-        
+
         v_b /= vn
         self.local_v[0] = np.dot(v_b, self.u)
         self.local_v[1] = np.dot(v_b, self.v)

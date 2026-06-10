@@ -20,9 +20,11 @@ jobs:
         # identical across contributor / pre-commit / CI.
         run: pip install 'ruff~=0.7.0'
       - name: Ruff lint
+        # No ``ruff format --check`` step: the codebase deliberately
+        # hand-aligns HUD-string dicts and groups JIT-kernel scalar
+        # math with semicolons — the formatter would flatten both.
+        # Style is enforced through lint rules only (pyproject.toml).
         run: ruff check .
-      - name: Ruff format check
-        run: ruff format --check .
 
   test:
     runs-on: ubuntu-latest

@@ -412,7 +412,7 @@ def run_session(session_path, samples, locator):
     geo, splines, closed = spline_export.rebuild_mesh_and_nodes(data)
 
     tasks = []
-    for nodes, is_closed in zip(splines, closed):
+    for nodes, is_closed in zip(splines, closed, strict=False):
         if len(nodes) >= 2:
             tasks.extend(build_tasks(nodes, samples, closed=is_closed))
 
@@ -480,7 +480,7 @@ def test_orange_cascade_benchmark():
     run2 = [spline_export._orange_span_worker(t) for t in tasks]
 
     assert len(run1) == n_spans
-    for a, b in zip(run1, run2):
+    for a, b in zip(run1, run2, strict=False):
         assert a.shape == b.shape
         assert np.isfinite(a).all(), "cascade produced non-finite samples"
         # The cascade must be deterministic run-to-run.
@@ -560,7 +560,7 @@ def main():
         base = [data[k] for k in data.files]
         max_diff = 0.0
         worst = -1
-        for i, (a, b) in enumerate(zip(base, results)):
+        for i, (a, b) in enumerate(zip(base, results, strict=False)):
             if a.shape != b.shape:
                 print(f"  span {i}: SHAPE MISMATCH {a.shape} vs {b.shape}")
                 max_diff = float("inf")

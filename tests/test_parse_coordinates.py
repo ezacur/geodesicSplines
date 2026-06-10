@@ -12,8 +12,6 @@ import ast
 import math
 from pathlib import Path
 
-import pytest
-
 
 def _load_parser():
     """Extract the static method body without importing the heavy module."""

@@ -131,8 +131,8 @@ import sys
 from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
-from geodesics import GeodesicMesh, eval_cascade_at_t
 
+from geodesics import GeodesicMesh, eval_cascade_at_t
 
 NAN_LINE = "NaN , NaN , NaN"
 
@@ -163,7 +163,7 @@ def load_json(path: str) -> dict:
     silently mis-export here.  Cross-tool consistency guarantee.
     """
     try:
-        with open(path, 'r', encoding='utf-8') as f:
+        with open(path, encoding='utf-8') as f:
             data = json.load(f)
     except FileNotFoundError:
         log.error("session file not found: %s", path)
@@ -232,6 +232,7 @@ def _read_mesh_VF(mesh_file: str) -> tuple[np.ndarray, np.ndarray]:
     helper deals only with on-disk meshes.
     """
     import warnings
+
     import pyvista as pv
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore")
@@ -412,7 +413,7 @@ def compute_blue(geo, nodes, closed, n_samples) -> list[np.ndarray]:
 # 10-20 MB serialised per span, hammered through the IPC pipe
 # n_spans times.  The initializer pattern picks (V, F) up exactly
 # once per worker process.
-_worker_geo: 'GeodesicMesh | None' = None
+_worker_geo: GeodesicMesh | None = None
 
 
 def _orange_worker_init(v: np.ndarray, f: np.ndarray) -> None:
@@ -596,7 +597,7 @@ def compute_orange(geo, nodes, closed, n_samples,
     # samples land on opposite sides of a ridge.
     mean_edge = float(np.sqrt(geo._face_edge_len2.mean()))
     secant_tol = mean_edge * 0.01
-    for i, res in zip(valid_task_indices, results):
+    for i, res in zip(valid_task_indices, results, strict=False):
         if res is None or len(res) < 2:
             all_pts[i] = res
             continue
@@ -620,7 +621,7 @@ def compute_interp(geo, nodes, closed, n_samples) -> list[np.ndarray]:
     "for spans in list, for span in spans" so the shape is compatible
     even though the semantics differ.
     """
-    from scipy.interpolate import splprep, splev
+    from scipy.interpolate import splev, splprep
 
     n_nodes = len(nodes)
     if n_nodes < 2:
@@ -657,20 +658,20 @@ def write_obj(path, spline_points_list):
         v_offset = 1
         for spline_idx, spans in enumerate(spline_points_list):
             f.write(f"g spline_{spline_idx}\n")
-            
+
             # Collect all points for this spline to create a continuous line
             # Spans are lists of numpy arrays
             all_points = []
             for span in spans:
                 for pt in span:
                     all_points.append(pt)
-            
+
             if not all_points:
                 continue
-                
+
             for pt in all_points:
                 f.write(f"v {pt[0]:.8f} {pt[1]:.8f} {pt[2]:.8f}\n")
-            
+
             # Create individual segments connecting the vertices using 'f'
             for i in range(v_offset, v_offset + len(all_points) - 1):
                 f.write(f"f {i} {i+1}\n")
@@ -897,7 +898,7 @@ def main():
     log.info("samples/span: %d", args.samples)
 
     all_spline_points = []
-    for sid, (nodes, closed) in enumerate(zip(splines, splines_closed)):
+    for sid, (nodes, closed) in enumerate(zip(splines, splines_closed, strict=False)):
         n_nodes = len(nodes)
         log.info("spline %d: %d nodes, %s",
                  sid, n_nodes, 'closed' if closed else 'open')

@@ -75,7 +75,7 @@ def test_astar_path_is_adjacent_chain(grid_geo):
     geo = grid_geo
     adj = geo._face_adj
     path = geo._astar_corridor(0, 97)
-    for u, v in zip(path[:-1], path[1:]):
+    for u, v in zip(path[:-1], path[1:], strict=False):
         assert v in set(int(x) for x in adj[u]), f"{u}->{v} not adjacent"
 
 
