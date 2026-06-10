@@ -954,8 +954,9 @@ KDTree, `vtkStaticCellLocator`, `EdgeFlipGeodesicSolver`,
 ### Safety
 
 No cross-file invariants are affected: splines are persisted as
-3D positions + tangents (never as vertex indices), so JSON save/load
-works unchanged across sessions that use different reorder settings.
+literal 3-D positions — node origin plus the `p_a` / `p_b` handle
+endpoints, never as vertex indices — so JSON save/load works
+unchanged across sessions that use different reorder settings.
 The flag is exposed purely for A/B benchmarking — toggle
 `GeodesicMesh.MORTON_REORDER = False` to measure without it on your
 own mesh.
