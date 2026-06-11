@@ -297,7 +297,9 @@ slightly-perturbed input pairs in the de Casteljau cascade.
 - The visible discontinuities are an instance of the discrete-
   geodesic flip-flop already documented in
   [`compute_endpoint_local`](../geodesics.py#L2328) — at
-  `submesh_subdiv=1` (editor default) the 1-to-4 submesh subdivision
+  `submesh_subdiv=1` (the configuration under test during this
+  analysis; the shipped default is `ORANGE_SUBMESH_SUBDIV = 0`,
+  and no committed default has ever been 1) the 1-to-4 submesh subdivision
   is fine enough to expose the flip-flop between two near-equal-
   length edge chains but not fine enough for the discrete geodesic
   to converge to the smooth one.  Solver choice does not matter:
