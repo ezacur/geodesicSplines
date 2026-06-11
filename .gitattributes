@@ -27,3 +27,4 @@
 *.stl    binary
 *.vtk    binary
 *.gif binary
+* text=auto
