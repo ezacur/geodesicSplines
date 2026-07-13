@@ -19,14 +19,14 @@ pytest.importorskip("scipy")
 pytest.importorskip("vtk")
 pytest.importorskip("pyvista")
 
-import geo_splines  # noqa: E402
-from geo_splines import (  # noqa: E402
+import span_workers  # noqa: E402
+from geodesics import GeodesicMesh  # noqa: E402
+from span_workers import (  # noqa: E402
     _build_chord_geodesic,
     _geodesic_decasteljau_worker,
     _hierarchical_inner_order,
     _phase3_chord_bridge,
 )
-from geodesics import GeodesicMesh  # noqa: E402
 
 
 @pytest.fixture
@@ -174,7 +174,7 @@ def _flat_span_inputs():
 def test_worker_reports_clean_done_on_flat_mesh(two_triangle_mesh, monkeypatch):
     """End-to-end: a fully solvable span on a flat mesh finishes with
     ``('done', span_key, False)`` — phase 3 does not spuriously flag."""
-    monkeypatch.setattr(geo_splines, "_process_geo", two_triangle_mesh)
+    monkeypatch.setattr(span_workers, "_process_geo", two_triangle_mesh)
     ctrl, path_b, path_a_rev = _flat_span_inputs()
     t_grid = np.linspace(0.0, 1.0, 5)
     writer = _CollectingWriter()
@@ -194,13 +194,13 @@ def test_worker_folds_phase3_degraded_into_done(two_triangle_mesh, monkeypatch):
     """The worker ORs ``_phase3_chord_bridge``'s return into the final
     ``degraded_any``.  Force phase 3 to report a degraded chord while
     phases 1-2 run clean on the flat mesh; ``'done'`` must be True."""
-    monkeypatch.setattr(geo_splines, "_process_geo", two_triangle_mesh)
+    monkeypatch.setattr(span_workers, "_process_geo", two_triangle_mesh)
 
     def _fake_phase3(geo, span_key, p_list, writer, **kwargs):
         writer.send(('chord_geo', span_key, np.stack(p_list)))
         return True
 
-    monkeypatch.setattr(geo_splines, "_phase3_chord_bridge", _fake_phase3)
+    monkeypatch.setattr(span_workers, "_phase3_chord_bridge", _fake_phase3)
 
     ctrl, path_b, path_a_rev = _flat_span_inputs()
     t_grid = np.linspace(0.0, 1.0, 5)

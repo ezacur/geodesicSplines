@@ -1,6 +1,6 @@
 {
     "pythonVersion": "3.10",
-    "include": ["geo_splines.py", "geo_shoot.py", "geodesics.py", "gizmo.py", "spline_export.py", "session_io.py"],
+    "include": ["geo_splines.py", "geo_shoot.py", "geodesics.py", "gizmo.py", "spline_export.py", "session_io.py", "span_workers.py"],
     "exclude": ["**/__pycache__", ".venv", "build", "dist", "tests/_data"],
     "reportArgumentType": "none",
     "reportAttributeAccessIssue": "none",

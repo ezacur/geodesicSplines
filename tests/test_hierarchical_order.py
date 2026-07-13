@@ -12,7 +12,7 @@ from pathlib import Path
 
 
 def _load_fn():
-    src = (Path(__file__).resolve().parent.parent / "geo_splines.py").read_text(
+    src = (Path(__file__).resolve().parent.parent / "span_workers.py").read_text(
         encoding="utf-8"
     )
     tree = ast.parse(src)
@@ -24,7 +24,7 @@ def _load_fn():
             module = ast.Module(body=[node], type_ignores=[])
             ast.fix_missing_locations(module)
             ns: dict = {}
-            exec(compile(module, "geo_splines.py", "exec"), ns)
+            exec(compile(module, "span_workers.py", "exec"), ns)
             return ns["_hierarchical_inner_order"]
     raise RuntimeError("_hierarchical_inner_order not found")
 
