@@ -396,16 +396,21 @@ def _ray_edge_jit(fverts, fedges, fedge_len2, fid, px, py, pz, dx, dy, dz, nx, n
     ~~~~~~~~~~~~~~~~~~~~
     Three thresholds control edge-case behaviour:
 
-      - **det_tol** (``1e-10 * edge_len²``): the determinant
+      - **det_tol** (``1e-10 * edge_len``): the determinant
         ``(d × edge) · n`` is near-zero when the ray is almost parallel
-        to the edge.  Scaling by ``edge_len²`` makes the tolerance
-        invariant to mesh scale.
+        to the edge.  With unit ``d`` / ``n`` the determinant scales
+        *linearly* with edge length (``|det| ≈ edge_len · |sin θ|``), so
+        the tolerance is scaled by ``edge_len`` (``sqrt(edge_len²)``) to
+        make the angular reject threshold invariant to mesh scale.  The
+        comparison is ``<=`` so a zero-length edge (degenerate face with
+        two coincident vertex positions) rejects cleanly instead of
+        reaching the ``1.0 / det`` division below.
       - **s_tol** (``1e-4``): edge parametric bounds ``s ∈ [-s_tol, 1+s_tol]``
         accept intersections slightly outside the edge due to float
         rounding.  The hit point is clamped to ``[0, 1]``.
-      - **t_min** (``-1e-8``): ``t > -t_min`` instead of ``t > 0`` avoids
-        rejecting intersections at the current position (common after
-        an edge-to-edge advance of 1e-7).
+      - **t_min** (``-1e-8``): ``t >= t_min`` (with ``t_min = -1e-8``)
+        instead of ``t > 0`` avoids rejecting intersections at the
+        current position (common after an edge-to-edge advance of 1e-7).
 
     On extremely degenerate triangles (area → 0), all three determinants
     may be near-zero, returning ``found=0``.  The vertex/edge fallback in
@@ -426,7 +431,17 @@ def _ray_edge_jit(fverts, fedges, fedge_len2, fid, px, py, pz, dx, dy, dz, nx, n
         cy = dz * e0 - dx * e2
         cz = dx * e1 - dy * e0
         det = cx * nx + cy * ny + cz * nz
-        if abs(det) < 1e-10 * fedge_len2[fid, i]:
+        # Parallel-edge reject.  With unit *d* / *n*, |det| ≈ L·|sin θ|
+        # (L = edge length), so a scale-invariant angular threshold needs
+        # a tolerance linear in L — hence sqrt(fedge_len2), not
+        # fedge_len2 itself (the old quadratic form made the effective
+        # angular threshold scale with L, breaking the invariance the
+        # docstring claims).  The scalar sqrt is a single hardware op and
+        # runs at most 3×/crossing.  ``<=`` (not ``<``) makes a
+        # zero-length edge — where fedge_len2 and det are both 0 — reject
+        # via ``0.0 <= 0.0`` instead of dividing by zero at inv_det below
+        # (undefined under fastmath).
+        if abs(det) <= 1e-10 * _math_sqrt(fedge_len2[fid, i]):
             continue
 
         dfx = fverts[fid, i, 0] - px

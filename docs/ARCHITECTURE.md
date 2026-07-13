@@ -401,7 +401,11 @@ The inner loop (7 phases per edge crossing):
 2. **Ray-edge intersection** (`_ray_edge_jit`): intersect the ray with
    all 3 edges of the current triangle. Uses the determinant form
    `(d x edge) . n` with three numerical thresholds:
-   - `det_tol = 1e-10 * edge_len^2` -- scale-invariant parallelism test.
+   - `det_tol = 1e-10 * edge_len` -- scale-invariant parallelism test.
+     `|det| ≈ edge_len·|sin θ|` with unit direction/normal, so the
+     tolerance is linear in edge length (not `edge_len^2`); a `<=`
+     comparison also rejects zero-length degenerate edges before the
+     `1/det` division.
    - `s_tol = 1e-4` -- edge parametric bounds with clamping.
    - `t_min = -1e-8` -- accepts intersections at the current position
      (after the 1e-7 nudge from the previous step).
