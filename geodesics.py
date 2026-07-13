@@ -2308,9 +2308,13 @@ class GeodesicMesh:
         # the discrete geodesic to converge to the smooth-surface
         # geodesic by giving the solver finer edges to work with).
         # ``vmap`` is intentionally NOT extended: the new midpoint
-        # vertices have no global counterpart, so ``_to_local``
-        # falls back to the local KDTree path for them — exactly
-        # what we want.
+        # vertices have no global counterpart.  Note ``_to_local`` maps
+        # the global-nearest vertex through ``vmap`` and only falls back
+        # to a local KDTree when that vertex is *outside* the submesh —
+        # it does NOT return midpoint vertices, so a point inside a
+        # subdivided triangle's central subface seeds the insertion from
+        # an original corner.  ``_add_point_local``'s bary backstop
+        # rescans all faces in that case; see the comment there.
         for _ in range(max(0, int(submesh_subdiv))):
             V_sub, F_sub = self._subdivide_submesh_1to4(V_sub, F_sub)
 
@@ -3084,6 +3088,26 @@ class GeodesicMesh:
                        key=lambda i: self._outside_score_buf(p, i, V_buf, F_buf))
 
         u, v, w = self._bary_buf(p, face_idx, V_buf, F_buf)
+        # Defensive backstop against a mis-seeded candidate pool.  The
+        # pool is faces incident to the nearest vertex *vi*; that misses
+        # p's true containing face whenever vi is not one of that face's
+        # corners.  The load-bearing case is ``submesh_subdiv >= 1``: the
+        # 1-to-4 subdivision adds midpoint vertices that ``vmap`` does not
+        # cover, so ``_to_local`` can only ever return an *original*
+        # corner — and a point inside a triangle's central subface (whose
+        # three corners are all midpoints) then seeds from a corner its
+        # subface doesn't touch.  The ``min(outside_score)`` pick lands on
+        # an adjacent subface, ``min_bary`` goes strongly negative, and
+        # the 2-to-4 split below would weld p onto the wrong edge while
+        # its 3-D position sits inside the neighbour — a local fold.  A
+        # grossly-negative bary means "chosen face does not contain p";
+        # rescan all faces so the insert targets the real one.  Never
+        # fires on a well-seeded pool (min_bary >= ~0), so the
+        # parity-oracle'd submesh_subdiv=0 path is unchanged.
+        if min(u, v, w) < -1e-2 and len(candidates) < nf:
+            face_idx = min(range(nf),
+                           key=lambda i: self._outside_score_buf(p, i, V_buf, F_buf))
+            u, v, w = self._bary_buf(p, face_idx, V_buf, F_buf)
         fa = int(F_buf[face_idx, 0])
         fb = int(F_buf[face_idx, 1])
         fc = int(F_buf[face_idx, 2])
