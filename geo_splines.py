@@ -777,9 +777,9 @@ def _hierarchical_inner_order(total: int) -> list[int]:
 def _build_chord_geodesic(
     geo, p_left: np.ndarray, p_right: np.ndarray,
     submesh_subdiv: int = 0,
-) -> np.ndarray:
-    """Return a polyline that follows the mesh geodesic from *p_left*
-    to *p_right*.
+) -> tuple[np.ndarray, bool]:
+    """Return ``(polyline, degraded)`` — a polyline that follows the
+    mesh geodesic from *p_left* to *p_right*, plus a degraded flag.
 
     Used by the orange worker's phase-3 chord-bridging — once all
     cascade samples are computed, every pair of consecutive samples
@@ -795,20 +795,27 @@ def _build_chord_geodesic(
     the requested *submesh_subdiv* level (~25-100 ms).  Last resort,
     when even the full solver fails (disconnected components,
     malformed input), is a degenerate two-point Euclidean polyline
-    — at least the geometry can still be rendered, with the degraded
-    flag set elsewhere.
+    — at least the geometry can still be rendered.
+
+    *degraded* is ``True`` whenever the returned polyline is that
+    Euclidean stand-in rather than a real geodesic: the solver raised,
+    returned nothing usable, or reported its own ``was_fallback``
+    straight-line stub.  The caller must OR it into the span's
+    ``degraded_any`` flag — a straight chord that renders without the
+    red fallback repaint is exactly the "phantom curve" the editor
+    promises never to show.
     """
     seg = geo.short_geodesic(p_left, p_right)
     if seg is not None:
-        return seg
+        return seg, False
     try:
-        seg, _fb = geo.compute_endpoint_local(
+        seg, was_fallback = geo.compute_endpoint_local(
             p_left, p_right, submesh_subdiv=submesh_subdiv)
     except (RuntimeError, ValueError, TypeError, IndexError):
-        seg = None
+        seg, was_fallback = None, True
     if seg is None or len(seg) < 2:
-        return np.stack([p_left, p_right])
-    return seg
+        return np.stack([p_left, p_right]), True
+    return seg, bool(was_fallback)
 
 
 def _phase1_canonical(
@@ -937,17 +944,22 @@ def _phase3_chord_bridge(
     geo, span_key: SpanKey,
     p_list: list[np.ndarray], writer, *,
     submesh_subdiv: int,
-) -> None:
+) -> bool:
     """Phase 3 of the orange worker: geodesic chord bridging.
 
     Connects every consecutive sample pair with an exact mesh geodesic
     (:func:`_build_chord_geodesic`) and sends the concatenated polyline
-    once as ``('chord_geo', span_key, polyline)``.
+    once as ``('chord_geo', span_key, polyline)``.  Returns ``True``
+    when any chord degraded to a straight Euclidean segment, so the
+    caller can fold it into the ``('done', ...)`` degraded flag and
+    the parent repaints the span red.
     """
+    degraded = False
     polyline_segs: list[np.ndarray] = []
     for i in range(len(p_list) - 1):
-        seg = _build_chord_geodesic(geo, p_list[i], p_list[i + 1],
-                                    submesh_subdiv=submesh_subdiv)
+        seg, deg = _build_chord_geodesic(geo, p_list[i], p_list[i + 1],
+                                         submesh_subdiv=submesh_subdiv)
+        degraded |= deg
         polyline_segs.append(seg)
     # Concatenate, dropping the duplicated joint between
     # consecutive segments so the polyline has no zero-length
@@ -957,6 +969,7 @@ def _phase3_chord_bridge(
         full.append(seg[1:])
     polyline = np.concatenate(full, axis=0)
     writer.send(('chord_geo', span_key, polyline))
+    return degraded
 
 
 def _geodesic_decasteljau_worker(
@@ -1023,13 +1036,16 @@ def _geodesic_decasteljau_worker(
     geodesic via :func:`_build_chord_geodesic` (``short_geodesic`` fast
     path, ``compute_endpoint_local`` fallback).  The polyline is sent
     once as ``('chord_geo', span_key, polyline)``; the parent replaces
-    the actor geometry wholesale.  Skipped when *chord_bridging* is
-    False — in that case the parent renders the t-sorted polyline as
-    Euclidean chords between samples.
+    the actor geometry wholesale.  Chords whose solvers all fail
+    degrade to straight Euclidean segments and feed the degraded
+    flag, same as the cascade phases.  Skipped when *chord_bridging*
+    is False — in that case the parent renders the t-sorted polyline
+    as Euclidean chords between samples.
 
     Finally a ``('done', span_key, degraded_any)`` message terminates
     the worker.  The *degraded_any* flag triggers the red-fallback
-    repaint on the parent if any solver call hit a straight-line path.
+    repaint on the parent if any solver call — in any of the three
+    phases — hit a straight-line path.
 
     Failure modes
     -------------
@@ -1093,8 +1109,9 @@ def _geodesic_decasteljau_worker(
 
         # Phase 3 — chord bridging via short / full geodesics.
         if chord_bridging and len(p_list) >= 2:
-            _phase3_chord_bridge(geo, span_key, p_list, writer,
-                                 submesh_subdiv=submesh_subdiv)
+            degraded_any |= _phase3_chord_bridge(
+                geo, span_key, p_list, writer,
+                submesh_subdiv=submesh_subdiv)
 
         writer.send(('done', span_key, degraded_any))
     except (BrokenPipeError, OSError):

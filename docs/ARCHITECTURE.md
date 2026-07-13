@@ -258,6 +258,12 @@ path that handles two cases without invoking the edge-flip solver:
   degenerate edge, crossing on/near a shared-edge vertex) → returns
   `None`; the worker falls back to `compute_endpoint_local`.
 
+If the fallback solver *also* fails (raises, returns nothing usable,
+or reports its own straight-line stub), the chord degrades to a plain
+Euclidean segment and the span's degraded flag is set — a phase-3
+failure triggers the same red repaint as a cascade failure, so a
+straight chord never renders disguised as a geodesic.
+
 The validation margin is critical: a crossing that lands on a shared-
 edge vertex means the optimal geodesic actually wraps around the
 vertex's curvature cone — the flat unfolding is not valid in that

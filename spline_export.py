@@ -308,8 +308,9 @@ def rebuild_mesh_and_nodes(data: dict):
             try:
                 path, _ = geo.compute_endpoint_from_origin(cache, p_target)
             except (RuntimeError, ValueError, TypeError, IndexError) as exc:
-                log.debug("v2 load: solver failed for handle %s (%s)",
-                          p_target.tolist(), exc)
+                log.warning("v2 load: solver failed for handle %s (%s); "
+                            "handle path degrades to a straight segment",
+                            p_target.tolist(), exc)
                 path = np.array([origin, p_target])
             if path is None or len(path) < 2:
                 path = np.array([origin, p_target])
@@ -382,20 +383,26 @@ def compute_blue(geo, nodes, closed, n_samples) -> list[np.ndarray]:
         return all_pts
 
     n_spans = n_nodes if closed else n_nodes - 1
+    n_skipped = 0
+    degraded_spans: list[int] = []
     for i in range(n_spans):
         n0 = nodes[i]
         n1 = nodes[(i + 1) % n_nodes]
         ctrl = [n0['origin'], n0['p_b'], n1['p_a'], n1['origin']]
         if any(p is None for p in ctrl):
+            n_skipped += 1
             continue
         path_b = n0['path_b']
         path_a_rev = n1['path_a'][::-1] if n1['path_a'] is not None else None
 
         # Geodesic H_out → H_in via local submesh solver
         log.debug("span %d: computing path_12 (H_out -> H_in)", i)
-        path_12, _ = geo.compute_endpoint_local(n0['p_b'], n1['p_a'])
+        path_12, was_fallback = geo.compute_endpoint_local(n0['p_b'], n1['p_a'])
         if path_12 is None or len(path_12) < 2:
             path_12 = None
+            degraded_spans.append(i)
+        elif was_fallback:
+            degraded_spans.append(i)
 
         n = geo.adaptive_samples(ctrl, 0.3, 15, 100)
         n = max(n, n_samples)
@@ -403,6 +410,14 @@ def compute_blue(geo, nodes, closed, n_samples) -> list[np.ndarray]:
             ctrl, path_b, path_a_rev, n, fast=False, path_12=path_12)
         pts = geo.project_smooth_batch(pts)
         all_pts.append(pts)
+
+    if n_skipped:
+        log.warning("blue: %d of %d spans SKIPPED (handles missing or "
+                    "unsolvable) — output is incomplete", n_skipped, n_spans)
+    if degraded_spans:
+        log.warning("blue: %d of %d spans DEGRADED (level-1 geodesic "
+                    "H_out->H_in fell back to a straight line; spans %s)",
+                    len(degraded_spans), n_spans, degraded_spans)
 
     return all_pts
 
@@ -479,6 +494,11 @@ def _orange_span_worker(task_data):
 
     The caller is responsible for the secant-chord subdivision pass
     (the editor runs it post-worker in ``_apply_orange_progress``).
+
+    Returns ``(span_pts, degraded)`` — *degraded* mirrors the editor
+    worker's ``degraded_any``: ``True`` when the level-1 middle path
+    or any cascade evaluation fell back to a straight-line stub, so
+    the parent can warn instead of exporting a phantom curve silently.
     """
     (ctrl, path_b, path_a_rev, t_grid) = task_data
 
@@ -493,9 +513,13 @@ def _orange_span_worker(task_data):
 
     P0, H_out, H_in, P1 = ctrl
 
-    path_12, _ = geo.compute_endpoint_local(H_out, H_in)
+    degraded = False
+    path_12, was_fallback = geo.compute_endpoint_local(H_out, H_in)
     if path_12 is None or len(path_12) < 2:
         path_12 = np.array([H_out, H_in])
+        degraded = True
+    elif was_fallback:
+        degraded = True
 
     cum_b, total_b = GeodesicMesh.compute_path_lengths(path_b)
     cum_a, total_a = GeodesicMesh.compute_path_lengths(path_a_rev)
@@ -512,12 +536,13 @@ def _orange_span_worker(task_data):
     # the editor's orange worker runs — for bit-for-bit parity.
     for idx in range(1, n - 1):
         t = float(t_grid[idx])
-        span_pts[idx], _ = eval_cascade_at_t(
+        span_pts[idx], deg = eval_cascade_at_t(
             geo, t, path_b, cum_b, total_b,
             path_a_rev, cum_a, total_a,
             path_12, cum_12, total_12)
+        degraded |= deg
 
-    return np.array(span_pts)
+    return np.array(span_pts), degraded
 
 
 def compute_orange(geo, nodes, closed, n_samples,
@@ -544,6 +569,11 @@ def compute_orange(geo, nodes, closed, n_samples,
     Spans whose endpoints could not be solved are filtered out, so the
     list length may be less than ``N - 1`` (open) / ``N`` (closed).
     Same shape as ``compute_blue``.
+
+    Skipped spans (unsolvable handles) and degraded spans (worker fell
+    back to a straight-line path somewhere) are reported via
+    ``log.warning`` — the export succeeds but the user must know the
+    output is not the full exact curve.
     """
     n_nodes = len(nodes)
     if n_nodes < 2:
@@ -597,11 +627,23 @@ def compute_orange(geo, nodes, closed, n_samples,
     # samples land on opposite sides of a ridge.
     mean_edge = float(np.sqrt(geo._face_edge_len2.mean()))
     secant_tol = mean_edge * 0.01
-    for i, res in zip(valid_task_indices, results, strict=False):
+    degraded_spans: list[int] = []
+    for i, (res, degraded) in zip(valid_task_indices, results, strict=False):
+        if degraded:
+            degraded_spans.append(i)
         if res is None or len(res) < 2:
             all_pts[i] = res
             continue
         all_pts[i] = geo.subdivide_secant_chords(res, tol=secant_tol, max_depth=6)
+
+    n_skipped = n_spans - len(valid_task_indices)
+    if n_skipped:
+        log.warning("orange: %d of %d spans SKIPPED (handles missing or "
+                    "unsolvable) — output is incomplete", n_skipped, n_spans)
+    if degraded_spans:
+        log.warning("orange: %d of %d spans DEGRADED to straight-line "
+                    "fallback (spans %s) — the editor paints these red",
+                    len(degraded_spans), n_spans, degraded_spans)
 
     return [p for p in all_pts if p is not None]
 

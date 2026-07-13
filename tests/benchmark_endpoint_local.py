@@ -332,7 +332,9 @@ def profile(mesh_path, nodes, samples, seed, locator):
     install_instrumentation(geo)
     spline_export._worker_geo = geo
     t0 = time.perf_counter()
-    results = [spline_export._orange_span_worker(task) for task in tasks]
+    # _orange_span_worker returns (span_pts, degraded); the profiling
+    # harness only cares about the geometry.
+    results = [spline_export._orange_span_worker(task)[0] for task in tasks]
     wall = time.perf_counter() - t0
     report(n_spans, wall)
     return results
@@ -426,7 +428,7 @@ def run_session(session_path, samples, locator):
     n_nonfinite = 0
     t0 = time.perf_counter()
     for task in tasks:
-        res = spline_export._orange_span_worker(task)
+        res, _degraded = spline_export._orange_span_worker(task)
         if res is not None and res.size and not np.isfinite(res).all():
             n_nonfinite += 1
     wall = time.perf_counter() - t0
@@ -476,8 +478,8 @@ def test_orange_cascade_benchmark():
     assert n_spans == 5
 
     spline_export._worker_geo = geo
-    run1 = [spline_export._orange_span_worker(t) for t in tasks]
-    run2 = [spline_export._orange_span_worker(t) for t in tasks]
+    run1 = [spline_export._orange_span_worker(t)[0] for t in tasks]
+    run2 = [spline_export._orange_span_worker(t)[0] for t in tasks]
 
     assert len(run1) == n_spans
     for a, b in zip(run1, run2, strict=False):
