@@ -50,3 +50,30 @@ jobs:
         # mesh, none of which are installed here — excluded explicitly in
         # addition to its own skip guard.
         run: pytest tests/ -m "not gpu and not gui and not benchmark" -q
+
+  # Full-dependency job: the slim ``test`` job above installs only
+  # numpy/scipy, so every test that does ``importorskip("vtk")`` — i.e.
+  # the entire geodesic core (astar, subdivision, short_geodesic,
+  # find_faces, chord-degraded, geo_core) — silently skips there.  This
+  # job installs the real runtime + Numba and actually exercises them,
+  # including the ``benchmark`` cascade parity net (fandisk.obj ships in
+  # the repo).  Single Python version, headless (offscreen VTK); allowed
+  # to be slower than the slim matrix.
+  test-full:
+    runs-on: ubuntu-latest
+    env:
+      PYVISTA_OFF_SCREEN: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install full runtime + JIT + test deps
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -e .[jit]
+          pip install pytest
+      - name: Run full test suite (incl. benchmark parity net)
+        run: pytest tests/ -m "not gpu and not gui" -q

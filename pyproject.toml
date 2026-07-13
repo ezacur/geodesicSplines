@@ -76,6 +76,13 @@ disable_error_code = ["attr-defined", "arg-type", "assignment"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra -q"
+# Collect the profiling/parity harness too — its filename doesn't match
+# the default ``test_*.py`` glob, so without this its
+# ``test_orange_cascade_benchmark`` correctness net (the only automated
+# end-to-end check of the export cascade) was silently never collected.
+# It carries the ``benchmark`` marker and is deselected from the slim CI
+# matrix via ``-m "not benchmark"``.
+python_files = ["test_*.py", "benchmark_*.py"]
 markers = [
     "benchmark: in-process perf benchmark for the geodesic core; needs full deps (vtk/pyvista/potpourri3d) + a mesh, so excluded from the slim CI matrix.",
     "gpu: requires a GPU / hardware-accelerated VTK context.",

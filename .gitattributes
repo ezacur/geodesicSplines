@@ -21,10 +21,12 @@
 *.txt    text eol=lf
 *.json   text eol=lf
 
-# Binary assets: never EOL-convert.
+# Binary assets: never EOL-convert.  These MUST stay after the generic
+# ``* text=auto eol=lf`` line above: gitattributes applies the LAST
+# matching pattern per attribute, so a trailing catch-all here would
+# silently re-enable text/EOL conversion on the very files it corrupts.
 *.obj    binary
 *.ply    binary
 *.stl    binary
 *.vtk    binary
-*.gif binary
-* text=auto
+*.gif    binary
