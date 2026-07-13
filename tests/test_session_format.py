@@ -1,12 +1,16 @@
 """Tests for the JSON session schema validator.
 
-These tests exercise ``geo_splines._validate_session_dict`` directly —
+These tests exercise ``session_io._validate_session_dict`` directly —
 no PyVista, no VTK, no mesh.  They guard the invariants that the
 interactive editor relies on at load time:
 
   - Top-level shape is an object with a ``splines`` list.
   - Each node has a 3-element ``origin`` and ``tangent``, both finite.
   - Closed splines have at least 3 nodes.
+
+The validator now lives in the stdlib-only ``session_io`` module (moved
+out of ``geo_splines`` to break the CLI's pyvista dependency), so it
+imports directly — no more AST-extraction shim to dodge the heavy deps.
 """
 from __future__ import annotations
 
@@ -14,41 +18,7 @@ import math
 
 import pytest
 
-
-# Importing geo_splines pulls in pyvista / vtk which are not installed
-# in the slim CI environment.  We only need the validator, so import
-# it via a small shim that bypasses the heavy deps.
-def _load_validator():
-    """Loads ``_validate_session_dict`` without importing pyvista / vtk.
-
-    The validator is a pure function defined near the top of
-    ``geo_splines.py``.  We extract its source by parsing the module
-    file rather than ``import geo_splines``, which would force the full
-    dependency tree (pyvista, vtk, potpourri3d) to be present even for
-    pure-data tests.
-    """
-    import ast
-    from pathlib import Path
-
-    src = (Path(__file__).resolve().parent.parent / "geo_splines.py").read_text(
-        encoding="utf-8"
-    )
-    tree = ast.parse(src)
-    for node in tree.body:
-        if (
-            isinstance(node, ast.FunctionDef)
-            and node.name == "_validate_session_dict"
-        ):
-            module = ast.Module(body=[node], type_ignores=[])
-            ast.fix_missing_locations(module)
-            ns: dict = {}
-            exec(compile(module, "geo_splines.py", "exec"), ns)
-            return ns["_validate_session_dict"]
-    raise RuntimeError("_validate_session_dict not found in geo_splines.py")
-
-
-validate = _load_validator()
-
+from session_io import _validate_session_dict as validate
 
 # --- Happy path ----------------------------------------------------------
 

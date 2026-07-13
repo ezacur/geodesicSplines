@@ -13,10 +13,10 @@ This exercises ``submit_span`` in isolation (no real process pool /
 shared memory) via a flaky fake executor.
 """
 import multiprocessing as mp
+from concurrent.futures.process import BrokenProcessPool
 
 import numpy as np
 import pytest
-from concurrent.futures.process import BrokenProcessPool
 
 pytest.importorskip("vtk")  # geo_splines imports vtk transitively
 

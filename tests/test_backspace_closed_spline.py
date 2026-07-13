@@ -20,7 +20,6 @@ import pytest
 pytest.importorskip("vtk")
 pytest.importorskip("pyvista")
 
-import geo_splines  # noqa: E402
 from geo_splines import GeodesicSplineApp  # noqa: E402
 
 

@@ -34,7 +34,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["geo_splines", "geo_shoot", "geodesics", "gizmo", "spline_export"]
+py-modules = ["geo_splines", "geo_shoot", "geodesics", "gizmo", "spline_export", "session_io"]
 
 [tool.ruff]
 line-length = 100
@@ -68,6 +68,7 @@ files = [
     "geo_shoot.py",
     "geo_splines.py",
     "spline_export.py",
+    "session_io.py",
 ]
 # UI modules (geo_shoot / geo_splines) lean heavily on dynamic VTK/PyVista
 # attributes; loosen the strictness there until the call sites are typed.

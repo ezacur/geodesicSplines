@@ -187,12 +187,11 @@ def load_json(path: str) -> dict:
     # CLI / GUI behaviour aligned and rejects hostile / hand-edited
     # inputs (NaN/Inf coordinates, missing splines, malformed nodes)
     # with a clear error rather than crashing deep inside the solver.
-    try:
-        from geo_splines import _validate_session_dict as _validate
-    except ImportError:
-        # geo_splines pulls pyvista; if that's unavailable, the rest
-        # of this CLI cannot function either, so re-raise.
-        raise
+    # ``session_io`` is stdlib-only (no pyvista / vtk), so validation
+    # runs before we touch the heavy geometry stack — a malformed
+    # session is rejected cheaply, and this no longer imports the whole
+    # GUI module just to reach the validator.
+    from session_io import _validate_session_dict as _validate
     try:
         _validate(data)
     except ValueError as exc:
