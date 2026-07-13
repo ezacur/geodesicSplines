@@ -4427,6 +4427,39 @@ class GeodesicSplineApp(MidpointShooterApp):
         if curve_changed:
             self.plotter.render()
 
+    def _reopen_spline_loop(self, sid: int) -> None:
+        """Reopen a closed spline *in place*.
+
+        Clears the first node's closing tangent (the phantom ``p_a`` that
+        belonged only to the wrap-around span), drops that wrap-around
+        span from both caches (removing its actors and cancelling its
+        orange workers), marks the spline open, and flags hover dirty.
+
+        Pure state mutation — the caller drives ``_recompute_spans`` /
+        ``_refresh_visuals`` / ``render``.  Shared by the ``C``-key
+        reopen, the Backspace-on-closed-spline path, and the
+        break-undo path so all three stay in lockstep (a past drift
+        between them stranded the wrap-around actor — see
+        ``_on_backspace``).
+        """
+        nodes = self.splines[sid]
+        self.splines_closed[sid] = False
+        if nodes:
+            first = nodes[0]
+            first.p_a = None
+            first.path_a = None
+            first.update_visuals(self.plotter)
+            # Wrap-around span of a closed N-node spline is span N-1.
+            key = (sid, len(nodes) - 1)
+            entry = self._span_cache.pop(key, None)
+            if entry:
+                safe_remove_actor(self.plotter, entry[1])
+            self._work_mgr.cancel_all_for_span(key)
+            entry_g = self._geo_span_cache.pop(key, None)
+            if entry_g:
+                safe_remove_actor(self.plotter, entry_g[1])
+        self._hover_dirty = True
+
     def _on_close_spline(self) -> None:
         """'C' key: toggles open/closed state of the active spline.
 
@@ -4448,24 +4481,7 @@ class GeodesicSplineApp(MidpointShooterApp):
         # Already closed → reopen
         if self.splines_closed[sid]:
             self._push_undo()
-            self.splines_closed[sid] = False
-            # Clear the closing tangent on the first node (phantom handle
-            # that belonged only to the wrap-around span)
-            first = nodes[0]
-            first.p_a = None
-            first.path_a = None
-            first.update_visuals(self.plotter)
-            # Remove the wrap-around span cache entries + cancel workers
-            closing_idx = len(nodes) - 1
-            key = (sid, closing_idx)
-            entry = self._span_cache.pop(key, None)
-            if entry:
-                safe_remove_actor(self.plotter, entry[1])
-            self._work_mgr.cancel_all_for_span(key)
-            entry_g = self._geo_span_cache.pop(key, None)
-            if entry_g:
-                safe_remove_actor(self.plotter, entry_g[1])
-            self._hover_dirty = True
+            self._reopen_spline_loop(sid)
             self._recompute_spans()
             self._submit_geodesic_spans()
             self._refresh_visuals()
@@ -4539,35 +4555,28 @@ class GeodesicSplineApp(MidpointShooterApp):
             self.active_spline_idx = len(self.splines) - 1
             self._rebuild_node_index()
             if self.splines_closed[self.active_spline_idx]:
-                self.splines_closed[self.active_spline_idx] = False
-                prev_nodes = self.splines[self.active_spline_idx]
-
-                # Clear the closing tangent on the first node — it was
-                # set by _on_close_spline and doesn't belong to any open
-                # span.  Without this, a phantom handle A remains visible,
-                # hoverable, and draggable after reopening.
-                first = prev_nodes[0]
-                first.p_a = None
-                first.path_a = None
-                first.update_visuals(self.plotter)
-
-                # Remove the closing span from cache
-                closing_idx = len(prev_nodes) - 1
-                key = (self.active_spline_idx, closing_idx)
-                entry = self._span_cache.pop(key, None)
-                if entry:
-                    safe_remove_actor(self.plotter, entry[1])
-                # Cancel all workers + hide actors for closing span
-                self._work_mgr.cancel_all_for_span(key)
-                for cache in (self._geo_span_cache,):
-                    removed = cache.pop(key, None)
-                    if removed:
-                        safe_remove_actor(self.plotter, removed[1])
-                self._hover_dirty = True
+                self._reopen_spline_loop(self.active_spline_idx)
                 self._set_hud(_t("loop_opened"), 'yellow')
             else:
                 self._set_hud(_t("break_removed"), 'yellow')
             self._refresh_visuals()
+            self._update_stitch()
+            self.plotter.render()
+            return
+
+        # Closed spline: the most recent structural op was the close, so
+        # Backspace reopens the loop (undo the close) rather than popping
+        # a node.  Popping a closed spline stranded the wrap-around span's
+        # actor (only span N-2 was cleaned) and could drop a closed
+        # 3-node spline to a closed 2-node one — a state
+        # ``_validate_session_dict`` rejects, which silently dead-ends the
+        # undo/redo chain the next time that snapshot is restored.
+        if nodes and self.splines_closed[sid]:
+            self._reopen_spline_loop(sid)
+            self._recompute_spans()
+            self._submit_geodesic_spans()
+            self._refresh_visuals()
+            self._set_hud(_t("loop_opened"), 'yellow')
             self._update_stitch()
             self.plotter.render()
             return
