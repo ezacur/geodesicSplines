@@ -1206,7 +1206,12 @@ class _SpanWorkManager:
         # ``_processes`` is a dict[pid, multiprocessing.Process] on every
         # supported Python version; defensive ``getattr`` for the
         # vanishingly small chance the attribute is renamed upstream.
-        for proc in getattr(self._executor, '_processes', {}).values():
+        # ``or {}`` guards the window after ``executor.shutdown(wait=False)``
+        # where the executor's management thread has already nulled
+        # ``_processes`` — ``getattr(..., {})`` returns that None (the attr
+        # exists), and ``None.values()`` would crash here, *before* the shm
+        # cleanup below, leaking the shared-memory blocks.
+        for proc in (getattr(self._executor, '_processes', None) or {}).values():
             try:
                 if proc.is_alive():
                     proc.kill()
