@@ -147,9 +147,17 @@ To cancel: ``self.state.pending_debounces.pop('my_task', None)``.
 Task IDs currently registered:
   - ``'drag_exact'`` (this module) — handle drag consolidation; see
     ``_schedule_debounce`` and ``_fire_debounce``.
+  - ``'hover_revert'`` (this module) — delayed revert of a hover
+    highlight once the cursor leaves a marker; registered in the
+    hover-handling path.
   - ``'stitch_exact'`` (``GeodesicSplineApp``) — cursor-stillness
     refinement of the gray stitch line; see ``_schedule_stitch_exact``
     and ``_fire_stitch_exact`` in ``geo_splines.py``.
+  - ``'guides_fade'`` (``GeodesicSplineApp``) — timed fade-out of the
+    handle guide lines; registered in ``geo_splines.py``.
+  (Note: ``'didactic_t'`` and ``'my_task'`` are *not* live tasks — the
+  former is only ever ``pop``-cancelled as legacy defensive cleanup, the
+  latter is just the registration example above.)
 
 Implementation details:
   - The timer is created from a one-shot ``RenderEvent`` callback in
@@ -1176,7 +1184,6 @@ class MidpointShooterApp:
         which is desirable: the user sees the error first, then the
         progress text resumes once the window expires.
         """
-        import time
         now = time.monotonic()
         sticky_until = getattr(self, '_hud_sticky_until', 0.0)
         # Non-sticky callers must wait out an in-progress sticky window.

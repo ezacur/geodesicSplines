@@ -2198,6 +2198,11 @@ class GeodesicSplineApp(MidpointShooterApp):
         # outright by ``_recompute_spans`` (see the
         # ``_is_node_in_last_span`` guard).
         self._didactic_visible: bool = False
+        # NOTE: ``_didactic_dirty`` is write-only (dead) — it is set here and
+        # in ``_compute_didactic``/``_recompute_spans`` but never read in any
+        # condition.  Toggle-ON recomputes unconditionally; cache validity is
+        # decided per-slot inside ``_compute_didactic`` via ``cache_key``.
+        # Kept for now (removal is out of scope for the current doc pass).
         self._didactic_dirty: bool = True
         # Cache of the t-INVARIANT pieces of the cascade (path_12 plus
         # the cumulative lengths of path_b / path_a / path_12).  These
@@ -2601,8 +2606,6 @@ class GeodesicSplineApp(MidpointShooterApp):
     def _toggle_layer_key(self, layer: str) -> None:
         """Keyboard shortcut: inverts the visibility of a curve layer
         and synchronizes the checkbox widget to match.
-
-        Keys: ``b`` (blue), ``o`` (orange), ``k`` (interp).
 
         Keys: ``b`` (blue), ``o`` (orange), ``k`` (interp).
         """
@@ -5084,7 +5087,7 @@ class GeodesicSplineApp(MidpointShooterApp):
             self._set_span(sid, i, projected, dragging=is_preview_drag)
 
         # Interpolation curve tracks node origins — recompute on every call.
-        self._recompute_interp_curve(sid, is_dragging=is_dragging)
+        self._recompute_interp_curve(sid, is_dragging=is_preview_drag)
 
         # Didactic scaffold (key 'd') — interactive refresh:
         #   * Only recompute when the drag actually affects the LAST
@@ -5105,7 +5108,7 @@ class GeodesicSplineApp(MidpointShooterApp):
         #     the visible snap is itself a teaching moment.
         if self._didactic_visible:
             if node is None or self._is_node_in_last_span(node):
-                self._compute_didactic(fast=is_dragging)
+                self._compute_didactic(fast=is_preview_drag)
         else:
             self._didactic_dirty = True
 
@@ -5409,9 +5412,11 @@ class GeodesicSplineApp(MidpointShooterApp):
 
         On the OFF→ON transition we lazy-create the t slider (see
         ``_ensure_didactic_slider``) and trigger a synchronous
-        compute (only if the cache is dirty) so the editor feels
-        frozen for ~75-125 ms once.  Subsequent toggles only flip
-        actor visibility + the slider's enabled state.
+        ``_compute_didactic()`` *unconditionally* so the editor feels
+        frozen for ~75-125 ms once.  (The per-slot ``_didactic_geo_cache``
+        inside ``_compute_didactic`` still short-circuits the t-invariant
+        pieces, but the toggle itself does not gate the call.)  The OFF
+        transition only hides the actors + disables the slider.
         """
         self._didactic_visible = not self._didactic_visible
         if self._didactic_visible:
@@ -5920,10 +5925,15 @@ class GeodesicSplineApp(MidpointShooterApp):
 
         Always uses ``fast=False`` (exact geodesic).  Rationale:
         ``path_12`` is t-INVARIANT and held in the ``'exact'`` slot
-        of ``_didactic_geo_cache``.  As long as the geometry is
-        stable (no node drag in flight), every slider tick after
-        the first hits the cache in ~1-5 ms.  The first tick pays
-        the ~75-125 ms ``compute_endpoint_local`` cost once.
+        of ``_didactic_geo_cache`` (along with the cumulative-length
+        tables for path_b / path_a / path_12), so it is *not*
+        recomputed per tick.  But the cache covers only the level-1
+        middle segment: the level-2/3 chords (``path_c0``, ``path_c1``,
+        ``path_final``) depend on ``t`` and are rebuilt every tick via
+        three fresh ``compute_endpoint_local`` calls.  So each tick after
+        the first still costs roughly ~75-300 ms (three local-submesh
+        solves) — the cache saves only the fourth (path_12) solve, not
+        the whole cascade.  The first tick pays all four.
 
         An earlier implementation alternated ``fast=True`` on the
         live tick with ``fast=False`` on a 100 ms debounce.  That
@@ -6981,8 +6991,10 @@ class GeodesicSplineApp(MidpointShooterApp):
         """Replaces all splines with those described in *data*.
 
         Clears existing state (workers, actors, caches), reconstructs
-        each node from the 2 saved fields (origin + tangent), and
-        recomputes all derived geometry.  Always leaves ``self.splines``
+        each node from its saved fields (v2: origin + p_a + p_b handle
+        endpoints; legacy v1: origin + tangent — dispatched by
+        ``_node_from_record``), and recomputes all derived geometry from
+        those.  Always leaves ``self.splines``
         with at least one (possibly empty) entry so downstream code can
         rely on that invariant.
 

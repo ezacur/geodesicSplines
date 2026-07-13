@@ -74,12 +74,22 @@ load-bearing under Numba because it maps directly to efficient LLVM IR:
 The topology-insertion path (``prepare_origin`` / ``compute_endpoint_from_origin``)
 uses a different strategy — oversized pre-allocated buffers:
 
-  * **V buffer**: frontier overwrite.  The origin is inserted once; each
-    endpoint call writes at ``V_buf[nv_cached]`` without copying 120K vertices.
-  * **F buffer**: local copy per call (~0.4 ms).  Topology insertion modifies
-    *existing* faces (subdivides them), so the cached F must stay clean for
-    the next endpoint.  A full frontier overwrite was attempted but requires
-    fragile per-face save/restore that isn't worth the complexity.
+  * **Origin buffers** (``prepare_origin``): the origin is inserted *once*
+    into oversized ``V_buf`` / ``F_buf`` copies (+3 verts / +10 faces), and
+    both are cached in the ``OriginCache`` alongside the pre-built solver.
+    ``compute_endpoint_from_origin`` then treats these buffers as read-only:
+    Tier 1 (vertex-snap) only *reads* them (``_find_face_buf`` / ``_bary_buf``)
+    to test whether the endpoint coincides with an existing vertex, and Tier 2
+    delegates to ``compute_endpoint_local`` (a fresh local submesh + solver).
+    No endpoint call writes into the cached buffers, so no per-call F copy is
+    needed here — the earlier "frontier overwrite" / "per-call F copy" scheme
+    was retired when the endpoint path moved to the local-submesh solver.
+    HAZARD: if the origin insertion produces a degenerate mesh, the
+    ``prepare_origin`` fallback sets ``V_buf, F_buf = self.V, self.F`` —
+    i.e. the cache then *aliases* the live mesh arrays rather than owning
+    private copies.  Tier 1 only reads them, so this is currently safe, but
+    any future code that mutates ``origin_cache['V_buf']`` / ``['F_buf']``
+    would corrupt the live mesh on the fallback path.
   * **Robust face lookup** (``_find_face_buf``): unconditionally includes all
     faces created by prior insertions, not just those adjacent to the nearest
     original vertex.  Handles the case where newly inserted vertices are
@@ -183,8 +193,9 @@ Methods for the hybrid geodesic/Euclidean Bézier curves used by
 
 Init-time optimizations
 -----------------------
-  * ``_smooth_face_normals_laplacian`` reuses the pre-built
-    ``_edge_to_face`` dict instead of re-scanning all faces — ~50% faster.
+  * ``_smooth_face_normals_laplacian`` builds its sparse adjacency directly
+    from the vectorized ``_face_adj`` matrix (no dict iteration) instead of
+    re-scanning all faces — ~50% faster.
   * ``_compute_vertex_normals`` uses ``np.bincount`` instead of
     ``np.add.at`` for ~10x faster scatter-add (``add.at`` disables SIMD).
 
@@ -863,8 +874,9 @@ class GeodesicMesh:
     # On multi-million-face scans the speedup can reach 20-40% on the
     # traversal loops.
     #
-    # Safety: splines are saved as 3D positions + tangents, never as
-    # vertex indices, so reordering does not break JSON save/load.  The
+    # Safety: splines are saved as 3D positions (origin + p_a/p_b handle
+    # endpoints), never as vertex indices, so reordering does not break
+    # JSON save/load.  The
     # flag is there purely for A/B benchmarking — leave it ON by default,
     # it is essentially free on small meshes and real on large ones.
     MORTON_REORDER = True
@@ -970,6 +982,11 @@ class GeodesicMesh:
 
         self._kdtree         = KDTree(self.V)
         self._face_normals   = self._compute_face_normals()
+        # DEAD as of v2: ``_edge_to_face`` (and its builder
+        # ``_build_edge_adjacency``) is never read anywhere — normal-field
+        # smoothing now builds its adjacency from the vectorized
+        # ``_face_adj`` matrix instead.  Kept for now (removal is out of
+        # scope for the current doc pass); safe to delete both.
         self._edge_to_face   = self._build_edge_adjacency()
 
         # Pre-computed face geometry (avoids double-indexing V[F[i]] in hot loops)
@@ -1102,8 +1119,10 @@ class GeodesicMesh:
         """
         bbox_min = pts.min(axis=0)
         bbox_max = pts.max(axis=0)
-        # Add a tiny epsilon so the top-right corner doesn't overflow to
-        # 2^21.  Scale then cast to uint32 (21 bits fits comfortably).
+        # Scale into [0, 2^21 - 1] then cast to uint32 (21 bits fits
+        # comfortably).  The max corner maps to exactly ``scale`` = 2^21 - 1
+        # (since ``(pts - bbox_min) / extent`` is exactly 1.0 there), so it
+        # can never overflow into the 22nd bit — no epsilon nudge needed.
         extent = np.maximum(bbox_max - bbox_min, 1e-30)
         scale = (1 << 21) - 1
         q = ((pts - bbox_min) / extent * scale).astype(np.uint32)
@@ -1521,6 +1540,10 @@ class GeodesicMesh:
 
         Vectorized construction: all edges are computed and sorted in NumPy,
         then grouped into the dict in a single pass over sorted arrays.
+
+        DEAD as of v2: the only assignment (``self._edge_to_face`` in
+        ``__init__``) is never read.  Normal-field smoothing switched to the
+        vectorized ``_face_adj`` matrix.  Retained pending a cleanup pass.
         """
         F = self.F
         nf = len(F)
@@ -1572,8 +1595,8 @@ class GeodesicMesh:
                      C: np.ndarray) -> tuple[float, float, float]:
         """Barycentric coordinates of *p* w.r.t. triangle (A, B, C).
 
-        Single canonical implementation shared by ``get_barycentric``,
-        ``_bary_buf``, and ``get_barycentric``.
+        Single canonical implementation shared by ``get_barycentric``
+        (global mesh) and ``_bary_buf`` (work-buffer variant).
 
         The five dot products are spelled out as scalar arithmetic
         rather than ``np.dot`` on 3-vectors: ``np.dot`` carries a
@@ -2096,8 +2119,8 @@ class GeodesicMesh:
         """
         V_buf, F_buf, nv, nf = self._make_work_buffers(extra_verts=2, extra_faces=6)
         # Seed adjacency from the precomputed global table; reserve
-        # 2 × extra_faces slots so the split path can grow it in
-        # lockstep with F_buf.
+        # extra_faces (=6) extra slots so the split path can grow it in
+        # lockstep with F_buf (which is also sized nf + extra_faces).
         adj_buf = np.full((nf + 6, 3), -1, dtype=np.int32)
         adj_buf[:nf] = self._face_adj
         idx_s, nv, nf = self._add_point_buf(p_start, V_buf, F_buf, nv, nf,
