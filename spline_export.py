@@ -513,8 +513,16 @@ def _orange_span_worker(task_data):
 
     P0, H_out, H_in, P1 = ctrl
 
+    # Guard the level-1 solver exactly as the editor worker does
+    # (geo_splines._geodesic_decasteljau_worker): a solver exception on
+    # one span must degrade to a straight stub, not abort the whole
+    # export by propagating a pickled traceback through executor.map.
     degraded = False
-    path_12, was_fallback = geo.compute_endpoint_local(H_out, H_in)
+    try:
+        path_12, was_fallback = geo.compute_endpoint_local(H_out, H_in)
+    except (RuntimeError, ValueError, TypeError, IndexError) as exc:
+        log.debug("orange span: level-1 path_12 solver failed: %s", exc)
+        path_12, was_fallback = None, True
     if path_12 is None or len(path_12) < 2:
         path_12 = np.array([H_out, H_in])
         degraded = True
