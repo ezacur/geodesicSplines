@@ -111,6 +111,32 @@ def test_broken_pool_retry_uses_fresh_open_pipe():
     assert reader.recv() == ('done', span_key, False)
 
 
+def test_cancel_all_clears_result_flags():
+    """cancel_all must clear the per-span result flags too, or a stale
+    generation bleeds into the next batch: a resubmitted span whose key
+    sits in done_spans renders 'final' on its first partial polyline, and
+    a leftover degraded_spans key repaints a healthy new span red."""
+    m = _bare_manager(executor=None)
+    key = (0, 0)
+    m.dirty_spans.add(key)
+    m.done_spans.add(key)
+    m.dead_spans.add(key)
+    m.degraded_spans.add(key)
+    m.active_spans.add(key)
+    m._batch_submitted = 3
+    m._batch_done = 1
+
+    m.cancel_all()
+
+    assert not m.dirty_spans
+    assert not m.done_spans
+    assert not m.dead_spans
+    assert not m.degraded_spans
+    assert not m.active_spans
+    assert m._batch_submitted == 0
+    assert m._batch_done == 0
+
+
 def test_pipe_pairing_helper_sanity():
     """Guards the assumption the test above relies on: mp.Pipe(duplex=
     False) returns (reader, writer) and a closed reader reports closed."""

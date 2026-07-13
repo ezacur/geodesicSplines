@@ -1531,6 +1531,16 @@ class _SpanWorkManager:
         self._futures.clear()
         self._points.clear()
         self.active_spans.clear()
+        # Clear the per-span result flags too (matches _rebuild_executor).
+        # These are keyed by (spline_idx, span_idx); leaving them behind
+        # lets a stale generation bleed into the next one — a freshly
+        # submitted span whose key happens to sit in done_spans renders
+        # "final" on its first partial polyline, and a leftover
+        # degraded_spans key repaints a healthy new span red.
+        self.dirty_spans.clear()
+        self.done_spans.clear()
+        self.dead_spans.clear()
+        self.degraded_spans.clear()
         self._batch_submitted = 0
         self._batch_done = 0
 
@@ -1560,10 +1570,9 @@ class _SpanWorkManager:
         Duplicates within ``1e-12`` are treated as overwrites — defensive
         against numerical noise on midpoint subdivision.
         """
-        import bisect as _bisect
         t_list = state['t_list']
         p_list = state['p_list']
-        pos = _bisect.bisect_left(t_list, t)
+        pos = bisect.bisect_left(t_list, t)
         if pos < len(t_list) and abs(t_list[pos] - t) < 1e-12:
             p_list[pos] = point
             return
@@ -1846,6 +1855,12 @@ class GeodesicSplineApp(MidpointShooterApp):
         # by ``_recompute_spans`` and orange-worker drain; consumed by
         # ``_set_span`` / ``_set_geo_span`` to repaint in red.
         self._degraded_spans: set[SpanKey] = set()
+        # Node most recently consolidated to exact quality by
+        # ``_fire_debounce``.  Lets ``_finalize_release`` skip a redundant
+        # second exact ``_recompute_spans`` when the release-time debounce
+        # already did it; reset on every fast-preview move so a later
+        # release with no fired debounce still consolidates.
+        self._consolidated_seg = None
         # Interpolation curve: one actor per spline (keyed by spline index)
         self._interp_cache: dict[int, tuple[pv.PolyData, vtk.vtkActor]] = {}
         # Per-spline pre-allocated origin buffer + content-fingerprint
@@ -2682,6 +2697,9 @@ class GeodesicSplineApp(MidpointShooterApp):
             # Origin may have moved — stitch cache uses same id() but stale solver
             if id(seg) == self._stitch_origin_node_id:
                 self._invalidate_stitch_cache()
+            # Record the exact consolidation so a release following this
+            # debounce doesn't recompute the same spans a second time.
+            self._consolidated_seg = seg
             self._set_hud(_t("refined_exact"), 'cyan')
 
     def _finalize_release(self, seg: GeodesicSegment) -> None:
@@ -2694,10 +2712,16 @@ class GeodesicSplineApp(MidpointShooterApp):
 
         Does NOT submit geodesic workers — that is already handled by
         ``_fire_debounce`` which runs synchronously inside ``_on_release``
-        before this method.
+        before this method.  When that debounce fired for this same node
+        it already produced the exact spans (``is_preview`` was cleared,
+        so ``_recompute_spans`` took the exact branch), so we skip a
+        redundant second solve here; otherwise (release with no pending
+        debounce, e.g. a click without drag) we consolidate now.
         """
         seg.is_active = True
-        self._recompute_spans(node=seg)
+        if self._consolidated_seg is not seg:
+            self._recompute_spans(node=seg)
+        self._consolidated_seg = None
         seg.update_visuals(self.plotter)
 
         # Restore the active spline from before the drag
@@ -3147,6 +3171,12 @@ class GeodesicSplineApp(MidpointShooterApp):
             for sid in changed_splines:
                 self._recompute_spans(sid=sid)
                 self._submit_geodesic_spans(sid=sid)
+            # ``_rebuild_node_inplace`` keeps the node objects (and their
+            # ids) but moves their origins, so the stitch cache — keyed by
+            # id(last_node) — can now point a pre-built solver at the old
+            # origin.  Drop it; the full-rebuild branch above does the same
+            # via ``_clear_all_curve_caches``.
+            self._invalidate_stitch_cache()
 
         self.active_spline_idx = self._clamp_spline_idx(active)
         self._prev_active_spline_idx = self.active_spline_idx
@@ -4375,6 +4405,9 @@ class GeodesicSplineApp(MidpointShooterApp):
             super()._on_move(obj, event, pick_override=pick_result)
 
         if dragged:
+            # A fresh preview move invalidates any prior exact
+            # consolidation, so a subsequent release must recompute.
+            self._consolidated_seg = None
             # Recompute spans after the parent processed the drag geometry.
             self._recompute_spans(node=dragged)
             self._hide_curve_hover_marker()
@@ -4986,13 +5019,22 @@ class GeodesicSplineApp(MidpointShooterApp):
         if sid is None:
             sid = self.active_spline_idx
 
-        is_dragging = node is not None and node.is_dragging
-        # Visual drag style: lighter/thinner while preview, normal on consolidation
-        is_preview_drag = is_dragging and node.is_preview
+        # The cheap fast-preview render (Euclidean H_out->H_in, no exact
+        # path_12 solve, no secant pass) applies only while the drag is
+        # actively previewing — i.e. ``is_preview``.  Consolidation
+        # (``_fire_debounce`` on a mid-drag pause, or ``_on_release``)
+        # clears ``is_preview`` *before* calling this, so those paths take
+        # the exact branch even though ``is_dragging`` is still True.
+        # Gating on ``is_dragging`` instead left a mid-drag pause on the
+        # hybrid LOD while announcing "REFINED (EXACT)" — the exact solve
+        # only ever ran on release, contradicting the documented
+        # pause-to-consolidate behaviour.
+        is_preview_drag = (node is not None and node.is_dragging
+                           and node.is_preview)
         sc = self.scfg
-        res = sc.DRAG_RESOLUTION if is_dragging else sc.RESOLUTION
-        min_s = sc.DRAG_MIN_SAMPLES if is_dragging else sc.MIN_SAMPLES
-        max_s = sc.DRAG_MAX_SAMPLES if is_dragging else sc.MAX_SAMPLES
+        res = sc.DRAG_RESOLUTION if is_preview_drag else sc.RESOLUTION
+        min_s = sc.DRAG_MIN_SAMPLES if is_preview_drag else sc.MIN_SAMPLES
+        max_s = sc.DRAG_MAX_SAMPLES if is_preview_drag else sc.MAX_SAMPLES
 
         adaptive = sc.ADAPTIVE_SAMPLING
         ctrl = self._ctrl_scratch  # (4, 3) view; rows reused per span
@@ -5015,26 +5057,27 @@ class GeodesicSplineApp(MidpointShooterApp):
             # available" and fall back to the drag-style hybrid by
             # passing ``path_12=None``.
             path_12 = None
-            if not is_dragging:
+            if not is_preview_drag:
                 path_12, was_fallback = self.geo.compute_endpoint_local(
                     n0.p_b, n1.p_a)
                 if path_12 is not None and len(path_12) < 2:
                     path_12 = None
-                # Track fallbacks only on consolidation.  During drag the
-                # hybrid skips the solver entirely so there is nothing to flag.
+                # Track fallbacks only on consolidation.  During the fast
+                # preview the hybrid skips the solver entirely so there is
+                # nothing to flag.
                 self._mark_span_degraded((sid, i), was_fallback)
             pts = self.geo.hybrid_de_casteljau_curve(
-                ctrl, n0.path_b, n1.path_a, n, fast=is_dragging,
+                ctrl, n0.path_b, n1.path_a, n, fast=is_preview_drag,
                 t_vals=t_vals, path_12=path_12)
-            # Phase 2 refinement: only when not dragging (no time pressure)
-            if adaptive and not is_dragging and len(pts) >= 3:
+            # Phase 2 refinement: only on consolidation (no time pressure)
+            if adaptive and not is_preview_drag and len(pts) >= 3:
                 t2 = GeodesicMesh.refine_t_vals_by_curvature(pts, t_vals)
                 if len(t2) > len(t_vals):
                     pts = self.geo.hybrid_de_casteljau_curve(
                         ctrl, n0.path_b, n1.path_a, len(t2),
                         t_vals=t2, path_12=path_12)
             projected = self.geo.project_smooth_batch(pts)
-            if not is_dragging:
+            if not is_preview_drag:
                 projected = self.geo.subdivide_secant_chords(
                     projected, tol=self._secant_tol,
                     max_depth=self.scfg.SECANT_MAX_DEPTH)
@@ -6160,16 +6203,27 @@ class GeodesicSplineApp(MidpointShooterApp):
             self.plotter.render()
 
     def _apply_worker_fallbacks(self) -> None:
-        """Merges ``_work_mgr.degraded_spans`` into the app-level set.
+        """Reconciles the app-level ``_degraded_spans`` with the workers.
 
-        Workers only set the flag inside their ``'done'`` payload, which
-        is delivered alongside ``dirty_spans`` — no separate
-        synchronisation is needed.
+        For every span that emitted a ``'done'`` this tick, mirror the
+        worker's final verdict: mark it degraded when a solver hit a
+        straight-line fallback, and — crucially — *clear* it when the
+        worker finished clean.  The old code merged only ``True`` flags,
+        so a span painted red once stayed red forever: rebuilding it
+        (``R``) with a clean result never propagated the clear, because
+        the manager's clean-``done`` ``discard`` only emptied its own
+        set (which the merge then skipped via an early return).  Runs
+        before ``_apply_orange_progress`` so the repaint below reads the
+        reconciled flag.  ``_mark_span_degraded`` is a no-op when the
+        state is unchanged, so re-running each tick costs nothing and
+        never re-flashes the HUD.
         """
-        if not self._work_mgr.degraded_spans:
+        done = self._work_mgr.done_spans
+        if not done:
             return
-        for span_key in list(self._work_mgr.degraded_spans):
-            self._mark_span_degraded(span_key, True)
+        degraded = self._work_mgr.degraded_spans
+        for span_key in done:
+            self._mark_span_degraded(span_key, span_key in degraded)
         self._work_mgr.degraded_spans.clear()
 
     def _apply_shoot_truncation_hud(self) -> None:
@@ -6259,14 +6313,18 @@ class GeodesicSplineApp(MidpointShooterApp):
         rendered = False
         for span_key in dirty_orange:
             sid, i = span_key
+            # Read + discard the done-flag up front (not after the guards
+            # below): a done span that is out of range or has no points
+            # still finished, and leaving its key in done_spans leaks it
+            # across every future tick (it would re-enter
+            # _apply_worker_fallbacks forever).
+            is_done = span_key in self._work_mgr.done_spans
+            self._work_mgr.done_spans.discard(span_key)
             if sid >= len(self.splines) or i >= self._span_count(sid):
                 continue
             pts = self._work_mgr.get_points(span_key)
             if pts is None:
                 continue
-            is_done = span_key in self._work_mgr.done_spans
-            if is_done:
-                self._work_mgr.done_spans.discard(span_key)
             self._set_geo_span(*span_key, pts, computing=not is_done)
             rendered = True
         return rendered
@@ -6907,6 +6965,10 @@ class GeodesicSplineApp(MidpointShooterApp):
         self._interp_result_cache.clear()
         self._span_drag_state.clear()
         self._degraded_spans.clear()
+        # The stitch cache is keyed by id(last_node); after a full replace
+        # a recycled id could match a node built around a different origin,
+        # so drop it here.
+        self._invalidate_stitch_cache()
         # All curve actors gone — hover cache must be rebuilt next time.
         self._hover_curve_dirty = True
         self._hover_curve_items_cached = []
