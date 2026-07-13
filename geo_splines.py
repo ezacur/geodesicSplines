@@ -1440,9 +1440,19 @@ class _SpanWorkManager:
                 **worker_kwargs)
         except BrokenProcessPool:
             self._rebuild_executor()
-            # ``_rebuild_executor`` cleared self._readers / self._points,
-            # so the bookkeeping we set up just above is gone too.  Re-
-            # establish for this span before the retry.
+            # ``_rebuild_executor`` closed EVERY reader (including the one
+            # created above) and cleared self._readers / self._points.
+            # The original (reader, writer) pair is therefore dead: its
+            # read-end is closed, so a retried worker writing to the old
+            # ``writer`` would surface only as an ``OSError`` on the next
+            # ``drain_queue`` poll — killing the very span we are trying
+            # to recover.  Close the orphaned write-end and mint a FRESH
+            # pipe for the retry.
+            try:
+                writer.close()
+            except OSError:
+                pass
+            reader, writer = mp.Pipe(duplex=False)
             self._readers[span_key] = reader
             self._points[span_key] = state
             try:
