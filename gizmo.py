@@ -587,10 +587,18 @@ class SegmentData:
             self.origin, -tangent_3d, new_magnitude,
             self.face_idx, fast_mode=fast)
 
+        # Mirror ``update_from_p``: a failed shoot must null the
+        # endpoint too, or the model holds ``path_b is None`` with a
+        # stale ``p_b`` — an invisible but hoverable/draggable marker
+        # that also leaks into save/undo snapshots.
         if self.path_b is not None and len(self.path_b) > 1:
             self.p_b = np.array(self.path_b[-1], dtype=float)
+        else:
+            self.p_b = None
         if self.path_a is not None and len(self.path_a) > 1:
             self.p_a = np.array(self.path_a[-1], dtype=float)
+        else:
+            self.p_a = None
 
         # Keep h_length consistent with the new magnitude.  We
         # deliberately do NOT call ``update_local_v`` here — that
@@ -939,7 +947,12 @@ class GeodesicSegment(SegmentData):
             self._handle_pd[tag] = pd
             self._handle_act[tag] = act
         else:
-            pd.points = np.ascontiguousarray(buf); pd.Modified()
+            # ``buf.copy()``, NOT ``ascontiguousarray(buf)``: the latter
+            # returns the SAME array when already contiguous, and pyvista
+            # wraps it zero-copy — the p/a/b polydata would then all
+            # alias one shared buffer and every marker would render at
+            # the last-written handle's position.
+            pd.points = buf.copy(); pd.Modified()
             prop = act.GetProperty()
             prop.SetColor(_color_rgb(actual_col))
             prop.SetPointSize(sz)
@@ -1001,7 +1014,11 @@ class GeodesicSegment(SegmentData):
         # input array from shape (X,3) into shape (Y,3)``.
         na = len(self.path_a) if self.path_a is not None and len(self.path_a) > 1 else 0
         nb_total = len(self.path_b) if self.path_b is not None and len(self.path_b) > 1 else 0
-        nb = max(0, nb_total - 1)  # path_b[1:] skips the shared origin
+        # ``path_b[1:]`` skips the shared origin — but only when
+        # ``path_a`` actually supplied it.  When path_a is missing
+        # (shoot failed near a boundary) the full path_b must be kept
+        # or the rendered line starts one segment away from the origin.
+        nb = max(0, nb_total - 1) if na > 0 else nb_total
         needed = na + nb
         if needed > self._line_buf.shape[0]:
             self._line_buf = np.empty((needed * 2, 3), dtype=float)
@@ -1011,7 +1028,7 @@ class GeodesicSegment(SegmentData):
             self._line_buf[:na] = self.path_a[::-1]
             n = na
         if nb > 0 and self.path_b is not None:
-            self._line_buf[n:n + nb] = self.path_b[1:]
+            self._line_buf[n:n + nb] = self.path_b[1:] if na > 0 else self.path_b
             n += nb
 
         # Hover bump also raises the tangent line's z-buffer priority

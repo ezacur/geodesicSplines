@@ -94,7 +94,8 @@ bottleneck".
 ### Float32 for `V` / `F` in shared memory
 
 **Proposed**: store `V_c` (vertices) as `float32` in the shared
-memory blocks at [_SpanWorkManager.__init__](../geo_splines.py#L674-L685)
+memory blocks at [_SpanWorkManager.__init__](../span_workers.py#L621)
+(the manager lived in ``geo_splines.py`` when this was proposed)
 to halve memory bandwidth and double L1/L2 effective cache.
 
 **Rejected because**:
@@ -354,10 +355,11 @@ inside the C++ solver), via `psutil` or a SIGTERM equivalent.
 - The `potpourri3d` solver does not hang in practice — it raises an
   exception or returns `None` on degenerate input.  No reported case
   of a worker stuck.
-- [`drain_queue`](../geo_splines.py#L848) already detects worker
+- [`drain_queue`](../span_workers.py#L1090) already detects worker
   death (`BrokenPipeError` / `EOFError`) and the
-  [recently-added](../geo_splines.py#L955) per-phase shutdown
-  hardens the cleanup path.
+  [per-phase shutdown](../span_workers.py#L1233)
+  hardens the cleanup path.  (Both lived in ``geo_splines.py`` when
+  this was proposed; they moved to ``span_workers.py``.)
 - A watchdog adds cross-platform `psutil` plumbing, false-positive
   risk (a slow span is not a hung span), and per-pipe last-seen
   state.  Re-open with concrete logs if a real hang is seen.
@@ -366,7 +368,8 @@ inside the C++ solver), via `psutil` or a SIGTERM equivalent.
 
 ### Make the `submit(int, 0)` worker warmup async to avoid "blocking the UI"
 
-**Proposed**: in [`_SpanWorkManager.__init__`](../geo_splines.py#L1095),
+**Proposed**: in [`_SpanWorkManager.__init__`](../span_workers.py#L621)
+(then in ``geo_splines.py``),
 the loop ``for _ in range(max_workers): self._executor.submit(int, 0)``
 forces all worker subprocesses to spawn during construction.  Framed
 as blocking the GUI for 1-2 seconds on Windows while ``spawn`` brings
@@ -385,7 +388,7 @@ secondary thread.
   at the moment of the first orange-curve computation (where they
   expect interactive latency).  That trade-off is intentional —
   see the existing comments at
-  [geo_splines.py:1091-1094](../geo_splines.py#L1091-L1094).
+  [span_workers.py:692-698](../span_workers.py#L692-L698).
 - "Async pool on a secondary thread" is what Python's executor
   *already does internally* — adding another layer would be
   redundant.
@@ -408,10 +411,12 @@ until reboot.
   vanishes — including via segfault — Windows releases the kernel
   object automatically.  No leak across reboots.
 - On Linux (`/dev/shm`) the leak does happen; the
-  [hardened shutdown](../geo_splines.py#L935) covers normal exits and
-  KeyboardInterrupt, plus the existing `weakref.finalize` covers
-  interpreter teardown.  A hard segfault still leaks on Linux but
-  that requires a Monitor process (overkill).
+  [hardened shutdown](../span_workers.py#L1233) covers normal exits and
+  KeyboardInterrupt, plus the `weakref.finalize` safety net covers
+  garbage collection and interpreter teardown (since 2026-07 it
+  receives the executor + shm blocks directly, so it fires usefully
+  even when the manager object is already dead).  A hard segfault
+  still leaks on Linux but that requires a Monitor process (overkill).
 - `mmap` + `tempfile` has its own quirks (Windows file locking;
   POSIX file descriptor inheritance with spawn vs fork) that would
   trade one rare-edge-case leak for several common-case headaches.

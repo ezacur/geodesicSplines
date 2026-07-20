@@ -258,8 +258,8 @@ of the chosen layer to disk.  Three output formats:
 
 | Output | Flag | Contents |
 |---|---|---|
-| CSV (default, stdout) | -- | One ``x, y, z`` per line.  Single ``NaN, NaN, NaN`` line breaks the polyline between splines; double ``NaN`` separates landmark records. |
-| Wavefront OBJ | `--obj` | One vertex per sample, one ``f`` line per consecutive pair.  All splines concatenated into a single line strip per spline. |
+| CSV (default, stdout) | -- | One ``x, y, z`` per line.  A ``NaN, NaN, NaN`` line breaks the polyline between splines, and at any gap left by a span that could not be computed (missing handles).  No landmark records. |
+| Wavefront OBJ | `--obj` | One ``g`` group per spline, one vertex per sample, one ``l`` (polyline) record per span.  Consecutive spans share their endpoint, so intact splines read as continuous curves; skipped spans leave a real gap. |
 | Binary legacy VTK | `--vtk` | UnstructuredGrid with ``VTK_LINE`` (cell type 3) for span samples and ``VTK_VERTEX`` (cell type 1) for single-node landmarks. |
 
 | Layer | Flag | Typical time |
@@ -293,6 +293,8 @@ geodesics.py           Geodesic algorithms + Numba kernels
 gizmo.py               SegmentData + GeodesicSegment widget
 geo_shoot.py           MidpointShooterApp + SurfaceCursor
 geo_splines.py         GeodesicSplineApp (main application)
+span_workers.py        Background orange-worker pool (_SpanWorkManager)
+session_io.py          Stdlib-only session-JSON validation
 spline_export.py       CLI curve exporter
 userManual.md          User manual (English)
 manualDeUsuario.md     Manual de usuario (español)

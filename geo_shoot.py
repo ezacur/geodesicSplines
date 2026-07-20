@@ -1293,16 +1293,33 @@ class MidpointShooterApp:
         if self._hover_n == 0:
             return None
         pts_2d = self._to_screen_batch(self._hover_pts_3d[:self._hover_n])
-        best, best_sq = _hover_argmin_sq(
-            pts_2d, self._hover_n, float(x), float(y))
+        if allowed_tags is None:
+            best, best_sq = _hover_argmin_sq(
+                pts_2d, self._hover_n, float(x), float(y))
+        else:
+            # Filter BEFORE the argmin: an allowed marker within pick
+            # tolerance must not be shadowed by a nearer DISALLOWED one
+            # (e.g. an A/B arrow tip sub-pixel closer than the P marker
+            # it overlaps at minimum handle magnitude) — filtering the
+            # single winner afterwards returned None and the caller
+            # fell through to its empty-surface behaviour.
+            d2 = ((pts_2d[:self._hover_n, 0] - float(x)) ** 2
+                  + (pts_2d[:self._hover_n, 1] - float(y)) ** 2)
+            allowed = np.fromiter(
+                (tag in allowed_tags
+                 for _, tag in self._hover_tags[:self._hover_n]),
+                dtype=bool, count=self._hover_n)
+            if not allowed.any():
+                return None
+            d2[~allowed] = np.inf
+            best = int(np.argmin(d2))
+            best_sq = float(d2[best])
         if best_sq >= self.cfg.PICK_TOLERANCE_SQ:
             return None
         # Occlusion check: skip if hidden by mesh
         if self._is_marker_occluded(self._hover_pts_3d[best]):
             return None
         seg, tag = self._hover_tags[best]
-        if allowed_tags is not None and tag not in allowed_tags:
-            return None
         return seg, tag
 
     def _try_hit_marker(self, x: int, y: int) -> bool:
@@ -1608,7 +1625,13 @@ class MidpointShooterApp:
             dl, cb = self.state.pending_debounces[key]
             if now >= dl:
                 del self.state.pending_debounces[key]
-                cb()
+                try:
+                    cb()
+                except Exception:  # noqa: BLE001 — VTK observer must not propagate
+                    # Same invariant as the press/move/release handlers;
+                    # per-callback so one failing debounce doesn't skip
+                    # the remaining expired tasks or the batched render.
+                    log.exception("debounce callback %r failed", key)
                 fired = True
         if fired:
             self.plotter.render()
@@ -1623,8 +1646,19 @@ class MidpointShooterApp:
             q, cid = self.state.last_drag_q, self.state.last_drag_cid
             self.state.active_seg.is_preview = False
 
+            # Same dispatch as the live-preview path in ``_on_move``:
+            # Shift+drag of A/B is magnitude-only and must stay so on
+            # consolidation — ``update_from_a/b`` here would re-aim the
+            # tangent at the cursor, snapping the direction the user
+            # explicitly froze by holding Shift.  (The spline subclass
+            # carries the same branch in its ``_fire_debounce``.)
+            shift_held = bool(
+                self.plotter.iren.interactor.GetShiftKey())
             if self.state.drag_marker == 'p':
                 self.state.active_seg.update_from_p(q, cid, self.geo, exact=True)
+            elif self.state.drag_marker in ('a', 'b') and shift_held:
+                self.state.active_seg.update_magnitude(
+                    q, self.state.drag_marker, self.geo, exact=True)
             elif self.state.drag_marker == 'a':
                 self.state.active_seg.update_from_a(q, self.geo, exact=True)
             elif self.state.drag_marker == 'b':
@@ -1665,6 +1699,28 @@ class MidpointShooterApp:
             self._hover_dirty = True
             self._unlock_camera()
             self.plotter.render()
+
+    def _abort_active_drag(self) -> None:
+        """Terminates an in-flight marker drag WITHOUT consolidation.
+
+        Structural mutations (Backspace, session load, undo full
+        rebuild) can remove or replace the dragged node mid-gesture.
+        Dropping ``active_seg`` alone is not enough: the eventual mouse
+        release would hit ``_on_release``'s early return — skipping
+        ``_unlock_camera`` and leaving the viewport frozen — and a
+        continuing drag would keep re-creating actors for a node that
+        no longer belongs to any spline (a ghost gizmo nothing can
+        select or clean up).  No-op when no drag is in flight.
+        """
+        seg = self.state.active_seg
+        if seg is None:
+            return
+        seg.is_preview = False
+        seg.is_dragging = False
+        self.state.active_seg = None
+        self.state.drag_marker = None
+        self.state.pending_debounces.pop('drag_exact', None)
+        self._unlock_camera()
 
     def _on_leave_canvas(self, obj, event) -> None:
         """Synthetic release when the cursor leaves the render window.

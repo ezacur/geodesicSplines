@@ -645,14 +645,18 @@ class _SpanWorkManager:
         # Safety net: if the parent crashes before ``shutdown()`` runs,
         # atexit still fires during interpreter teardown and releases the
         # /dev/shm blocks (on POSIX) so they don't leak across sessions.
-        # ``shutdown()`` is idempotent so calling it twice is harmless.
-        # We register via ``weakref.finalize`` so a per-instance handle
-        # is recorded — multiple managers in one interpreter (rare, but
-        # possible in tests) do not share a single ``atexit`` slot, and
-        # a manager that is garbage-collected before interpreter exit
-        # releases its handler eagerly.
-        self._finalizer = weakref.finalize(self, _SpanWorkManager._cleanup_at_exit,
-                                           weakref.ref(self))
+        # The callback receives the RESOURCES directly, not a weakref to
+        # ``self``: ``finalize`` fires after its referent is already
+        # dead, so a ``weak_self()``-style callback always resolved to
+        # None and cleaned nothing — a manager dropped without an
+        # explicit ``shutdown()`` leaked its executor and shm blocks
+        # for the process lifetime.  Holding the resources in the
+        # finalizer's args does not pin the manager (no back-refs).
+        # ``shutdown()`` detaches this finalizer, and
+        # ``_rebuild_executor`` re-registers it for the fresh pool.
+        self._finalizer = weakref.finalize(
+            self, _SpanWorkManager._release_resources,
+            self._executor, self._shm_V, self._shm_F)
 
         # --- Orange (fully geodesic) tracking ---
         # ``_points[key]`` is a per-span state dict with three keys:
@@ -760,16 +764,50 @@ class _SpanWorkManager:
         self._batch_done = 0
 
         self._executor = self._build_executor()
+        # The safety-net finalizer captured the OLD executor — swap it
+        # for one that covers the fresh pool (the old finalizer would
+        # re-shutdown an already-dead executor and miss the new one).
+        finalizer = getattr(self, '_finalizer', None)
+        if finalizer is not None:
+            try:
+                finalizer.detach()
+            except Exception as exc:  # noqa: BLE001
+                log.debug("finalizer.detach on rebuild: %s", exc)
+        self._finalizer = weakref.finalize(
+            self, _SpanWorkManager._release_resources,
+            self._executor, self._shm_V, self._shm_F)
 
     @staticmethod
-    def _cleanup_at_exit(weak_self) -> None:
-        """``weakref.finalize`` callback — calls ``shutdown`` if alive."""
-        target = weak_self()
-        if target is not None:
+    def _release_resources(executor, shm_v, shm_f) -> None:
+        """``weakref.finalize`` callback — best-effort resource release.
+
+        Fires when the manager is garbage-collected without an explicit
+        ``shutdown()``, or at interpreter exit.  Mirrors ``shutdown``'s
+        executor + shm phases (each independently guarded); the
+        per-span pipe bookkeeping needs no cleanup here — the pipes die
+        with the process.
+        """
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
+        except Exception as exc:  # noqa: BLE001 — teardown is best-effort
+            log.debug("finalize executor.shutdown: %s", exc)
+        for proc in (getattr(executor, '_processes', None) or {}).values():
             try:
-                target.shutdown()
-            except Exception as exc:  # noqa: BLE001 — interpreter teardown is best-effort
-                log.debug("worker manager finalize: %s", exc)
+                if proc.is_alive():
+                    proc.kill()
+            except (AttributeError, OSError, ValueError) as exc:
+                log.debug("finalize force-kill skipped: %s", exc)
+        for shm_block in (shm_v, shm_f):
+            try:
+                shm_block.close()
+            except Exception as exc:  # noqa: BLE001
+                log.debug("finalize shm.close: %s", exc)
+            try:
+                shm_block.unlink()
+            except FileNotFoundError:
+                pass  # already unlinked
+            except Exception as exc:  # noqa: BLE001
+                log.debug("finalize shm.unlink: %s", exc)
 
     # --- Fully geodesic (orange) ---
 
@@ -824,6 +862,11 @@ class _SpanWorkManager:
         class docstring for the full rationale.
         """
         self.cancel_span(span_key)
+        # A resubmission revives the span: a stale dead-flag from a
+        # previous give-up (double-BrokenProcessPool) would otherwise
+        # exclude the fresh worker's first results (``dirty - dead``)
+        # and hide its actor one tick later.
+        self.dead_spans.discard(span_key)
         reader, writer = mp.Pipe(duplex=False)
         self._readers[span_key] = reader
 
@@ -940,6 +983,10 @@ class _SpanWorkManager:
         self._points.pop(span_key, None)
         self.done_spans.discard(span_key)
         self.active_spans.discard(span_key)
+        # A cancelled span no longer needs its "worker died — clear the
+        # actor" signal; leaving it would hide the actor of whatever
+        # replaces this span next.
+        self.dead_spans.discard(span_key)
         if was_active and self._batch_submitted > 0:
             self._batch_submitted -= 1
 
@@ -972,6 +1019,38 @@ class _SpanWorkManager:
         self.degraded_spans.clear()
         self._batch_submitted = 0
         self._batch_done = 0
+
+    def shift_spline_keys(self, removed_sid: int) -> set[int]:
+        """Renumbers per-span bookkeeping after the app removed spline
+        *removed_sid* from its spline list.
+
+        Every span with live pipe/point state at or after the removed
+        index is **cancelled** rather than re-keyed: worker messages
+        embed the OLD key inside the tuple, so results in flight cannot
+        be safely renumbered mid-stream.  The result-flag sets (pure
+        parent-side state, no embedded-key hazard) are shifted in
+        place; flags of cancelled spans are dropped with them.
+
+        Returns the set of OLD spline indices that had in-flight
+        workers — the caller resubmits those splines under their new
+        index (``old_sid - 1``).
+        """
+        affected = {k[0] for k in self.active_spans if k[0] >= removed_sid}
+        stale = {k for k in (set(self._readers) | set(self._futures)
+                             | set(self._points) | self.active_spans)
+                 if k[0] >= removed_sid}
+        for k in stale:
+            self.cancel_span(k)
+
+        def _shift(key: SpanKey) -> SpanKey:
+            return (key[0] - 1, key[1]) if key[0] > removed_sid else key
+
+        for name in ('dirty_spans', 'done_spans', 'degraded_spans',
+                     'dead_spans'):
+            old = getattr(self, name)
+            setattr(self, name, {_shift(k) for k in old
+                                 if k[0] != removed_sid and k not in stale})
+        return affected
 
     def progress(self) -> tuple[int, int]:
         """Returns ``(done, total)`` for the orange progress HUD.

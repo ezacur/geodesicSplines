@@ -32,14 +32,16 @@ their measurements in [REJECTED_SUGGESTIONS.md](REJECTED_SUGGESTIONS.md).
 
 ## Module Layout
 
-The system is split into five modules with clear responsibilities:
+The system is split into seven modules with clear responsibilities:
 
 | Module | Role |
 |---|---|
 | `geodesics.py` | Geodesic algorithms: shooting, endpoint solving, topology insertion, surface projection, Numba JIT kernels |
 | `gizmo.py` | `SegmentData` (pure geometry) + `GeodesicSegment` (VTK rendering) for interactive ray-pair widgets |
 | `geo_shoot.py` | `MidpointShooterApp` base app: plotter, picking, cursor, debounce timer, drag lifecycle |
-| `geo_splines.py` | `GeodesicSplineApp`: multi-node splines, three curve layers, background workers, save/load, CLI |
+| `geo_splines.py` | `GeodesicSplineApp`: multi-node splines, three curve layers, save/load, CLI |
+| `span_workers.py` | Background orange-worker pool: `_SpanWorkManager`, shared-memory mesh replicas, the three-phase worker pipeline |
+| `session_io.py` | Stdlib-only session-JSON validation, shared by the editor and the CLI exporter |
 | `spline_export.py` | Command-line curve exporter (CSV / OBJ / VTK) |
 
 ### Class diagram
@@ -221,7 +223,7 @@ projected to the surface, not points on the cascade).
 | **2 — Cascade densification** | For every consecutive sample pair whose chord deviates from the true curve beyond `ORANGE_SUBDIV_TOL_FACTOR × mean_edge`, insert a fresh cascade evaluation at the midpoint t. Recursive up to `ORANGE_SUBDIV_MAX_DEPTH`. Each insertion is sent immediately, so the curve refines progressively in problem regions. | More `('point', span_key, t, point)` messages, t-sorted on the parent via bisect. |
 | **3 — Geodesic chord-bridging** | Connect every consecutive sample pair with an exact mesh geodesic via `short_geodesic` (fast path: adjacent triangles, ~5 µs) or `compute_endpoint_local` (fallback, ~25 ms). Result polyline hugs the surface even between samples — no straight 3-D chords cutting through ridges. | One `('chord_geo', span_key, polyline)` message; replaces the t-sorted chord polyline as the rendering source. |
 
-The three phases map 1:1 to the worker helpers in `geo_splines.py`:
+The three phases map 1:1 to the worker helpers in `span_workers.py`:
 `_phase1_canonical`, `_phase2_densify`, `_phase3_chord_bridge`,
 orchestrated by `_geodesic_decasteljau_worker`.
 
@@ -230,15 +232,16 @@ Two deviation criteria for Phase 2 (selectable via
 
 | Mode | Cost per pair | Decision rule |
 |---|---|---|
-| `'cascade'` (default) | One full cascade evaluation per pair (~75 ms) | Split if `‖chord_midpoint − cascade_eval(t_mid)‖ > tol` — measures deviation from the *true* curve.  Always pays the cascade cost even on pairs that won't split. |
-| `'surface'` | One batched `project_smooth_batch` call (~µs per pair) + cascade evaluation only on pairs flagged for splitting | Split if `‖chord_midpoint − project(chord_midpoint)‖ > tol` — only catches mesh-piercing chords, but cheap.  Inserted point is still the cascade evaluation, so geometric quality is identical between modes; only the *decision* of whether to split differs. |
+| `'surface'` (default) | One batched `project_smooth_batch` call (~µs per pair) + cascade evaluation only on pairs flagged for splitting | Split if `‖chord_midpoint − project(chord_midpoint)‖ > tol` — only catches mesh-piercing chords, but cheap.  Inserted point is still the cascade evaluation, so geometric quality is identical between modes; only the *decision* of whether to split differs. |
+| `'cascade'` | One full cascade evaluation per pair (~75 ms) | Split if `‖chord_midpoint − cascade_eval(t_mid)‖ > tol` — measures deviation from the *true* curve.  Always pays the cascade cost even on pairs that won't split. |
 
-`'cascade'` is the honest metric (the curve is the truth) and is the
-default.  `'surface'` exists as a faster fallback for users with
-many splines on dense meshes who find `'cascade'` too slow.  Disable
-chord-bridging entirely with `ORANGE_CHORD_BRIDGING = False` if you
-want straight chords between samples (rarely useful, kept as an
-escape hatch).
+`'surface'` is the shipped default (`SplineConfig.ORANGE_DEVIATION_MODE
+= 'surface'`) — cheap enough to run on every span without hurting
+worker throughput.  `'cascade'` is the honest metric (the curve is the
+truth): switch to it when chasing maximum fidelity and the extra
+per-pair cascade cost is acceptable.  Disable chord-bridging entirely
+with `ORANGE_CHORD_BRIDGING = False` if you want straight chords
+between samples (rarely useful, kept as an escape hatch).
 
 #### `short_geodesic` — fast path for adjacent triangles
 
@@ -276,9 +279,17 @@ The cached orange polyline (post-phase-3) is the rendering source of
 truth.  When `EXPORT_VTK_SAMPLES >= GEO_SAMPLES` and no workers are
 in flight, the `v` key reuses those polylines verbatim — the export
 is bit-for-bit identical to what is on screen, with no recomputation.
-Lower export sample counts trigger a fresh `compute_orange` with no
-densification (useful for ultra-light exports of coarse landmark
-curves; the CLI `spline_export.py` does the same).
+
+Lower export sample counts (including the shipped default,
+`EXPORT_VTK_SAMPLES = 20` < `GEO_SAMPLES = 33`) trigger a fresh
+`compute_orange` (useful for ultra-light exports of coarse landmark
+curves; the CLI `spline_export.py` does the same).  Note the fresh
+path runs **phase 1 only** plus a legacy `subdivide_secant_chords`
+post-pass — no phase-2 densification, no phase-3 chord-bridging — so
+its output can deviate from the rendered curve wherever a chord
+crosses a ridge (the inserted secant midpoints are surface
+projections, not cascade evaluations).  Raise `EXPORT_VTK_SAMPLES`
+to ≥ `GEO_SAMPLES` when the export must match the screen exactly.
 
 #### Progress feedback
 
@@ -545,12 +556,13 @@ sometimes triggers solver degeneracy, and is not recommended.
 The orange worker runs in background processes so this does not
 block the UI; the visible curve just appears a few seconds later.
 
-**Used by.**  `ORANGE_SUBMESH_SUBDIV = 1` in `SplineConfig` (default)
-threads `submesh_subdiv=1` through every `compute_endpoint_local`
-call inside the orange worker AND the didactic scaffold (so the
-collapse point still lands exactly on the rendered curve).  Blue
-consolidation and handle drag stay at `submesh_subdiv=0` for
-latency.
+**Used by.**  `SplineConfig.ORANGE_SUBMESH_SUBDIV` threads the level
+through every `compute_endpoint_local` call inside the orange worker
+AND the didactic scaffold (so the collapse point still lands exactly
+on the rendered curve).  The shipped default is **0** (off) — set it
+to 1 to trade worker latency for the smoother discrete geodesic
+described above.  Blue consolidation and handle drag always stay at
+`submesh_subdiv=0` for latency.
 
 #### Projected-Line Pre-filter
 
@@ -1154,8 +1166,10 @@ noise into vertex-normal interpolation. The smoothing pipeline:
 
 1. **Raw face normals** -- geometric cross product. Used by the shooting
    inner loop for exact ray-edge math.
-2. **Smoothed face normals** -- Laplacian-smoothed (5 iterations). Two
-   weighting strategies selectable via `COTANGENT_WEIGHTS`:
+2. **Smoothed face normals** -- Laplacian-smoothed (2 iterations with
+   the default cotangent weights, 5 with uniform — the cotangent
+   operator converges faster per step). Two weighting strategies
+   selectable via `COTANGENT_WEIGHTS`:
    - **Uniform** (default off): each neighbor has equal weight.
    - **Cotangent** (default on): classical Pinkall-Polthier weights --
      for each shared edge, the weight is `½ · (cot α + cot β)` where
@@ -1252,12 +1266,17 @@ large splines.
 
 ### Architecture
 
-Before every mutation (node add, insert, delete, close loop, break, drag,
+Before every mutation (node add, insert, delete, close loop, break,
 load), a lightweight snapshot of the entire spline state is pushed onto
-`_undo_stack`. Each snapshot stores the **v2 schema** — three literal
-3-D points per node (`origin`, `p_a`, `p_b`) plus per-spline `closed`
-flags and the active spline index — the same representation as the JSON
-save format. Typical size: ~96 bytes per node, ~10 KB for 100 nodes.
+`_undo_stack`. Drags are special-cased: the snapshot is *captured* at
+marker-press time but only *committed* to the stack on the first actual
+drag movement (`_commit_pending_drag_undo`) — a plain click on a marker
+(spline switching, accidental clicks) mutates nothing, so it no longer
+spends an undo slot or clears the redo stack. Each snapshot stores the
+**v2 schema** — three literal 3-D points per node (`origin`, `p_a`,
+`p_b`) plus per-spline `closed` flags and the active spline index — the
+same representation as the JSON save format. Typical size: ~96 bytes
+per node, ~10 KB for 100 nodes.
 
 ### Differential restore
 
@@ -1382,7 +1401,7 @@ equivalent to incrementing a generation, and the previous worker's
 `BrokenPipeError` is equivalent to discarding any result that carries
 the old generation. The full rationale (race windows, key reuse,
 cross-batch isolation) is documented in the docstring of
-`_SpanWorkManager` in `geo_splines.py`.
+`_SpanWorkManager` in `span_workers.py`.
 
 ### Debounce Pattern
 

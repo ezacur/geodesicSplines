@@ -67,7 +67,15 @@ def _make_closed_3node_app():
     wrap_actor_g = object()
     app._span_cache = {(0, 0): (None, object()), (0, 2): (None, wrap_actor)}
     app._geo_span_cache = {(0, 2): (None, wrap_actor_g)}
+    app._span_drag_state = {}
+    app._degraded_spans = set()
     app._hover_dirty = False
+    # ``_on_backspace`` aborts any in-flight drag before mutating —
+    # the fake app carries the (idle) drag state it inspects.
+    app.state = types.SimpleNamespace(
+        active_seg=None, drag_marker=None,
+        hover_seg=None, hover_marker=None,
+        pending_hover_revert_seg=None, pending_debounces={})
     app._wrap_actors = (wrap_actor, wrap_actor_g)
 
     # Stub the heavy collaborators the closed-Backspace path calls.
@@ -109,9 +117,9 @@ def test_backspace_open_spline_still_pops():
     # Extra stubs the open pop-path touches.
     popped = app.splines[0][-1]
     app.segments = set()
-    app.state = types.SimpleNamespace(
-        hover_seg=None, hover_marker=None,
-        pending_hover_revert_seg=None, pending_debounces={})
+    app._hover_curve_dirty = False
+    app._invalidate_stitch_cache = types.MethodType(
+        lambda self, *a, **k: None, app)
     popped.clear_actors = types.MethodType(lambda self, p: None, popped)
 
     app._on_backspace()

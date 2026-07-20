@@ -137,6 +137,81 @@ def test_cancel_all_clears_result_flags():
     assert m._batch_done == 0
 
 
+def test_cancel_span_discards_dead_flag():
+    """A cancelled span's 'worker died — clear the actor' signal is
+    obsolete; leaving it hid the actor of whatever replaced the span."""
+    m = _bare_manager(executor=None)
+    key = (0, 0)
+    reader, writer = mp.Pipe(duplex=False)
+    m._readers[key] = reader
+    m.dead_spans.add(key)
+
+    m.cancel_span(key)
+
+    assert key not in m.dead_spans
+    writer.close()
+
+
+def test_shift_spline_keys_renumbers_and_cancels():
+    """After the app pops spline 1, the manager must cancel in-flight
+    spans of splines >= 1 (their pipe messages embed the OLD key) and
+    renumber the parent-side flag sets."""
+    m = _bare_manager(executor=None)
+    live_reader, live_writer = mp.Pipe(duplex=False)
+    m._readers[(2, 0)] = live_reader          # in-flight span of spline 2
+    m.active_spans.add((2, 0))
+    m._batch_submitted = 1
+    # Flags across all three splines.
+    m.done_spans.update({(0, 1), (2, 1)})
+    m.degraded_spans.update({(1, 0), (2, 1)})
+    m.dirty_spans.add((0, 0))
+    m.dead_spans.add((2, 2))
+
+    affected = m.shift_spline_keys(1)
+
+    assert affected == {2}                     # caller resubmits new sid 1
+    assert (2, 0) not in m._readers and live_reader.closed
+    assert not m.active_spans
+    # Spline 0 untouched; spline 1's flags dropped; spline 2 shifted → 1.
+    assert m.done_spans == {(0, 1), (1, 1)}
+    assert m.degraded_spans == {(1, 1)}
+    assert m.dirty_spans == {(0, 0)}
+    assert m.dead_spans == {(1, 2)}
+    live_writer.close()
+
+
+def test_release_resources_shuts_down_executor_and_shm():
+    """The GC-time finalizer receives the resources directly — a
+    weakref-to-self callback always resolved to None (finalize fires
+    after the referent dies) and cleaned nothing."""
+    class _Exec:
+        def __init__(self):
+            self.shutdowns = []
+            self._processes = {}
+
+        def shutdown(self, wait=True, cancel_futures=False):
+            self.shutdowns.append((wait, cancel_futures))
+
+    class _Shm:
+        def __init__(self):
+            self.closed = False
+            self.unlinked = False
+            self.name = "test"
+
+        def close(self):
+            self.closed = True
+
+        def unlink(self):
+            self.unlinked = True
+
+    ex, shm_v, shm_f = _Exec(), _Shm(), _Shm()
+    _SpanWorkManager._release_resources(ex, shm_v, shm_f)
+
+    assert ex.shutdowns == [(False, True)]
+    assert shm_v.closed and shm_v.unlinked
+    assert shm_f.closed and shm_f.unlinked
+
+
 def test_pipe_pairing_helper_sanity():
     """Guards the assumption the test above relies on: mp.Pipe(duplex=
     False) returns (reader, writer) and a closed reader reports closed."""

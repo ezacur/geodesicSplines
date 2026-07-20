@@ -541,9 +541,10 @@ def _shoot_loop(curr_p, curr_d, curr_fid, rem, max_steps, fast_mode,
     # parallel-transport leaves ``curr_p`` clustered around the same
     # vertex, so the next ``_ray_edge_jit`` fails again and Phase 2b
     # fires again — an infinite loop bounded only by ``max_steps`` and
-    # the user's patience.  Breaking out after 2 consecutive
-    # fallbacks ends the geodesic at the last good edge crossing
-    # rather than spending the whole step budget thrashing.
+    # the user's patience.  Breaking out once the streak EXCEEDS 2
+    # (i.e. on the 3rd consecutive fallback) ends the geodesic at the
+    # last good edge crossing rather than spending the whole step
+    # budget thrashing.
     fallback_streak = 0
     exit_code = 0  # 0=normal, 1=non-manifold-fan truncation
 
@@ -2008,10 +2009,12 @@ class GeodesicMesh:
         Returns an ``OriginCache`` TypedDict used by
         ``compute_endpoint_from_origin`` (see its field docstrings).
 
-        The V buffer is oversized (+3 slots) so that endpoint insertion can
-        write at ``V_buf[nv]`` without copying the entire vertex array.
-        F buffer has +10 slots for the same reason but F is copied per-call
-        (see ``compute_endpoint_from_origin`` docstring for why).
+        Both buffers are oversized (V +3 slots, F +10) so the origin
+        insertion can write at ``V_buf[nv]`` / ``F_buf[nf]`` without
+        copying the full arrays.  ``compute_endpoint_from_origin`` only
+        READS the cached buffers (vertex-snap test); its non-snap path
+        delegates to ``compute_endpoint_local``, which builds its own
+        submesh — the cache is never mutated after construction.
 
         If topology insertion produces a degenerate mesh (self-edges from
         nearly-degenerate triangles in the original mesh, or non-manifold
@@ -2263,9 +2266,10 @@ class GeodesicMesh:
 
         Avoids the O(N²) cost of restarting from scratch on every retry
         of ``compute_endpoint_local``: at depth 60 after passes of
-        3 / 7 / 15 / 30 / 60, we now do ``3 + 4 + 8 + 15 + 30 = 60``
-        rings of work (the increments) instead of
-        ``3 + 7 + 15 + 30 + 60 = 115`` (the absolute depths).
+        3 / 15 / 30 / 60 (phase A's 3 rings, then phase C's
+        escalations), we do ``3 + 12 + 15 + 30 = 60`` rings of work
+        (the increments) instead of ``3 + 15 + 30 + 60 = 108`` (the
+        absolute depths).
         """
         adj = self._face_adj
         for _ in range(extra_rings):
@@ -2331,13 +2335,17 @@ class GeodesicMesh:
         # the discrete geodesic to converge to the smooth-surface
         # geodesic by giving the solver finer edges to work with).
         # ``vmap`` is intentionally NOT extended: the new midpoint
-        # vertices have no global counterpart.  Note ``_to_local`` maps
-        # the global-nearest vertex through ``vmap`` and only falls back
-        # to a local KDTree when that vertex is *outside* the submesh —
-        # it does NOT return midpoint vertices, so a point inside a
-        # subdivided triangle's central subface seeds the insertion from
-        # an original corner.  ``_add_point_local``'s bary backstop
-        # rescans all faces in that case; see the comment there.
+        # vertices have no global counterpart.  ``_to_local``'s primary
+        # path maps the global-nearest vertex through ``vmap`` and can
+        # therefore only return ORIGINAL corners — a point inside a
+        # subdivided triangle's central subface seeds the insertion
+        # from a corner its subface doesn't touch, and
+        # ``_add_point_local``'s bary backstop rescans all faces in
+        # that case (see the comment there).  The local-KDTree fallback
+        # (global-nearest outside the submesh) is built on the
+        # post-subdivision ``V_sub`` and CAN return a midpoint index;
+        # that is harmless — the index only seeds the candidate pool,
+        # and a midpoint seed is at least as close as a corner seed.
         for _ in range(max(0, int(submesh_subdiv))):
             V_sub, F_sub = self._subdivide_submesh_1to4(V_sub, F_sub)
 
@@ -3655,6 +3663,20 @@ class GeodesicMesh:
         """
         face_idx = self._find_face_buf(p, V_buf, F_buf, nv, nf)
         u, v, w = self._bary_buf(p, face_idx, V_buf, F_buf)
+        # Same grossly-negative-bary backstop as ``_add_point_local``:
+        # ``_find_face_buf`` seeds candidates from the single nearest
+        # vertex, and on irregular tessellation (sliver fans, strong
+        # size gradients) the true containing face may not touch that
+        # vertex at all.  A min-bary below -1e-2 means "the chosen face
+        # does not contain p" — welding p onto one of its edges would
+        # fold the local topology.  The full rescan is O(nf) with a
+        # Python key function, but it only fires on the mis-seeded
+        # case; well-seeded insertions (min_bary >= ~0) are unchanged.
+        if min(u, v, w) < -1e-2:
+            face_idx = min(range(nf),
+                           key=lambda i: self._outside_score_buf(
+                               p, i, V_buf, F_buf))
+            u, v, w = self._bary_buf(p, face_idx, V_buf, F_buf)
         fa, fb, fc = int(F_buf[face_idx, 0]), int(F_buf[face_idx, 1]), int(F_buf[face_idx, 2])
         snap_eps = 1e-7
         edge_eps = 1e-7

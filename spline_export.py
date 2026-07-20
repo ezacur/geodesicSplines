@@ -54,14 +54,15 @@ Output format (CSV, one point per line)
 ::
 
     x , y , z          — curve point
-    NaN , NaN , NaN    — break between splines
-    NaN , NaN , NaN
-    x , y , z          — landmark (node origin)
-    NaN , NaN , NaN
+    NaN , NaN , NaN    — break between splines (also emitted at any
+                         gap left by a skipped span)
 
-Landmarks are node origins wrapped in NaN sentinels so downstream
-tools (Matplotlib, R, MATLAB) cut polylines cleanly at the breaks
-without joining disjoint splines.
+Consecutive spans of one spline share their endpoint, so each intact
+spline prints as one contiguous polyline; downstream tools
+(Matplotlib, R, MATLAB) cut polylines at the NaN rows without joining
+disjoint splines.  Node-origin landmark rows are no longer emitted
+(an earlier revision wrapped each origin in NaN sentinels); splines
+with fewer than 2 nodes contribute no rows at all.
 
 Layers
 ------
@@ -198,6 +199,15 @@ def load_json(path: str) -> dict:
         log.error("invalid session %s: %s", path, exc)
         sys.exit(2)
 
+    # Mirror the editor's version gate (``_on_load``): a session the
+    # editor refuses to open must not silently export here under a
+    # v1/v2 interpretation its (future) version may not have.
+    version = data.get('version')
+    if version not in (1, 2):
+        log.error("unknown session version %r in %s (supported: 1, 2)",
+                  version, path)
+        sys.exit(2)
+
     return data
 
 
@@ -263,7 +273,14 @@ def rebuild_mesh_and_nodes(data: dict):
     of lists of dicts with 'origin', 'face_idx', 'p_a', 'p_b', 'path_a',
     'path_b'.
     """
-    mesh_file = data['mesh_file']
+    # ``_validate_session_dict`` does not require ``mesh_file`` (undo
+    # snapshots legitimately omit it) — reject it here with the CLI's
+    # clean exit-2 diagnostic instead of a raw KeyError traceback.
+    mesh_file = data.get('mesh_file')
+    if not mesh_file:
+        log.error("session has no 'mesh_file' key — pass --mesh to "
+                  "supply the mesh explicitly")
+        sys.exit(2)
     log.info("loading mesh: %s", mesh_file)
     # Both the prefixed sentinel ("__builtin__:icosahedron") and the
     # legacy plain string ("ICOSAHEDRON") map to the in-memory demo
@@ -392,7 +409,13 @@ def compute_blue(geo, nodes, closed, n_samples) -> list[np.ndarray]:
             n_skipped += 1
             continue
         path_b = n0['path_b']
-        path_a_rev = n1['path_a'][::-1] if n1['path_a'] is not None else None
+        # ``hybrid_de_casteljau_curve`` expects ``path_in`` oriented
+        # P1 -> H_in exactly as stored (it reverses internally, same as
+        # the editor's call in ``_recompute_spans``).  Passing a
+        # pre-reversed copy double-reverses: every span then ends at the
+        # H_in handle instead of the destination node.  Only the
+        # ``eval_cascade_at_t`` orange path takes a pre-reversed copy.
+        path_a = n1['path_a']
 
         # Geodesic H_out → H_in via local submesh solver
         log.debug("span %d: computing path_12 (H_out -> H_in)", i)
@@ -406,7 +429,7 @@ def compute_blue(geo, nodes, closed, n_samples) -> list[np.ndarray]:
         n = geo.adaptive_samples(ctrl, 0.3, 15, 100)
         n = max(n, n_samples)
         pts = geo.hybrid_de_casteljau_curve(
-            ctrl, path_b, path_a_rev, n, fast=False, path_12=path_12)
+            ctrl, path_b, path_a, n, fast=False, path_12=path_12)
         pts = geo.project_smooth_batch(pts)
         all_pts.append(pts)
 
@@ -474,8 +497,8 @@ def _orange_worker_init(v: np.ndarray, f: np.ndarray) -> None:
 def _orange_span_worker(task_data):
     """Worker function to compute a single orange span in a separate process.
 
-    Mirrors ``_geodesic_decasteljau_worker`` in ``geo_splines.py`` for
-    bit-for-bit parity with the editor's orange layer:
+    Mirrors **phase 1** (canonical cascade samples) of the editor's
+    ``span_workers._geodesic_decasteljau_worker``:
 
       - **Endpoints are pre-seeded with the literal P0 / P1**
         (``ctrl[0]`` / ``ctrl[3]`` = node origins).  Computing the
@@ -491,8 +514,11 @@ def _orange_span_worker(task_data):
         (matches the editor's default ``ADAPTIVE_SAMPLING=True``),
         falling back to ``np.linspace`` otherwise.
 
-    The caller is responsible for the secant-chord subdivision pass
-    (the editor runs it post-worker in ``_apply_orange_progress``).
+    It does NOT run the editor worker's phase 2 (cascade
+    densification) or phase 3 (geodesic chord-bridging); the caller
+    applies a legacy ``subdivide_secant_chords`` pass instead — see
+    ``compute_orange``'s docstring for how the exported curve can
+    therefore differ from the rendered one.
 
     Returns ``(span_pts, degraded)`` — *degraded* mirrors the editor
     worker's ``degraded_any``: ``True`` when the level-1 middle path
@@ -513,7 +539,7 @@ def _orange_span_worker(task_data):
     P0, H_out, H_in, P1 = ctrl
 
     # Guard the level-1 solver exactly as the editor worker does
-    # (geo_splines._geodesic_decasteljau_worker): a solver exception on
+    # (span_workers._geodesic_decasteljau_worker): a solver exception on
     # one span must degrade to a straight stub, not abort the whole
     # export by propagating a pickled traceback through executor.map.
     degraded = False
@@ -556,8 +582,8 @@ def compute_orange(geo, nodes, closed, n_samples,
                    adaptive: bool = True) -> list[np.ndarray]:
     """Computes fully geodesic (orange) de Casteljau points for one spline.
 
-    Mirrors the editor's orange-layer pipeline end-to-end so the export
-    produces the exact curve the user sees on screen:
+    Mirrors **phase 1** of the editor's orange-layer pipeline (the
+    canonical cascade samples):
 
       1. Per-span control points ``[P0, H_out, H_in, P1]`` built from
          the node origins + handle endpoints.
@@ -567,8 +593,18 @@ def compute_orange(geo, nodes, closed, n_samples,
       3. Worker computes only the *inner* points; the parent (here)
          pre-seeds endpoints with the literal node origins via the
          worker's seed logic.
-      4. ``subdivide_secant_chords`` post-processing identical to
-         ``_apply_orange_progress`` in the editor.
+
+    Known divergence from the rendered curve
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    The editor's worker additionally runs phase 2 (cascade
+    densification) and phase 3 (geodesic chord-bridging); this export
+    path instead applies the legacy ``subdivide_secant_chords``
+    post-pass, which inserts surface-projected chord midpoints that
+    are NOT on the de Casteljau cascade.  The exported polyline can
+    therefore deviate from the on-screen orange curve wherever a chord
+    crosses a ridge.  (The editor's ``v``-key export avoids this only
+    when ``EXPORT_VTK_SAMPLES >= GEO_SAMPLES`` lets it reuse the live
+    rendered polylines — see ``_on_export_vtk``.)
 
     Return contract
     ~~~~~~~~~~~~~~~
@@ -628,10 +664,12 @@ def compute_orange(geo, nodes, closed, n_samples,
             initargs=(geo.V, geo.F)) as executor:
         results = list(executor.map(_orange_span_worker, valid_tasks))
 
-    # Post-process: same secant chord subdivision the editor applies in
-    # _apply_orange_progress when the worker emits 'done'.  Keeps the
+    # Post-process: legacy secant-chord subdivision.  Keeps the
     # polyline visibly close to the surface even when the de Casteljau
-    # samples land on opposite sides of a ridge.
+    # samples land on opposite sides of a ridge, but the inserted
+    # midpoints are NOT on the cascade — the editor retired this pass
+    # in favour of the worker's phase-2/3 pipeline (see the
+    # "Known divergence" note in the docstring above).
     mean_edge = float(np.sqrt(geo._face_edge_len2.mean()))
     secant_tol = mean_edge * 0.01
     degraded_spans: list[int] = []
@@ -701,30 +739,61 @@ def compute_interp(geo, nodes, closed, n_samples) -> list[np.ndarray]:
 
 
 def write_obj(path, spline_points_list):
-    """Writes curve points as an OBJ file with vertices and lines."""
+    """Writes curve points as an OBJ file: ``v`` records plus one ``l``
+    (polyline) record per span.
+
+    ``l`` — not 2-vertex ``f`` records — is the OBJ element for
+    polylines: the spec requires faces to have >= 3 vertices, and
+    vtkOBJReader / ParaView / MeshLab reject 2-vertex ``f`` files
+    outright (empty dataset).  One ``l`` chain per SPAN (not per
+    spline): consecutive spans share their endpoint so an intact
+    spline still reads as a continuous curve, while a skipped span
+    (missing handles) leaves a real gap instead of a fabricated
+    straight bridge — matching the VTK writer's spans-as-separate-
+    cells behaviour.
+    """
     with open(path, 'w', encoding='utf-8') as f:
         f.write("# Geodesic Spline Export\n")
         v_offset = 1
         for spline_idx, spans in enumerate(spline_points_list):
             f.write(f"g spline_{spline_idx}\n")
-
-            # Collect all points for this spline to create a continuous line
-            # Spans are lists of numpy arrays
-            all_points = []
             for span in spans:
+                if len(span) < 2:
+                    continue
                 for pt in span:
-                    all_points.append(pt)
+                    f.write(f"v {pt[0]:.8f} {pt[1]:.8f} {pt[2]:.8f}\n")
+                chain = " ".join(
+                    str(i) for i in range(v_offset, v_offset + len(span)))
+                f.write(f"l {chain}\n")
+                v_offset += len(span)
 
-            if not all_points:
+
+def write_csv(spline_points_list, stream):
+    """Writes curve points as CSV rows to *stream*.
+
+    One ``x, y, z`` row per point; a NaN row between splines.  Adjacent
+    spans share their endpoint bit-for-bit; when they do NOT (a span
+    was skipped for missing handles), an extra NaN row marks the gap so
+    downstream parsers don't fabricate a straight bridge across it.
+    See the module docstring for the full format contract.
+    """
+    first_spline = True
+    for span_pts_list in spline_points_list:
+        if not first_spline:
+            # Break between splines
+            print(NAN_LINE, file=stream)
+        first_spline = False
+
+        prev_end = None
+        for span in span_pts_list:
+            if len(span) == 0:
                 continue
-
-            for pt in all_points:
-                f.write(f"v {pt[0]:.8f} {pt[1]:.8f} {pt[2]:.8f}\n")
-
-            # Create individual segments connecting the vertices using 'f'
-            for i in range(v_offset, v_offset + len(all_points) - 1):
-                f.write(f"f {i} {i+1}\n")
-            v_offset += len(all_points)
+            if prev_end is not None and not np.allclose(
+                    prev_end, span[0], atol=1e-9):
+                print(NAN_LINE, file=stream)
+            for pt in span:
+                print(format_point(pt), file=stream)
+            prev_end = span[-1]
 
 
 def write_vtk(path, spline_points_list, landmarks=None):
@@ -970,18 +1039,7 @@ def main():
         log.info("exporting to binary legacy VTK: %s", vtk_path)
         write_vtk(vtk_path, all_spline_points)
     else:
-        # CSV output to stdout
-        first_spline = True
-        for span_pts_list in all_spline_points:
-            if not first_spline:
-                # Break between splines
-                print(NAN_LINE)
-            first_spline = False
-
-            # Print all points for all spans of this spline
-            for span in span_pts_list:
-                for pt in span:
-                    print(format_point(pt))
+        write_csv(all_spline_points, sys.stdout)
 
     log.info("done.")
 

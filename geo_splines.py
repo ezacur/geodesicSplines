@@ -579,6 +579,13 @@ class GeodesicSplineApp(MidpointShooterApp):
         # already did it; reset on every fast-preview move so a later
         # release with no fired debounce still consolidates.
         self._consolidated_seg = None
+        # Snapshot captured at marker-press time but NOT yet pushed to
+        # the undo stack.  Committed by the first actual drag movement
+        # (``_commit_pending_drag_undo``); discarded on a release with
+        # no movement.  Pushing eagerly at press time flooded the
+        # 50-deep undo history with no-op entries (and cleared the redo
+        # stack) on every plain marker click.
+        self._pending_drag_snapshot: dict | None = None
         # Interpolation curve: one actor per spline (keyed by spline index)
         self._interp_cache: dict[int, tuple[pv.PolyData, vtk.vtkActor]] = {}
         # Per-spline pre-allocated origin buffer + content-fingerprint
@@ -1431,17 +1438,25 @@ class GeodesicSplineApp(MidpointShooterApp):
         This prevents losing access to empty (break) splines that have
         no clickable nodes.
 
-        Does NOT submit geodesic workers — that is already handled by
-        ``_fire_debounce`` which runs synchronously inside ``_on_release``
-        before this method.  When that debounce fired for this same node
-        it already produced the exact spans (``is_preview`` was cleared,
-        so ``_recompute_spans`` took the exact branch), so we skip a
-        redundant second solve here; otherwise (release with no pending
-        debounce, e.g. a click without drag) we consolidate now.
+        When ``_fire_debounce`` ran synchronously inside ``_on_release``
+        for this same node it already produced the exact spans AND
+        resubmitted the orange workers (``is_preview`` was cleared, so
+        ``_recompute_spans`` took the exact branch), so we skip a
+        redundant second solve here.  Otherwise (release with no pending
+        debounce, e.g. a click without drag) we consolidate now — blue
+        AND orange: ``_try_hit_marker`` cancelled and cleared the
+        adjacent orange spans at press time, so without the resubmit
+        below a plain click on a marker left them blank until the next
+        drag or an ``R`` rebuild.
         """
+        # A release whose gesture never moved never committed the
+        # press-time snapshot — discard it (nothing mutated, nothing
+        # to undo).
+        self._pending_drag_snapshot = None
         seg.is_active = True
         if self._consolidated_seg is not seg:
             self._recompute_spans(node=seg)
+            self._submit_geodesic_spans(node=seg)
         self._consolidated_seg = None
         seg.update_visuals(self.plotter)
 
@@ -1452,6 +1467,21 @@ class GeodesicSplineApp(MidpointShooterApp):
                 self.active_spline_idx = pre
                 self._refresh_visuals()
         self._pre_drag_spline_idx = None
+
+    def _abort_active_drag(self) -> None:
+        """Spline-aware drag abort — see the base class docstring.
+
+        Additionally drops the spline-level per-gesture state: a stale
+        ``_consolidated_seg`` from the aborted gesture would make the
+        NEXT drag of the same node skip its release consolidation, and
+        an uncommitted press-time undo snapshot no longer corresponds
+        to any mutation.
+        """
+        had_drag = self.state.active_seg is not None
+        super()._abort_active_drag()
+        if had_drag:
+            self._consolidated_seg = None
+            self._pending_drag_snapshot = None
 
     def _setup_interaction(self) -> None:
         super()._setup_interaction()
@@ -1771,6 +1801,21 @@ class GeodesicSplineApp(MidpointShooterApp):
         self._undo_stack.append(self._snapshot())
         self._redo_stack.clear()
 
+    def _commit_pending_drag_undo(self) -> None:
+        """Pushes the press-time snapshot once a drag actually moved.
+
+        ``_try_hit_marker`` captures the pre-drag state without pushing
+        it; the first processed drag movement commits it here.  A click
+        that never moves discards the snapshot in ``_finalize_release``
+        instead, so plain marker clicks (spline switching, accidental
+        clicks) no longer spend undo entries or clear the redo stack.
+        """
+        snap = self._pending_drag_snapshot
+        if snap is not None:
+            self._pending_drag_snapshot = None
+            self._undo_stack.append(snap)
+            self._redo_stack.clear()
+
     def _on_undo_ctrl_z(self) -> None:
         """Ctrl+Z: restores the previous spline state from the undo stack."""
         if not self._undo_stack:
@@ -1898,6 +1943,12 @@ class GeodesicSplineApp(MidpointShooterApp):
             # origin.  Drop it; the full-rebuild branch above does the same
             # via ``_clear_all_curve_caches``.
             self._invalidate_stitch_cache()
+            # Marker positions moved too — without this the hover cache
+            # keeps serving the pre-restore screen positions (markers
+            # unhoverable at their restored location, ghost hover zone
+            # at the old one).  The full-rebuild branch gets it via
+            # ``_load_from_data``.
+            self._hover_dirty = True
 
         self.active_spline_idx = self._clamp_spline_idx(active)
         self._prev_active_spline_idx = self.active_spline_idx
@@ -2124,27 +2175,46 @@ class GeodesicSplineApp(MidpointShooterApp):
             return False
         seg, tag = hit
         s_idx = self._spline_for_node(seg)
-        self._push_undo()
+        # Capture the pre-drag snapshot WITHOUT pushing it — the first
+        # actual drag movement commits it (``_commit_pending_drag_undo``
+        # in ``_on_move``); a click that never moves discards it in
+        # ``_finalize_release``.
+        self._pending_drag_snapshot = self._snapshot()
         # Save the pre-drag active spline so _finalize_release can restore
         # it.  Without this, dragging a node in a non-active spline
         # permanently switches away from the active one — the user loses
         # access to an empty (break) spline that has no clickable nodes.
         self._pre_drag_spline_idx = self.active_spline_idx
-        if s_idx != self.active_spline_idx:
-            self.active_spline_idx = s_idx
-            self._refresh_visuals()
-        self.state.active_seg = seg
-        self.state.drag_marker = tag
-        seg.is_active = True
-        seg.is_dragging = True
+        # Lock camera FIRST so the setup below can fail safely — same
+        # rollback contract as the base class: any exception unwinds
+        # drag state and unlocks before re-raising, so the user is
+        # never stranded with a frozen viewport.
         self._lock_camera()
-        self._set_hud(_t("dragging", marker=tag.upper()), 'gold')
-        # Cancel background workers and hide orange immediately
-        # — in the same render frame as the drag initiation, not on the
-        # first _on_move (which would leave them visible for 1+ frame).
-        self._cancel_geodesic_spans(seg)
-        seg.update_visuals(self.plotter)
-        self.plotter.render()
+        try:
+            if s_idx != self.active_spline_idx:
+                self.active_spline_idx = s_idx
+                self._refresh_visuals()
+            self.state.active_seg = seg
+            self.state.drag_marker = tag
+            seg.is_active = True
+            seg.is_dragging = True
+            self._set_hud(_t("dragging", marker=tag.upper()), 'gold')
+            # Cancel background workers and hide orange immediately
+            # — in the same render frame as the drag initiation, not on
+            # the first _on_move (which would leave them visible for
+            # 1+ frame).
+            self._cancel_geodesic_spans(seg)
+            seg.update_visuals(self.plotter)
+            self.plotter.render()
+        except Exception:  # noqa: BLE001 — must always reach unlock
+            self.state.active_seg = None
+            self.state.drag_marker = None
+            seg.is_active = False
+            seg.is_dragging = False
+            self.active_spline_idx = self._pre_drag_spline_idx
+            self._pending_drag_snapshot = None
+            self._unlock_camera()
+            raise
         return True
 
     def _clear_spline_spans(self, sid: int) -> None:
@@ -2171,6 +2241,60 @@ class GeodesicSplineApp(MidpointShooterApp):
         # the new node objects.
         if sid == self.active_spline_idx:
             self._didactic_geo_cache = None
+
+    def _shift_spline_caches(self, removed_sid: int) -> None:
+        """Re-keys every sid-keyed cache after ``splines.pop(removed_sid)``.
+
+        ``self.splines`` / ``splines_closed`` are already popped when
+        this runs.  Entries of the removed spline are dropped (removing
+        their actors — normally none exist, the removed spline is
+        empty); entries of later splines shift down one index so they
+        keep pointing at the same spline data.  In-flight orange
+        workers of shifted splines are cancelled by the work manager —
+        their pipe messages embed the OLD key and would land on the
+        wrong spline — and resubmitted here under the new numbering.
+        """
+        def _shift(key):
+            return (key[0] - 1, key[1]) if key[0] > removed_sid else key
+
+        for name in ('_span_cache', '_geo_span_cache'):
+            old = getattr(self, name)
+            new = {}
+            for k, v in old.items():
+                if k[0] == removed_sid:
+                    safe_remove_actor(self.plotter, v[1])
+                else:
+                    new[_shift(k)] = v
+            setattr(self, name, new)
+        self._span_drag_state = {
+            _shift(k): v for k, v in self._span_drag_state.items()
+            if k[0] != removed_sid}
+        self._degraded_spans = {
+            _shift(k) for k in self._degraded_spans if k[0] != removed_sid}
+        for name in ('_interp_cache', '_interp_origins_buf',
+                     '_interp_result_cache'):
+            old = getattr(self, name)
+            new = {}
+            for s, v in old.items():
+                if s == removed_sid:
+                    if name == '_interp_cache':
+                        safe_remove_actor(self.plotter, v[1])
+                    continue
+                new[s - 1 if s > removed_sid else s] = v
+            setattr(self, name, new)
+        # Cancel in-flight workers keyed with the old numbering and
+        # resubmit the affected splines under their new index.
+        affected = self._work_mgr.shift_spline_keys(removed_sid)
+        for old_sid in affected:
+            if old_sid == removed_sid:
+                continue    # the removed spline itself — nothing to resubmit
+            new_sid = old_sid - 1
+            if 0 <= new_sid < len(self.splines):
+                self._submit_geodesic_spans(sid=new_sid)
+        self._hover_curve_dirty = True
+        # Spline indices shifted under the didactic scaffold's feet —
+        # its id()-keyed cache may now describe a different spline.
+        self._didactic_geo_cache = None
 
     def _insert_node_from_interp(self, info: dict, sid: int,
                                 nodes: list, closed: bool) -> None:
@@ -2590,6 +2714,18 @@ class GeodesicSplineApp(MidpointShooterApp):
         self.plotter.render()
 
     def _on_press(self, obj, event) -> None:
+        """VTK observer wrapper — must not propagate exceptions.
+
+        The base class guards its own handler body; this override
+        replaces it entirely, so it needs the same guard or a raising
+        insertion/pick would crash VTK's event loop.
+        """
+        try:
+            self._on_press_impl(obj, event)
+        except Exception:  # noqa: BLE001 — VTK observer must not propagate
+            log.exception("press handler failed")
+
+    def _on_press_impl(self, obj, event) -> None:
         """Left-button press: single-click drags a marker, double-click adds/inserts a node.
 
         On double-click:
@@ -2653,6 +2789,13 @@ class GeodesicSplineApp(MidpointShooterApp):
         self.plotter.render()
 
     def _on_right_press(self, obj, event) -> None:
+        """VTK observer wrapper — must not propagate exceptions."""
+        try:
+            self._on_right_press_impl(obj, event)
+        except Exception:  # noqa: BLE001 — VTK observer must not propagate
+            log.exception("right-press handler failed")
+
+    def _on_right_press_impl(self, obj, event) -> None:
         """Right-button handler with two double-click behaviours.
 
         Single right-click: ignored (no behaviour bound).
@@ -3050,6 +3193,19 @@ class GeodesicSplineApp(MidpointShooterApp):
         return best_pt, best_info
 
     def _on_move(self, obj, event, *, pick_override=None) -> None:
+        """VTK observer wrapper — must not propagate exceptions.
+
+        The parent's ``_on_move`` guards its own body, but this
+        override adds pre/post work (pick, snap, stitch preview via
+        ``prepare_origin`` — which can raise on degenerate faces,
+        curve hover) that runs outside that guard.
+        """
+        try:
+            self._on_move_impl(obj, event, pick_override=pick_override)
+        except Exception:  # noqa: BLE001 — VTK observer must not propagate
+            log.exception("spline move handler failed")
+
+    def _on_move_impl(self, obj, event, *, pick_override=None) -> None:
         """Spline-aware move handler.
 
         Picks once per frame and passes the result to the parent via
@@ -3079,6 +3235,11 @@ class GeodesicSplineApp(MidpointShooterApp):
         # Skip expensive ray-pick when hovering a marker (no drag active).
         hovering_marker = self.state.hover_seg is not None and self.state.active_seg is None
         dragged = self.state.active_seg
+        # The parent's drag branch assigns a FRESH ``last_drag_q`` object
+        # (``q.copy()``) on every processed drag movement — an identity
+        # change after ``super()._on_move`` marks a real mutation this
+        # frame, which is what commits the press-time undo snapshot.
+        prev_drag_q = self.state.last_drag_q if dragged else None
         # Tell the parent to suppress the cursor when curve hover is active
         # (set BEFORE super()._on_move so the parent reads it).
         self._hide_cursor = self.curve_hover_info is not None
@@ -3126,6 +3287,10 @@ class GeodesicSplineApp(MidpointShooterApp):
             super()._on_move(obj, event, pick_override=pick_result)
 
         if dragged:
+            # First processed movement of the gesture: commit the
+            # press-time undo snapshot (see _try_hit_marker).
+            if self.state.last_drag_q is not prev_drag_q:
+                self._commit_pending_drag_undo()
             # A fresh preview move invalidates any prior exact
             # consolidation, so a subsequent release must recompute.
             self._consolidated_seg = None
@@ -3212,6 +3377,12 @@ class GeodesicSplineApp(MidpointShooterApp):
             entry_g = self._geo_span_cache.pop(key, None)
             if entry_g:
                 safe_remove_actor(self.plotter, entry_g[1])
+            # The actor is destroyed — drop its cached style state too,
+            # or ``_set_span``'s style gate will skip painting the actor
+            # recreated later under the same key (it would keep the
+            # PyVista theme defaults instead of SPAN_COLOR / width).
+            self._span_drag_state.pop(key, None)
+            self._degraded_spans.discard(key)
         self._hover_dirty = True
 
     def _on_close_spline(self) -> None:
@@ -3260,10 +3431,16 @@ class GeodesicSplineApp(MidpointShooterApp):
         if vn > 1e-9:
             v_dir = vec / vn
             h_len = np.linalg.norm(first.origin - last.origin) * self.scfg.HANDLE_FRACTION
-            # Compute closing tangent for first node
+            # Compute closing tangent for first node.  ``p_a`` points
+            # BACKWARD, toward the last node (the same convention as
+            # ``_init_tangents``' sign=-1 ray and the mirror handle the
+            # first-close path reuses): the wrap-around span then
+            # arrives at the first node moving along +v_dir, G1 with
+            # span 0.  Shooting +v_dir placed the handle on the far
+            # side and hooked the closing span around the node.
             if first.p_a is None:
                 path_a = self.geo.compute_shoot(
-                    first.origin, v_dir, h_len, first.face_idx)
+                    first.origin, -v_dir, h_len, first.face_idx)
                 if path_a is not None:
                     first.p_a, first.path_a = path_a[-1], path_a
                     first.update_visuals(self.plotter)
@@ -3301,11 +3478,21 @@ class GeodesicSplineApp(MidpointShooterApp):
         if not nodes and len(self.splines) <= 1:
             return
 
+        # A structural mutation mid-gesture would strand the drag (ghost
+        # gizmo on the popped node, locked camera on release) — abort it
+        # cleanly first.
+        self._abort_active_drag()
+
         self._push_undo()
         # Empty spline = undo the break
         if not nodes and len(self.splines) > 1:
             self.splines.pop(sid)
             self.splines_closed.pop(sid)
+            # Every spline after ``sid`` just shifted down one index —
+            # re-key the sid-keyed caches (and worker bookkeeping) or
+            # their existing actors become unreachable ghosts and new
+            # edits draw duplicates.
+            self._shift_spline_caches(sid)
             self.active_spline_idx = len(self.splines) - 1
             self._rebuild_node_index()
             if self.splines_closed[self.active_spline_idx]:
@@ -3360,6 +3547,19 @@ class GeodesicSplineApp(MidpointShooterApp):
                     removed_entry = cache.pop(key, None)
                     if removed_entry:
                         safe_remove_actor(self.plotter, removed_entry[1])
+                # Same style-state cleanup as ``_reopen_spline_loop`` —
+                # a span recreated under this key must repaint.
+                self._span_drag_state.pop(key, None)
+                self._degraded_spans.discard(key)
+            # The popped node's curve geometry is gone (or about to be
+            # recomputed) — the curve-hover cache must rebuild, or the
+            # telescopic-sight marker keeps appearing on the deleted
+            # span (2→1-node pops trigger no _set_span call at all).
+            self._hover_curve_dirty = True
+            # The stitch cache is keyed by id(last node); the popped
+            # node might BE that node, and a recycled address could
+            # silently revive its solver for a different segment.
+            self._invalidate_stitch_cache()
             self._recompute_spans()
         self._update_stitch()
         self.plotter.render()
@@ -3839,6 +4039,11 @@ class GeodesicSplineApp(MidpointShooterApp):
             if entry is not None:
                 if entry[1].GetVisibility():
                     self._hover_curve_dirty = True
+                # Clear geometry so stale data can't reappear when
+                # ``_toggle_layer`` / ``_refresh_visuals`` blanket
+                # re-show the actor (same rationale as _set_geo_span).
+                entry[0].points = np.zeros((0, 3), dtype=float)
+                entry[0].Modified()
                 entry[1].SetVisibility(False)
             return
 
@@ -3932,9 +4137,18 @@ class GeodesicSplineApp(MidpointShooterApp):
             self._set_interp_curve(sid, cached[1])
             return
 
+        # scipy's ``per=True`` requires the last input point to
+        # duplicate the first; when it does not, ``splprep`` silently
+        # OVERWRITES the last point with the first, so the fitted curve
+        # missed the true last node entirely.  Fit on an explicitly
+        # wrapped copy for closed splines.
+        if closed:
+            pts_fit = np.vstack([origins, origins[:1]])
+        else:
+            pts_fit = origins
         try:
             tck, u = splprep(
-                [origins[:, 0], origins[:, 1], origins[:, 2]],
+                [pts_fit[:, 0], pts_fit[:, 1], pts_fit[:, 2]],
                 s=0, k=k, per=closed)
         except Exception as exc:  # noqa: BLE001 — scipy raises bare Exception
             log.debug("splprep failed for spline %d: %s", sid, exc)
@@ -3980,6 +4194,12 @@ class GeodesicSplineApp(MidpointShooterApp):
                 labels=u_per_pt)
 
         u_at_nodes = np.asarray(u, dtype=float)
+        if closed:
+            # Drop the wrap duplicate's parameter (``u[-1] == 1.0``,
+            # equivalent to node 0) so ``u_at_nodes`` keeps exactly one
+            # entry per node — the shape ``_insert_node_from_interp``
+            # expects.
+            u_at_nodes = u_at_nodes[:-1]
         self._interp_result_cache[sid] = (fp, projected, u_at_nodes, u_per_pt)
         self._set_interp_curve(sid, projected)
 
@@ -4896,6 +5116,13 @@ class GeodesicSplineApp(MidpointShooterApp):
             self._set_geo_span(sid, j, None)
 
     def _on_poll_timer(self, obj, event) -> None:
+        """VTK timer observer wrapper — must not propagate exceptions."""
+        try:
+            self._on_poll_timer_impl(obj, event)
+        except Exception:  # noqa: BLE001 — VTK observer must not propagate
+            log.exception("poll timer failed")
+
+    def _on_poll_timer_impl(self, obj, event) -> None:
         """Master Clock heartbeat — orchestrator only.
 
         The actual work is split across small helpers so each
@@ -4917,14 +5144,14 @@ class GeodesicSplineApp(MidpointShooterApp):
 
         needs_render = self._refresh_arrows_on_camera_change()
 
-        if not has_worker_results:
-            if needs_render:
-                self.plotter.render()
-            return
-
-        if self._apply_orange_progress():
+        if has_worker_results and self._apply_orange_progress():
             needs_render = True
-        if self._clear_dead_orange_spans():
+        # Dead spans can be flagged OUTSIDE drain_queue too —
+        # ``submit_span``'s double-BrokenProcessPool give-up path adds
+        # the key directly, with no pipe message to make drain_queue
+        # return True — so the cleanup must run even on quiet ticks or
+        # the key lingers until an unrelated worker message arrives.
+        if self._work_mgr.dead_spans and self._clear_dead_orange_spans():
             needs_render = True
 
         if needs_render:
@@ -5719,6 +5946,12 @@ class GeodesicSplineApp(MidpointShooterApp):
         Returns the total number of nodes loaded.
         """
         # --- Clear existing splines ---
+        # A load can arrive mid-drag ('l' key, or an undo/redo that
+        # takes the full-rebuild path).  Nulling ``active_seg`` alone
+        # left the camera locked forever: the eventual mouse release
+        # hit ``_on_release``'s early return and ``_unlock_camera``
+        # never ran.  Unwind the whole gesture instead.
+        self._abort_active_drag()
         self._clear_all_curve_caches()
         for seg in list(self.segments):
             seg.clear_actors(self.plotter)
@@ -5727,7 +5960,6 @@ class GeodesicSplineApp(MidpointShooterApp):
         self.state.hover_marker = None
         self.state.pending_hover_revert_seg = None
         self.state.pending_debounces.pop('hover_revert', None)
-        self.state.active_seg = None
         self._hover_dirty = True
 
         # --- Rebuild from JSON ---
@@ -5759,8 +5991,13 @@ class GeodesicSplineApp(MidpointShooterApp):
         self._prev_active_spline_idx = 0
         self._rebuild_node_index()
         self._refresh_visuals()
-        self._recompute_spans()
-        self._submit_geodesic_spans()
+        # Walk EVERY spline explicitly — the sid-less defaults operate
+        # on the active spline only (see ``_recompute_spans``'s
+        # docstring), which left splines 1..N-1 without blue spans or
+        # orange workers after a load / full undo-redo rebuild.
+        for sid in range(len(self.splines)):
+            self._recompute_spans(sid=sid)
+            self._submit_geodesic_spans(sid=sid)
         self._update_stitch()
 
         return sum(len(s) for s in self.splines)
