@@ -33,14 +33,26 @@ def _frame():
 
 
 class _FakeMapper:
+    """Records the offsets ``set_depth_priority`` applies.
+
+    The polygon parameter matters: the handle arrows are cone glyphs
+    made entirely of polygons, so without it they get no z-bias at all.
+    """
+
+    def __init__(self):
+        self.offsets = {}
+
     def SetResolveCoincidentTopologyToPolygonOffset(self):
         pass
 
+    def SetRelativeCoincidentTopologyPolygonOffsetParameters(self, a, b):
+        self.offsets['polygon'] = (a, b)
+
     def SetRelativeCoincidentTopologyLineOffsetParameters(self, a, b):
-        pass
+        self.offsets['line'] = (a, b)
 
     def SetRelativeCoincidentTopologyPointOffsetParameter(self, a):
-        pass
+        self.offsets['point'] = a
 
 
 class _FakeProp:
@@ -127,3 +139,21 @@ def test_update_magnitude_keeps_endpoints_on_success():
     np.testing.assert_allclose(seg.p_b, [0.5, 0.0, 0.0])
     np.testing.assert_allclose(seg.p_a, [-0.5, 0.0, 0.0])
     assert seg.h_length == pytest.approx(0.5)
+
+
+def test_set_depth_priority_biases_polygons_too():
+    """The A / B handle arrows are cone glyphs — pure polygons
+    (``polys=9, lines=0, verts=0`` at ``resolution=8``).  Setting only
+    the line and point offsets left them with no z-bias at all, so the
+    blue / orange / interp curves (line primitives, which *did* get
+    their offset) drew over the hovered gizmo — the inverse of the
+    documented behaviour."""
+    from gizmo import set_depth_priority
+
+    actor = _FakeActor()
+    set_depth_priority(actor, -26.0)
+
+    offsets = actor.GetMapper().offsets
+    assert offsets['polygon'] == (0, -26.0)
+    assert offsets['line'] == (0, -26.0)
+    assert offsets['point'] == -26.0

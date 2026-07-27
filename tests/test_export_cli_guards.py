@@ -156,3 +156,80 @@ def test_csv_break_between_splines():
     spline_b = _spans([[9, 0, 0], [10, 0, 0]])
     rows = _csv_rows([spline_a, spline_b])
     assert _nan_count(rows) == 1
+
+
+# ---------------------------------------------------------------------------
+# Output-path guard: the export must never clobber its own input
+# ---------------------------------------------------------------------------
+
+def test_guard_rejects_output_equal_to_input_mesh(tmp_path):
+    """``heart.json`` + ``heart.obj`` in one directory resolves the OBJ
+    output straight onto the mesh, which ``rebuild_mesh_and_nodes`` has
+    already read into memory — the write destroyed it and still exited
+    0."""
+    from spline_export import _guard_output_path
+
+    mesh = tmp_path / "heart.obj"
+    mesh.write_text("v 0 0 0\n")
+    out = str(tmp_path / "heart.obj")
+    with pytest.raises(SystemExit) as exc:
+        _guard_output_path(out, {'input mesh': str(mesh)})
+    assert exc.value.code == 2
+
+
+def test_guard_allows_a_distinct_output(tmp_path):
+    from spline_export import _guard_output_path
+
+    mesh = tmp_path / "mesh.obj"
+    mesh.write_text("v 0 0 0\n")
+    _guard_output_path(str(tmp_path / "curves.obj"),
+                       {'input mesh': str(mesh)})   # must not raise
+
+
+def test_guard_ignores_the_builtin_mesh_sentinel(tmp_path):
+    """``__builtin__:icosahedron`` is not a path; the guard must skip
+    it rather than trip on it."""
+    from spline_export import _guard_output_path
+
+    _guard_output_path(str(tmp_path / "out.vtk"),
+                       {'input mesh': '__builtin__:icosahedron'})
+
+
+# ---------------------------------------------------------------------------
+# Session-relative mesh resolution
+# ---------------------------------------------------------------------------
+
+def test_mesh_path_resolves_next_to_the_session(tmp_path, monkeypatch):
+    """``mesh_file`` is whatever relative name the *editor* was launched
+    with, so resolving it against the CLI's CWD only works by accident.
+    Sessions live next to their mesh."""
+    from spline_export import _resolve_mesh_path
+
+    sess_dir = tmp_path / "sessions"
+    sess_dir.mkdir()
+    mesh = sess_dir / "mesh.obj"
+    mesh.write_text("v 0 0 0\n")
+    session = sess_dir / "s.json"
+    session.write_text("{}")
+
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    monkeypatch.chdir(other)
+
+    assert _resolve_mesh_path("mesh.obj", str(session)) == str(mesh)
+
+
+def test_mesh_path_prefers_an_existing_cwd_match(tmp_path, monkeypatch):
+    """Backwards compatible: a name that already resolves against the
+    CWD keeps resolving there."""
+    from spline_export import _resolve_mesh_path
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "mesh.obj").write_text("v 0 0 0\n")
+    assert _resolve_mesh_path("mesh.obj", None) == "mesh.obj"
+
+
+def test_missing_mesh_returns_the_literal_for_the_caller_to_report(tmp_path):
+    from spline_export import _resolve_mesh_path
+
+    assert _resolve_mesh_path("nope.obj", str(tmp_path / "s.json")) == "nope.obj"

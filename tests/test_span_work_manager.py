@@ -220,3 +220,72 @@ def test_pipe_pairing_helper_sanity():
     assert reader.recv() == 42
     reader.close()
     assert reader.closed
+
+
+# ---------------------------------------------------------------------------
+# cancel_span must actually cancel the future
+# ---------------------------------------------------------------------------
+
+class _CancellableFuture:
+    def __init__(self):
+        self.cancelled = False
+
+    def add_done_callback(self, fn):
+        pass
+
+    def cancel(self):
+        self.cancelled = True
+        return True
+
+
+def test_cancel_span_cancels_the_future():
+    """Popping the future is not enough: ``ProcessPoolExecutor`` only
+    skips a queued work item whose future is cancelled, so a superseded
+    span otherwise still runs a level-1 solve plus a full cascade sample
+    on a worker slot before its first ``send()`` breaks."""
+    m = _bare_manager(object())
+    fut = _CancellableFuture()
+    key = (0, 3)
+    m._futures[key] = fut
+    m.active_spans.add(key)
+    m._batch_submitted = 1
+
+    m.cancel_span(key)
+
+    assert fut.cancelled is True
+    assert key not in m._futures
+    assert key not in m.active_spans
+    assert m._batch_submitted == 0
+
+
+def test_cancel_span_without_a_future_is_a_noop():
+    m = _bare_manager(object())
+    m.cancel_span((9, 9))  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# _rebuild_executor must report orphaned spans as dead
+# ---------------------------------------------------------------------------
+
+def test_rebuild_executor_marks_inflight_spans_dead():
+    """A pool rebuild kills every in-flight span.  Reporting them in
+    ``dead_spans`` is what makes the editor clear their actors; dropping
+    the keys left the curves frozen in the dimmed "computing" style
+    forever while the HUD claimed the batch was done."""
+    m = _bare_manager(object())
+    r_a, w_a = mp.Pipe(duplex=False)
+    r_b, w_b = mp.Pipe(duplex=False)
+    m._readers = {(0, 0): r_a, (0, 1): r_b}
+    m.active_spans = {(0, 0), (0, 1), (0, 2)}
+    m._build_executor = lambda: object()
+    m._finalizer = None
+    m._shm_V = m._shm_F = None   # only re-captured by the finalizer
+
+    m._rebuild_executor()
+
+    assert m.dead_spans == {(0, 0), (0, 1), (0, 2)}
+    assert m._readers == {}
+    assert m.active_spans == set()
+    assert m._batch_submitted == 0
+    for w in (w_a, w_b):
+        w.close()

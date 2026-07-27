@@ -235,3 +235,71 @@ def test_mixed_v1_v2_nodes_in_same_spline_accepted():
             ]
         }
     )
+
+
+# --- Out-of-range magnitudes ---------------------------------------------
+
+
+def test_oversized_int_origin_rejected():
+    """A Python ``int`` has no magnitude bound, so a hand-edited
+    400-digit coordinate is neither NaN nor ±inf and used to pass.
+
+    It then raised ``OverflowError`` inside ``np.asarray(..., float)``
+    in ``_node_from_record`` — after ``_load_from_data`` had already
+    emptied ``self.splines``, i.e. the half-loaded state the validator
+    exists to prevent.
+    """
+    huge = int("9" * 400)
+    with pytest.raises(ValueError, match="out of range"):
+        validate(
+            {
+                "splines": [
+                    {
+                        "closed": False,
+                        "nodes": [
+                            {"origin": [huge, 0.0, 0.0],
+                             "tangent": [1.0, 0.0, 0.0]},
+                        ],
+                    }
+                ]
+            }
+        )
+
+
+def test_oversized_negative_int_handle_rejected():
+    huge = -int("7" * 350)
+    with pytest.raises(ValueError, match="out of range"):
+        validate(
+            {
+                "splines": [
+                    {
+                        "closed": False,
+                        "nodes": [
+                            {
+                                "origin": [0.0, 0.0, 0.0],
+                                "p_a": [0.0, huge, 0.0],
+                                "p_b": None,
+                            },
+                        ],
+                    }
+                ]
+            }
+        )
+
+
+def test_large_but_representable_int_accepted():
+    """The guard rejects only what float64 cannot hold — an ordinary
+    large integer coordinate stays valid."""
+    validate(
+        {
+            "splines": [
+                {
+                    "closed": False,
+                    "nodes": [
+                        {"origin": [10**300, 0, 0],
+                         "tangent": [1.0, 0.0, 0.0]},
+                    ],
+                }
+            ]
+        }
+    )

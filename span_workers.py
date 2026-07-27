@@ -161,7 +161,15 @@ def _process_initializer(v_shm_name: str, v_shape: tuple, v_dtype: str,
     # stream of "orange worker pipe broken on span (0, 0): WinError
     # 109" warnings as each respawned worker dies before sending
     # any results).
-    _process_geo = GeodesicMesh(V.copy(), F.copy(), build_locator=False)
+    #
+    # ``sanitize=False``: V / F here are a verbatim shared-memory
+    # replica of the parent's ``geo.V`` / ``geo.F``, which
+    # ``GeodesicMesh.__init__`` already sanitised (and Morton-reordered)
+    # in the main process.  The passes are idempotent, so re-running
+    # them in every worker only burns time — ~240 ms each on a 207 K-face
+    # mesh, ~1 s across the default 4 workers.
+    _process_geo = GeodesicMesh(V.copy(), F.copy(), build_locator=False,
+                                sanitize=False)
     shm_v.close()
     shm_f.close()
 
@@ -727,10 +735,15 @@ class _SpanWorkManager:
              broken pool anyway).
           2. Drop all bookkeeping for the orange batch: ``_readers`` /
              ``_futures`` / ``_points`` / ``active_spans`` /
-             ``done_spans`` / ``dirty_spans`` / counters.  Spans that
-             were mid-flight will simply have to be resubmitted by the
-             caller (the editor's next ``_recompute_spans`` does this
-             automatically for the active spline).
+             ``done_spans`` / ``dirty_spans`` / counters — but move the
+             keys that were mid-flight into ``dead_spans`` so the editor
+             clears their actors instead of leaving them frozen in the
+             "computing" style.  Nothing resubmits them automatically:
+             every ``_submit_geodesic_spans`` call site in
+             ``geo_splines`` is user-action driven (drag consolidation,
+             node edit, close / reopen, load, undo, ``r``), so the user
+             has to press ``r`` — which is why the loss is surfaced in
+             the log rather than swallowed.
           3. Build a fresh executor with the same initializer + V / F
              shared-memory args.
 
@@ -752,6 +765,17 @@ class _SpanWorkManager:
                 r.close()
             except OSError:
                 pass
+        # Everything that was in flight dies with the pool.  Report it
+        # as *dead* rather than merely forgetting it: the editor polls
+        # ``dead_spans`` every tick (``geo_splines._clear_dead_orange_spans``)
+        # and blanks those actors.  Dropping the keys instead left each
+        # orphaned span frozen at its last partial polyline, painted
+        # ``GEO_COLOR_COMPUTING`` + dashed forever, while the HUD
+        # reported "orange done" — and nothing ever resubmitted them,
+        # because the only ``_submit_geodesic_spans`` call sites are
+        # user actions.  ``submit_span`` re-discards its own key right
+        # after this returns, so the span being submitted is unaffected.
+        orphaned = set(self._readers) | self.active_spans
         self._readers.clear()
         self._futures.clear()
         self._points.clear()
@@ -760,8 +784,14 @@ class _SpanWorkManager:
         self.done_spans.clear()
         self.dead_spans.clear()
         self.degraded_spans.clear()
+        self.dead_spans |= orphaned
         self._batch_submitted = 0
         self._batch_done = 0
+        if orphaned:
+            log.warning(
+                "orange pool rebuild orphaned %d in-flight span(s): %s — "
+                "their curves are cleared; press R to recompute",
+                len(orphaned), sorted(orphaned))
 
         self._executor = self._build_executor()
         # The safety-net finalizer captured the OLD executor — swap it
@@ -979,7 +1009,19 @@ class _SpanWorkManager:
                 reader.close()
             except OSError as exc:
                 log.debug("cancel_span: reader close failed (%s)", exc)
-        self._futures.pop(span_key, None)
+        # Cancel, don't just forget.  ``ProcessPoolExecutor``'s manager
+        # thread only discards a queued work item when
+        # ``set_running_or_notify_cancel()`` returns False, so an
+        # un-cancelled future is always dispatched: the worker starts,
+        # solves level-1 ``path_12`` plus a full cascade sample, and
+        # only discovers the cancellation when its first ``send()``
+        # raises ``BrokenPipeError`` on the reader closed above
+        # (~100 ms, ~400 ms at ``ORANGE_SUBMESH_SUBDIV = 1``).  With 4
+        # workers and FIFO dispatch, a drag that resubmits on every
+        # 150 ms pause queues the live span behind that dead work.
+        future = self._futures.pop(span_key, None)
+        if future is not None:
+            future.cancel()   # no-op once the worker has picked it up
         self._points.pop(span_key, None)
         self.done_spans.discard(span_key)
         self.active_spans.discard(span_key)

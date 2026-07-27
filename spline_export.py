@@ -86,9 +86,12 @@ Exit codes:
 
   * ``0`` success.
   * ``2`` JSON missing / unreadable / malformed / failing schema
-    validation, override mesh missing, or the ``--obj`` / ``--vtk``
-    output path resolving onto one of this run's own inputs (the
-    session or the mesh) — see ``_guard_output_path``.
+    validation; override mesh missing, or the session's own
+    ``mesh_file`` not found (looked up next to the session as well as
+    in the CWD); the ``--obj`` / ``--vtk`` output path resolving onto
+    one of this run's own inputs (the session or the mesh) — see
+    ``_guard_output_path``; or nothing to export (no spline with >= 2
+    nodes and no landmark).
 
 Examples
 --------
@@ -255,7 +258,30 @@ def _read_mesh_VF(mesh_file: str) -> tuple[np.ndarray, np.ndarray]:
     return V, F
 
 
-def rebuild_mesh_and_nodes(data: dict):
+def _resolve_mesh_path(mesh_file: str, session_path: str | None) -> str:
+    """Resolve a session's ``mesh_file`` to an existing path.
+
+    ``mesh_file`` is whatever relative name the editor was launched with
+    (``geo_splines.py:mesh_label``), so resolving it against the process
+    CWD only works when the CLI happens to run from the directory the
+    editor ran from.  Sessions are normally kept next to their mesh, so
+    try the session's own directory first — the same fix
+    ``tests/benchmark_endpoint_local.py`` already applies internally.
+
+    Returns the first candidate that exists; falls back to the literal
+    value so the caller's ``os.path.exists`` check produces the message.
+    """
+    if os.path.isabs(mesh_file) or os.path.exists(mesh_file):
+        return mesh_file
+    if session_path:
+        cand = os.path.join(os.path.dirname(os.path.abspath(session_path)),
+                            mesh_file)
+        if os.path.exists(cand):
+            return cand
+    return mesh_file
+
+
+def rebuild_mesh_and_nodes(data: dict, session_path: str | None = None):
     """Rebuilds GeodesicMesh and node data from JSON.
 
     Two schemas are accepted, dispatched per-node by which keys are
@@ -283,6 +309,28 @@ def rebuild_mesh_and_nodes(data: dict):
         log.error("session has no 'mesh_file' key — pass --mesh to "
                   "supply the mesh explicitly")
         sys.exit(2)
+    if mesh_file not in ("__builtin__:icosahedron", "ICOSAHEDRON"):
+        resolved = _resolve_mesh_path(mesh_file, session_path)
+        if not os.path.exists(resolved):
+            # Previously this fell straight into ``pv.read`` and surfaced
+            # as a raw FileNotFoundError traceback with exit 1, while the
+            # module's own exit-code table promises a clean 2 for a
+            # missing mesh.
+            log.error("mesh referenced by the session not found: %s "
+                      "(looked next to the session too) — pass --mesh to "
+                      "supply it explicitly", mesh_file)
+            sys.exit(2)
+        if resolved != mesh_file:
+            log.info("resolved session mesh relative to the session "
+                     "directory: %s", resolved)
+        mesh_file = resolved
+        # Write the resolved path back so downstream consumers see the
+        # mesh actually loaded — ``_guard_output_path`` compares the
+        # export target against it, and an unresolved relative name
+        # would fail its ``os.path.exists`` test and silently disarm
+        # the overwrite guard.  ``main`` already mutates this key for
+        # ``--mesh``, so the ownership convention is established.
+        data['mesh_file'] = mesh_file
     log.info("loading mesh: %s", mesh_file)
     # Both the prefixed sentinel ("__builtin__:icosahedron") and the
     # legacy plain string ("ICOSAHEDRON") map to the in-memory demo
@@ -419,9 +467,17 @@ def compute_blue(geo, nodes, closed, n_samples) -> list[np.ndarray]:
         # ``eval_cascade_at_t`` orange path takes a pre-reversed copy.
         path_a = n1['path_a']
 
-        # Geodesic H_out → H_in via local submesh solver
+        # Geodesic H_out → H_in via local submesh solver.  Guarded for
+        # the same reason ``_orange_span_worker`` guards its level-1
+        # solve: one bad span must degrade to the hybrid fallback, not
+        # abort the whole export with a traceback and exit 1.
         log.debug("span %d: computing path_12 (H_out -> H_in)", i)
-        path_12, was_fallback = geo.compute_endpoint_local(n0['p_b'], n1['p_a'])
+        try:
+            path_12, was_fallback = geo.compute_endpoint_local(
+                n0['p_b'], n1['p_a'])
+        except (RuntimeError, ValueError, TypeError, IndexError) as exc:
+            log.debug("span %d: path_12 solver failed: %s", i, exc)
+            path_12, was_fallback = None, True
         if path_12 is None or len(path_12) < 2:
             path_12 = None
             degraded_spans.append(i)
@@ -1043,7 +1099,8 @@ def main():
         log.info("mesh override: %s (replacing session's '%s')",
                  args.mesh_override, data.get('mesh_file', '<unset>'))
         data['mesh_file'] = args.mesh_override
-    geo, splines, splines_closed = rebuild_mesh_and_nodes(data)
+    geo, splines, splines_closed = rebuild_mesh_and_nodes(
+        data, session_path=args.json_file)
 
     compute_fn = {'b': compute_blue, 'o': compute_orange,
                   'k': compute_interp}
@@ -1056,11 +1113,21 @@ def main():
     log.info("samples/span: %d", args.samples)
 
     all_spline_points = []
+    # Single-node splines are *landmarks*, not curves.  The GUI's ``v``
+    # export emits them as ``VTK_VERTEX`` cells (``write_vtk`` has taken
+    # a ``landmarks`` argument all along); the CLI silently dropped
+    # them, so the same session exported through the two paths produced
+    # different files.
+    landmarks: list[np.ndarray] = []
     for sid, (nodes, closed) in enumerate(zip(splines, splines_closed, strict=False)):
         n_nodes = len(nodes)
         log.info("spline %d: %d nodes, %s",
                  sid, n_nodes, 'closed' if closed else 'open')
 
+        if n_nodes == 1:
+            landmarks.append(np.asarray(nodes[0]['origin'], dtype=float))
+            all_spline_points.append([])
+            continue
         if n_nodes < 2:
             all_spline_points.append([])
             continue
@@ -1069,6 +1136,22 @@ def main():
         span_pts_list = compute_fn[args.layer](
             geo, nodes, closed, args.samples)
         all_spline_points.append(span_pts_list)
+
+    n_spans_total = sum(len(s) for s in all_spline_points)
+    if landmarks and not args.vtk:
+        # Only the VTK writer has a cell type for a bare point.
+        log.warning("%d landmark (1-node) spline(s) are only representable "
+                    "in the VTK output — not written to %s",
+                    len(landmarks), "OBJ" if args.obj else "CSV")
+    if n_spans_total == 0 and not landmarks:
+        # Refuse instead of "succeeding" with nothing: ``write_vtk``
+        # returns before opening the file, so a stale export from a
+        # previous run stayed on disk and read as the current one, and
+        # ``write_obj`` / ``write_csv`` emitted headers-only output —
+        # all with "done." and exit 0.
+        log.error("nothing to export: no spline in %s has >= 2 nodes "
+                  "(layer %r)", args.json_file, args.layer)
+        sys.exit(2)
 
     # The output basename comes from the session, so it can land on the
     # mesh this very run just read (``heart.json`` + ``heart.obj``).
@@ -1085,8 +1168,9 @@ def main():
     elif args.vtk:
         vtk_path = os.path.splitext(args.json_file)[0] + ".vtk"
         _guard_output_path(vtk_path, _inputs)
-        log.info("exporting to binary legacy VTK: %s", vtk_path)
-        write_vtk(vtk_path, all_spline_points)
+        log.info("exporting to binary legacy VTK: %s (%d landmark(s))",
+                 vtk_path, len(landmarks))
+        write_vtk(vtk_path, all_spline_points, landmarks=landmarks)
     else:
         write_csv(all_spline_points, sys.stdout)
 

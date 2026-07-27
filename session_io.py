@@ -84,10 +84,25 @@ def _validate_session_dict(data: dict) -> None:
             # ``bool`` is a subclass of ``int``; rejecting it explicitly
             # prevents corrupt JSON like ``"origin": [true, 0, 0]`` from
             # silently passing validation and crashing in ``find_face``.
-            if (isinstance(x, bool)
-                    or not isinstance(x, (int, float))
-                    or x != x  # NaN
-                    or x == _POS_INF or x == _NEG_INF):
+            if isinstance(x, bool) or not isinstance(x, (int, float)):
+                raise ValueError(f"{label}[{j}] must be a finite number")
+            # Python ints are arbitrary-precision, so a hand-edited
+            # 400-digit coordinate is a genuine ``int`` that is neither
+            # NaN nor ±inf and sails past the checks below.  It then
+            # raises ``OverflowError`` much later, inside
+            # ``np.asarray(record['origin'], dtype=float)`` — by which
+            # point ``_load_from_data`` has already aborted the drag,
+            # cleared every curve cache and emptied ``self.splines``,
+            # i.e. exactly the half-loaded state this function exists
+            # to prevent.  Do the float64 conversion the loader will do
+            # here, where rejecting is still free.
+            try:
+                xf = float(x)
+            except (OverflowError, ValueError):
+                raise ValueError(
+                    f"{label}[{j}] is out of range for a 64-bit float"
+                ) from None
+            if xf != xf or xf == _POS_INF or xf == _NEG_INF:  # NaN / ±inf
                 raise ValueError(f"{label}[{j}] must be a finite number")
 
     for si, sd in enumerate(splines):

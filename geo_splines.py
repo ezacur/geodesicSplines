@@ -209,6 +209,9 @@ _HUD_TEXTS: dict[str, str] = {
     "refined_exact": "REFINED (EXACT)",
     "node_inserted": "NODE INSERTED",
     "node_inserted_interp": "NODE INSERTED (INTERP)",
+    "hover_stale": "SPLINE CHANGED — move the cursor to re-aim, then double-click",
+    "span_no_handles": "SPLINE {sid}: {n} SPAN(S) HAVE NO CURVE (handles unsolvable)",
+    "handler_failed": "{name} FAILED — see the console log",
     "loop_closed_break": "LOOP CLOSED + BREAK",
     "loop_opened": "LOOP OPENED",
     "break_removed": "BREAK REMOVED",
@@ -239,6 +242,13 @@ _HUD_TEXTS: dict[str, str] = {
     "guides_off":        "GUIDES OFF",
     "guides_none":       "NO GUIDES LOADED — use Ctrl+X to import",
 }
+
+
+# Surplus node-label actors kept alive before ``_ensure_node_labels``
+# trims the pool.  Large enough that ordinary add / remove churn never
+# destroys an actor, small enough that the pool cannot silently grow to
+# the largest session ever opened in this process.
+_NODE_LABEL_POOL_SLACK: int = 32
 
 
 def _t(key: str, **kwargs) -> str:
@@ -1169,6 +1179,45 @@ class GeodesicSplineApp(MidpointShooterApp):
                     }
         return best_info, best_pt_3d
 
+    def _hover_info_live(self, info: dict | None) -> bool:
+        """True when *info* still describes the spline it was built from.
+
+        The telescopic-sight payload carries ``spline_idx`` / ``span_idx``
+        captured on a mouse-move, but it is consumed later, by a
+        double-click.  Every structural mutation that can happen in
+        between is keyboard-driven (Backspace, ``C``, ``l``, Ctrl+Z,
+        Dbl-click R), so the cursor never moves and the payload is never
+        refreshed.  Acting on it then either raises ``IndexError`` deep
+        in ``_insert_node_at_curve`` — after ``_push_undo`` has already
+        spent an undo slot and cleared the redo stack — or, when the
+        stale index happens to stay in range, silently inserts into a
+        *different* span at a 3-D point taken from a curve that no
+        longer exists there.
+
+        Identity comparison, not ``==``: the node objects must be the
+        very same instances, so a rebuild that produced equal-looking
+        nodes still counts as stale.
+        """
+        if info is None:
+            return False
+        sid = info.get('spline_idx')
+        snap = info.get('nodes_snapshot')
+        if snap is None or not isinstance(sid, int):
+            return False
+        if not 0 <= sid < len(self.splines):
+            return False
+        if bool(self.splines_closed[sid]) != info.get('closed_snapshot'):
+            return False
+        cur = self.splines[sid]
+        if len(cur) != len(snap) or any(
+                a is not b for a, b in zip(cur, snap, strict=True)):
+            return False
+        # ``span_idx == -1`` is the interp layer's sentinel — it addresses
+        # the whole spline, not one span, so the node check above is the
+        # whole contract.
+        span_idx = info.get('span_idx', -1)
+        return span_idx == -1 or 0 <= span_idx < self._span_count(sid)
+
     def _hide_curve_hover_marker(self) -> None:
         """Hide both actors that make up the telescopic-sight hover
         marker (circumference + crosshair).  Idempotent.
@@ -1268,6 +1317,22 @@ class GeodesicSplineApp(MidpointShooterApp):
         caller should issue a render.
         """
         if info is not None and pt_3d is not None:
+            # Stamp the structure the payload describes.  ``info`` is
+            # consumed on a later event (the double-click that inserts a
+            # node), and every structural mutation in between —
+            # backspace, close / reopen, load, undo, spline delete — is
+            # keyboard-driven, so no intervening mouse-move refreshes
+            # it.  Validating the stamp at the point of use is one
+            # check that cannot rot; clearing the payload in each of the
+            # eight mutators would be a new invalidation path to keep in
+            # sync forever.  See ``_hover_info_live``.
+            sid = info['spline_idx']
+            if 0 <= sid < len(self.splines):
+                info['nodes_snapshot'] = tuple(self.splines[sid])
+                info['closed_snapshot'] = bool(self.splines_closed[sid])
+            else:
+                info['nodes_snapshot'] = None
+                info['closed_snapshot'] = None
             self.curve_hover_info = info
             self._orient_hover_marker(pt_3d)
             # Stash the geometry inputs so the camera-orbit hook can
@@ -1508,7 +1573,7 @@ class GeodesicSplineApp(MidpointShooterApp):
         # Ctrl+Z / Ctrl+Y — raw VTK observer (PyVista add_key_event
         # does not support modifier keys).
         self._observer_tags.append((_vtki, _vtki.AddObserver(
-            'KeyPressEvent', self._on_key_press_ctrl, 1.0)))
+            'KeyPressEvent', self._guard_observer(self._on_key_press_ctrl), 1.0)))
         # Node-index labels: 'n' must be a hold-to-show shortcut, not a
         # toggle, so PyVista's add_key_event (press-only) is not enough.
         # Raw VTK observers on both press AND release let us track the
@@ -1517,16 +1582,47 @@ class GeodesicSplineApp(MidpointShooterApp):
         # cheap so that's fine and also keeps labels positioned when
         # the user drags a node while holding 'n'.
         self._observer_tags.append((_vtki, _vtki.AddObserver(
-            'KeyPressEvent', self._on_key_press_labels, 1.0)))
+            'KeyPressEvent', self._guard_observer(self._on_key_press_labels), 1.0)))
         self._observer_tags.append((_vtki, _vtki.AddObserver(
-            'KeyReleaseEvent', self._on_key_release_labels, 1.0)))
+            'KeyReleaseEvent', self._guard_observer(self._on_key_release_labels), 1.0)))
         # Guide polylines: 'x' is hold-to-preview-opaque + release-to-
         # toggle.  Same raw-observer pattern as 'n' for the same
         # reason — PyVista's ``add_key_event`` is press-only.
         self._observer_tags.append((_vtki, _vtki.AddObserver(
-            'KeyPressEvent', self._on_key_press_guides, 1.0)))
+            'KeyPressEvent', self._guard_observer(self._on_key_press_guides), 1.0)))
         self._observer_tags.append((_vtki, _vtki.AddObserver(
-            'KeyReleaseEvent', self._on_key_release_guides, 1.0)))
+            'KeyReleaseEvent', self._guard_observer(self._on_key_release_guides), 1.0)))
+
+    def _guard_observer(self, fn):
+        """Wrap a raw VTK observer so a failure is *visible*.
+
+        ``_on_press`` / ``_on_move`` / ``_on_right_press`` /
+        ``_on_poll_timer`` each have a hand-written ``_impl`` guard; the
+        key observers wired above had none, and neither VTK nor
+        PyVista's dispatcher guards for us.  VTK does not die on a
+        raising Python observer — it calls ``PyErr_Print()`` and carries
+        on — so the real consequence is a *silent* one: the traceback
+        goes to stderr, which a GUI user never sees, the HUD is
+        unchanged, and the shortcut simply appears to do nothing.
+
+        Returns a plain function (not a bound method) — ``AddObserver``
+        holds the reference, and the tag is captured into
+        ``_observer_tags`` so ``cleanup()`` still detaches it.
+        """
+        name = getattr(fn, '__name__', repr(fn))
+
+        def _wrapper(obj, event):
+            try:
+                fn(obj, event)
+            except Exception:  # noqa: BLE001 — VTK observer must not propagate
+                log.exception("%s failed", name)
+                try:
+                    self._set_hud(_t("handler_failed", name=name), 'red',
+                                  sticky_seconds=4.0)
+                    self.plotter.render()
+                except Exception:  # noqa: BLE001 — HUD is best-effort
+                    pass
+        return _wrapper
 
     # Single source of truth for the editor's keybinding help.  Used
     # both by the on-screen panel (``_HELP_TEXT``, narrow column) and
@@ -1697,11 +1793,13 @@ class GeodesicSplineApp(MidpointShooterApp):
     def _on_key_release_labels(self, obj, event) -> None:
         """Raw VTK KeyRelease handler — hides node-index labels when
         the user releases 'n'.  See ``_on_key_press_labels`` for the
-        held-down counterpart and the rationale for the modifier
-        check."""
+        held-down counterpart.
+
+        No modifier re-check here: ``_hide_node_labels`` is a no-op
+        unless a press actually showed the labels, so that flag is the
+        correct gate.  Re-checking would swallow the release of a user
+        who pressed Ctrl *after* 'n', leaving the labels stuck on."""
         iren = self.plotter.iren.interactor
-        if iren.GetControlKey() or iren.GetAltKey():
-            return
         key = iren.GetKeySym()
         if key in ('n', 'N'):
             self._hide_node_labels()
@@ -2748,10 +2846,20 @@ class GeodesicSplineApp(MidpointShooterApp):
 
         # Node insertion on curve hover takes priority
         if self.curve_hover_info is not None:
-            self._push_undo()
-            self._insert_node_at_curve(self.curve_hover_info)
+            info = self.curve_hover_info
             self.curve_hover_info = None
             self._hide_curve_hover_marker()
+            if not self._hover_info_live(info):
+                # The spline changed under a marker the user never moved
+                # off.  Drop the gesture instead of inserting into a span
+                # that moved or vanished — and do it *before* the
+                # ``_push_undo`` below, so a no-op click cannot spend an
+                # undo slot and wipe the redo stack.
+                self._set_hud(_t("hover_stale"), 'yellow')
+                self.plotter.render()
+                return
+            self._push_undo()
+            self._insert_node_at_curve(info)
             return
 
         pt, cid = self._pick()
@@ -3035,6 +3143,13 @@ class GeodesicSplineApp(MidpointShooterApp):
             # Always clean up the preview sphere — even if mainloop
             # exits abnormally (uncaught Tk exception, signal).
             self._hide_coord_preview()
+            # ...and the interpreter.  ``_on_ok`` / ``_on_cancel``
+            # normally destroy it, so this only fires on the abnormal
+            # exit; destroying twice raises TclError, hence the guard.
+            try:
+                root.destroy()
+            except tk.TclError:
+                pass
         return result['value']
 
     def _update_coord_preview(self, target_xyz: tuple[float, float, float]) -> None:
@@ -3419,7 +3534,13 @@ class GeodesicSplineApp(MidpointShooterApp):
         if len(nodes) < 3:
             return
 
-        self._push_undo()
+        # ``_push_undo`` is deliberately NOT called yet: both the
+        # degenerate-vector check below and a failed closing shoot bail
+        # out having mutated nothing, and an undo entry pushed for a
+        # no-op click still clears the redo stack.  Same defect class
+        # ``_commit_pending_drag_undo`` was introduced to fix for marker
+        # clicks.  ``compute_shoot`` is a pure query, so everything the
+        # decision needs can be resolved first.
         did_close = False
         first, last = nodes[0], nodes[-1]
         vec = first.origin - last.origin
@@ -3438,14 +3559,19 @@ class GeodesicSplineApp(MidpointShooterApp):
             # arrives at the first node moving along +v_dir, G1 with
             # span 0.  Shooting +v_dir placed the handle on the far
             # side and hooked the closing span around the node.
+            path_a = None
             if first.p_a is None:
                 path_a = self.geo.compute_shoot(
                     first.origin, -v_dir, h_len, first.face_idx)
+            # Only close if the closing handle exists (already set, or
+            # the shoot just succeeded).  Everything above this point is
+            # read-only, so the undo slot is spent exactly when the
+            # close actually happens.
+            if first.p_a is not None or path_a is not None:
+                self._push_undo()
                 if path_a is not None:
                     first.p_a, first.path_a = path_a[-1], path_a
                     first.update_visuals(self.plotter)
-            # Only close if first.p_a is valid (shoot succeeded)
-            if first.p_a is not None:
                 self.splines_closed[sid] = True
                 did_close = True
                 self._recompute_spans()
@@ -3497,6 +3623,16 @@ class GeodesicSplineApp(MidpointShooterApp):
             self._rebuild_node_index()
             if self.splines_closed[self.active_spline_idx]:
                 self._reopen_spline_loop(self.active_spline_idx)
+                # ``_reopen_spline_loop`` is a pure state mutation — its
+                # docstring makes the caller drive the recompute, and the
+                # sibling reopen path below does exactly that.  Without
+                # it the interp (black) curve keeps rendering the
+                # periodic fit for a now-open spline (its fingerprint at
+                # ``_recompute_interp_curve`` would catch the flag flip,
+                # but nothing calls it) and the didactic scaffold keeps
+                # drawing the wrap-around span that was just deleted.
+                self._recompute_spans()
+                self._submit_geodesic_spans()
                 self._set_hud(_t("loop_opened"), 'yellow')
             else:
                 self._set_hud(_t("break_removed"), 'yellow')
@@ -3814,6 +3950,15 @@ class GeodesicSplineApp(MidpointShooterApp):
         if pts is None or len(pts) < 2:
             if actor.GetVisibility():
                 self._hover_curve_dirty = True
+            # Clear geometry so stale data can't reappear — same
+            # rationale as ``_set_geo_span`` / ``_set_interp_curve``.
+            # Hiding alone is not enough: ``_refresh_visuals`` and
+            # ``_toggle_layer`` both re-show every span actor of a
+            # spline unconditionally, so a blanked span (e.g. a node
+            # whose handles failed to solve, or an undo back to that
+            # state) would pop back at its pre-blank shape.
+            pd.points = np.zeros((0, 3), dtype=float)
+            pd.Modified()
             actor.SetVisibility(False)
             return
         update_line_inplace(pd, pts)
@@ -3959,8 +4104,18 @@ class GeodesicSplineApp(MidpointShooterApp):
 
         adaptive = sc.ADAPTIVE_SAMPLING
         ctrl = self._ctrl_scratch  # (4, 3) view; rows reused per span
+        handleless: list[int] = []
         for i, n0, n1 in self._iter_affected_spans(sid, node):
             if n0.p_b is None or n1.p_a is None:
+                # A handle is unsolvable (``compute_shoot`` returned
+                # ``None`` — degenerate direction, boundary-adjacent
+                # node) so this span has no curve at all.  Blank it, but
+                # say so: a span silently vanishing mid-edit is the same
+                # class of quiet failure the red fallback repaint exists
+                # to prevent.  ``spline_export.compute_blue`` already
+                # reports this exact condition; the editor was the mute
+                # one.
+                handleless.append(i)
                 self._set_span(sid, i, None)
                 continue
             ctrl[0] = n0.origin
@@ -4003,6 +4158,17 @@ class GeodesicSplineApp(MidpointShooterApp):
                     projected, tol=self._secant_tol,
                     max_depth=self.scfg.SECANT_MAX_DEPTH)
             self._set_span(sid, i, projected, dragging=is_preview_drag)
+
+        # Report skipped spans once per consolidation.  Gated on
+        # ``is_preview_drag`` so a drag through the condition does not
+        # repaint the HUD at frame rate; the log line is unconditional.
+        if handleless:
+            log.warning(
+                "spline %d: %d span(s) have no curve (handles missing or "
+                "unsolvable): %s", sid, len(handleless), handleless)
+            if not is_preview_drag:
+                self._set_hud(_t("span_no_handles", sid=sid,
+                                 n=len(handleless)), 'yellow')
 
         # Interpolation curve tracks node origins — recompute on every call.
         self._recompute_interp_curve(sid, is_dragging=is_preview_drag)
@@ -4414,16 +4580,21 @@ class GeodesicSplineApp(MidpointShooterApp):
         import tkinter as tk
         from tkinter import filedialog
 
+        # ``finally``: without it an exception out of the dialog (a
+        # ``TclError`` on a headless / broken display is the realistic
+        # one) leaked a live Tcl interpreter per attempt.
         root = tk.Tk()
-        root.withdraw()
-        fpaths = filedialog.askopenfilenames(
-            title="Load guide polylines (cell type 3 / 4)",
-            filetypes=[
-                ("PyVista-readable", "*.vtk *.vtp *.ply *.stl *.obj"),
-                ("All files", "*.*"),
-            ],
-        )
-        root.destroy()
+        try:
+            root.withdraw()
+            fpaths = filedialog.askopenfilenames(
+                title="Load guide polylines (cell type 3 / 4)",
+                filetypes=[
+                    ("PyVista-readable", "*.vtk *.vtp *.ply *.stl *.obj"),
+                    ("All files", "*.*"),
+                ],
+            )
+        finally:
+            root.destroy()
         if not fpaths:
             return
 
@@ -4499,7 +4670,13 @@ class GeodesicSplineApp(MidpointShooterApp):
                 pd_lines, color=sc.GUIDE_COLOR_HEX,
                 line_width=sc.GUIDE_LINE_WIDTH, opacity=sc.GUIDE_OPACITY,
                 lighting=False, pickable=False,
-                name=f"guide_{os.path.basename(fpath)}",
+                # Index-prefixed: PyVista's ``name=`` *replaces* any
+                # existing actor with the same name, so keying on the
+                # basename alone silently dropped one of two same-named
+                # guides picked from different directories in a single
+                # multi-select (``left/curves.vtk`` + ``right/curves.vtk``)
+                # while the HUD still reported both loaded.
+                name=f"guide_{len(self._guide_actors)}_{os.path.basename(fpath)}",
             )
             self._set_depth_priority(actor, sc.DEPTH_GUIDE)
             actor.SetVisibility(self._guide_visible)
@@ -4562,6 +4739,19 @@ class GeodesicSplineApp(MidpointShooterApp):
             # pixel-wise by the mesh in the z-buffer.
             self._overlay_renderer.AddViewProp(actor)
             self._node_labels.append(actor)
+
+        # Trim a grossly oversized pool.  Pooling exists to absorb the
+        # ±1 churn of adding / removing nodes, so a small surplus is
+        # kept deliberately; without any trim, though, the actor count
+        # was a session-lifetime high-water mark (load a 500-node
+        # session, then a 5-node one, and 495 actors stayed attached to
+        # the overlay renderer) — which the docstring above already
+        # claimed did not happen.
+        surplus = n_have - n_needed
+        if surplus > _NODE_LABEL_POOL_SLACK:
+            for label in self._node_labels[n_needed:]:
+                self._overlay_renderer.RemoveViewProp(label)
+            del self._node_labels[n_needed:]
 
         # Update or hide pre-existing actors.
         for i, label in enumerate(self._node_labels):
@@ -4686,12 +4876,18 @@ class GeodesicSplineApp(MidpointShooterApp):
           - was *hidden*  →  keep visible and start a 500 ms ease-out
             fade from 1.0 down to ``GUIDE_OPACITY``.
 
-        Modifier check mirrors the press path.  See
-        ``_on_key_press_guides`` for the captured-state semantics.
+        Deliberately does **not** re-check the modifier keys.  The press
+        path already refuses to capture while a modifier is held, so
+        ``_x_hold_was_visible is None`` is the correct and sufficient
+        gate for "this release does not belong to a hold cycle" —
+        Ctrl+X still cannot reach the toggle.  Re-checking here instead
+        swallowed legitimate releases: press ``x``, then press Shift
+        while still holding ``x``, and the release was dropped, leaving
+        the guides pinned at opacity 1.0 with the cycle still open (the
+        following ``x`` tap was then eaten by the captured-state guard
+        in the press handler).  Same shape as ``_on_key_release_labels``.
         """
         iren = self.plotter.iren.interactor
-        if iren.GetControlKey() or iren.GetAltKey() or iren.GetShiftKey():
-            return
         key = iren.GetKeySym()
         if key not in ('x', 'X'):
             return
@@ -5847,12 +6043,14 @@ class GeodesicSplineApp(MidpointShooterApp):
         initial_file = jsons[0] if jsons else ''
 
         root = tk.Tk()
-        root.withdraw()
-        fpath = filedialog.askopenfilename(
-            title="Load splines",
-            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
-            initialfile=initial_file)
-        root.destroy()
+        try:
+            root.withdraw()
+            fpath = filedialog.askopenfilename(
+                title="Load splines",
+                filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+                initialfile=initial_file)
+        finally:
+            root.destroy()
 
         if not fpath:
             return

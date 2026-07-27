@@ -897,7 +897,7 @@ class GeodesicMesh:
     USE_ASTAR_CORRIDOR = True
 
     def __init__(self, V: np.ndarray | object, F: np.ndarray | None = None,
-                 *, build_locator: bool = True):
+                 *, build_locator: bool = True, sanitize: bool = True):
         """Build a GeodesicMesh from raw arrays or a ``pv.PolyData``.
 
         ``build_locator`` (default True) controls whether the
@@ -906,6 +906,16 @@ class GeodesicMesh:
         which uses the KDTree — they pass ``build_locator=False`` to
         skip the ~250 ms locator construction *per worker process*
         (~1 s saved across 4 workers on a 240 K-face mesh).
+
+        ``sanitize`` (default True) controls the
+        :meth:`_sanitize_for_solver` topology cleanup.  Pass ``False``
+        **only** when V / F are known to be the output of a previous
+        sanitised build — the orange workers replicate the parent's
+        ``geo.V`` / ``geo.F`` verbatim through shared memory, so the
+        passes provably find nothing and only cost time (~240 ms per
+        worker on a 207 K-face mesh).  Sanitisation is idempotent, so
+        this is a pure time saving, never a semantic change.  Any
+        caller reading a mesh off disk must leave it True.
         """
         self._build_locator_enabled = build_locator
         if hasattr(V, 'points') and hasattr(V, 'faces'):
@@ -948,8 +958,21 @@ class GeodesicMesh:
         # is logged so the user knows what was changed.  Sanitisation
         # runs **before** Morton reorder + every derived structure so
         # the rest of ``__init__`` only ever sees a clean topology.
-        self.V, self.F, sanitize_report = self._sanitize_for_solver(
-            self.V, self.F)
+        #
+        # ``sanitize=False`` skips it for callers whose V / F provably
+        # came out of a previous run (the orange workers replicate the
+        # parent's already-sanitised ``geo.V`` / ``geo.F`` through
+        # shared memory).  The passes are idempotent by construction —
+        # each removes a defect class the next run can no longer find —
+        # so re-running them can only burn time.
+        if sanitize:
+            self.V, self.F, sanitize_report = self._sanitize_for_solver(
+                self.V, self.F)
+        else:
+            sanitize_report = dict.fromkeys(
+                ('self_edge_faces', 'duplicate_faces', 'non_manifold_faces',
+                 'winding_faces', 'vertex_splits', 'unreferenced_verts',
+                 'total_faces_dropped'), 0)
         _changed = (sanitize_report['total_faces_dropped'] > 0
                     or sanitize_report['vertex_splits'] > 0)
         if _changed:
@@ -1063,6 +1086,14 @@ class GeodesicMesh:
         self._vtk_cell_id = vtk.reference(0)
         self._vtk_sub_id = vtk.reference(0)
         self._vtk_dist2 = vtk.reference(0.0)
+        # True only while ``_vtk_cp`` pairs with the face ``find_face``
+        # actually returned.  ``find_face`` writes ``_vtk_cp`` on every
+        # locator call but *rejects* the locator's cell when its
+        # barycentric coords are out of range and answers from the
+        # KDTree instead — leaving a closest-point that belongs to a
+        # discarded face.  Consumers must check this before pairing the
+        # two.  See ``compute_shoot``.
+        self._vtk_cp_valid = False
 
         # Face dual graph (CSR sparse) — built lazily on first
         # ``_dijkstra_corridor`` call.  Most sessions never trigger
@@ -1619,14 +1650,19 @@ class GeodesicMesh:
         coords (locator precision issue on irregular meshes), falls back
         to KDTree nearest-vertex + barycentric scoring.
         """
+        self._vtk_cp_valid = False
         if self.locator is not None:
             self.locator.FindClosestPoint(
                 p, self._vtk_cp, self._vtk_cell_id, self._vtk_sub_id, self._vtk_dist2)
             cid = int(self._vtk_cell_id)
             u, v, w = self.get_barycentric(p, cid)
             if min(u, v, w) >= -0.1 and max(u, v, w) <= 1.1:
+                self._vtk_cp_valid = True
                 return cid
-            # Locator gave bad face — fall through to KDTree
+            # Locator gave bad face — fall through to KDTree.  Note
+            # ``_vtk_cp`` was already overwritten with the closest point
+            # of the face we are about to discard, so it stays flagged
+            # invalid for the caller.
         _, vi = self._kdtree.query(p)
         vi = int(vi)
         cands = self._vf_data[self._vf_offsets[vi]:self._vf_offsets[vi + 1]]
@@ -1708,15 +1744,25 @@ class GeodesicMesh:
         # world origin and the inner loop returned None for every node.
         # Only snap to the locator's closest-point when we actually have
         # a locator; otherwise trust the input ``p_start``.
+        #
+        # ``_vtk_cp_valid`` is the second half of that condition: when
+        # ``find_face`` rejects the locator's cell (bad barycentrics on
+        # an irregular mesh) it answers from the KDTree, but ``_vtk_cp``
+        # already holds the closest point of the *discarded* face.
+        # Snapping to it anyway paired a point with a face it does not
+        # lie on — precisely the inconsistency the surrounding
+        # validation exists to catch — and ``_ray_edge_jit``, starting
+        # outside its own face, then found no forward crossing and fell
+        # into the phase-2b vertex fallback.
         if face_idx is None:
             face_idx = self.find_face(p_start)
-            if self.locator is not None:
+            if self._vtk_cp_valid:
                 p_start = np.array(self._vtk_cp, dtype=float)
         else:
             u, v, w = self.get_barycentric(p_start, face_idx)
             if min(u, v, w) < -0.1 or max(u, v, w) > 1.1:
                 face_idx = self.find_face(p_start)
-                if self.locator is not None:
+                if self._vtk_cp_valid:
                     p_start = np.array(self._vtk_cp, dtype=float)
 
         curr_p = np.empty(3, dtype=float)
@@ -2066,8 +2112,10 @@ class GeodesicMesh:
     def _try_endpoint_insertion(self, p_start, p_end):
         """Single attempt at topology insertion + solver construction.
 
-        Returns ``(path, success)`` where *path* is the geodesic polyline
-        and *success* is True if the solver returned a usable path.
+        Returns ``(path, success, degraded)`` where *path* is the
+        geodesic polyline, *success* is True if the attempt produced a
+        usable result, and *degraded* marks that result as a
+        straight-line stub rather than a real geodesic.
 
         ``success`` is False (and *path* is None) when the solver
         returns ``None`` or a degenerate single-point path — both of
@@ -2091,12 +2139,25 @@ class GeodesicMesh:
                                             adj_buf=adj_buf)
         nf = self._remove_degenerate_faces(F_buf, nf)
         if idx_s == idx_e:
-            return np.array([p_start, p_end]), True
+            # Both endpoints resolved to the SAME vertex.  Two routes get
+            # here: the ``bary > 1 - snap_eps`` snap (the points really
+            # are coincident — the 2-point stub is then correct), and
+            # ``_add_point_buf``'s area-degenerate revert, which returns
+            # a face *corner* that can sit a full edge length from the
+            # requested position.  In the second case this is a straight
+            # 3-D chord between genuinely distant points — the "phantom
+            # curve" the red fallback repaint exists to expose — so it
+            # must not be reported as a real geodesic.  Every other site
+            # handling this condition already flags it:
+            # ``_try_solve_on_region`` returns ``'trivial'``,
+            # ``compute_endpoint_from_origin`` and the vertex-snap
+            # fallback below both return ``True``.
+            return np.array([p_start, p_end]), True, True
         solver = pp3d.EdgeFlipGeodesicSolver(V_buf[:nv], F_buf[:nf])
         path = solver.find_geodesic_path(idx_s, idx_e)
         if path is None or len(path) < 2:
-            return None, False
-        return path, True
+            return None, False, False
+        return path, True, False
 
     # --- Local submesh geodesic solver ---
 
@@ -2388,7 +2449,21 @@ class GeodesicMesh:
 
             solver = pp3d.EdgeFlipGeodesicSolver(V_buf[:nv], F_buf[:nf])
             path = solver.find_geodesic_path(idx_s, idx_e)
-        except (RuntimeError, ValueError, TypeError, IndexError) as exc:
+        except IndexError:
+            # NOT a routine solver failure.  ``V_buf`` / ``F_buf`` /
+            # ``adj_buf`` are sized for exactly two insertions, so an
+            # out-of-bounds write here means the buffer provisioning and
+            # the insertion path have drifted apart.  Folding it into
+            # the ``('error', None)`` branch below turned that into
+            # "widen the seed and retry", then a silent global fallback
+            # — i.e. a correctness bug would surface only as
+            # unexplained slowness.  Log it loudly and keep escalating
+            # (the global solver is still correct) rather than swallow.
+            log.exception(
+                "local submesh solver raised IndexError — buffer "
+                "provisioning bug, not a solver failure")
+            return ('error', None)
+        except (RuntimeError, ValueError, TypeError) as exc:
             # pp3d / topology-insertion failure on this submesh region.
             # Caller (compute_endpoint_local) treats ('error', None) as a
             # signal to widen the seed and retry.
@@ -3113,6 +3188,21 @@ class GeodesicMesh:
         #               nudge inward as last-resort to keep the
         #               1-to-3 path manifold.  Tight (1e-7) so the
         #               nudge fires only when geometrically necessary.
+        #
+        # The 4-decade window ``[nudge_eps, split_eps)`` where a
+        # 2-to-4-unavailable point gets neither treatment is
+        # **deliberate**, not an oversight.  Widening ``nudge_eps`` to
+        # ``split_eps`` looks like the obvious fix and is worse: the
+        # nudge displaces p by ~1 % of the triangle, so points at
+        # ``min_bary = 0.99e-3`` would jump while those at ``1.01e-3``
+        # stay put — reintroducing at 1e-3 exactly the discrete
+        # inserted-vertex jump that the 2-to-4 split was built to remove
+        # (see ARCHITECTURE, "Topology insertion").  A 1e5×-thin
+        # sub-face is poorly conditioned but *faithful*; a 1 %
+        # positional jump is a visible artefact in the cascade.  The
+        # ``area < 1e-15`` revert remains the backstop for the genuinely
+        # degenerate case.  Re-open with a reproduction where the sliver
+        # (not the discontinuity) is what breaks the solver.
         snap_eps = 1e-7
         split_eps = 1e-3
         nudge_eps = 1e-7
@@ -3187,6 +3277,12 @@ class GeodesicMesh:
                          np.linalg.norm(p - V_buf[fc])]
                 return [fa, fb, fc][np.argmin(dists)], nv - 1, nf
 
+        # Only now that the split is committed (the area check above
+        # reverts and returns early otherwise) is it safe to publish the
+        # new topology to the adjacency buffer.
+        if adj_buf is not None:
+            self._relink_adj_1to3(adj_buf, face_idx, nf)
+
         return p_idx, nv, nf + 2
 
     def compute_endpoint(self, p_start: F64Array,
@@ -3213,11 +3309,11 @@ class GeodesicMesh:
 
         # Attempt 1: exact positions
         try:
-            path, ok = self._try_endpoint_insertion(p_start, p_end)
+            path, ok, degraded = self._try_endpoint_insertion(p_start, p_end)
             if ok:
                 assert path is not None
                 self.diagnose_path(path, "endpoint")
-                return path, False
+                return path, degraded
         except (RuntimeError, ValueError, TypeError, IndexError) as exc:
             log.debug("compute_endpoint attempt-1 failed: %s", exc)
 
@@ -3237,11 +3333,11 @@ class GeodesicMesh:
             nudge_e = max(1e-6, min(1e-2, min_edge_e * 0.01))
             p_s2 = p_start * (1.0 - nudge_s) + A_s * nudge_s
             p_e2 = p_end * (1.0 - nudge_e) + A_e * nudge_e
-            path, ok = self._try_endpoint_insertion(p_s2, p_e2)
+            path, ok, degraded = self._try_endpoint_insertion(p_s2, p_e2)
             if ok:
                 assert path is not None
                 self.diagnose_path(path, "endpoint-nudged")
-                return path, False
+                return path, degraded
         except (RuntimeError, ValueError, TypeError, IndexError) as exc:
             log.debug("compute_endpoint attempt-2 (nudged) failed: %s", exc)
 
@@ -3283,12 +3379,129 @@ class GeodesicMesh:
         return n_valid
 
     @staticmethod
+    def _relink_adj_1to3(adj_buf: np.ndarray, face_idx: int, nf: int) -> None:
+        """Rebuild *adj_buf* after a 1-to-3 split of *face_idx*.
+
+        The split writes the three sub-faces as::
+
+            A = face_idx = [p, fa, fb]
+            B = nf       = [p, fb, fc]
+            C = nf + 1   = [p, fc, fa]
+
+        so, with the parent's neighbours ``(n0, n1, n2)`` across its
+        edge slots 0..2, each sub-face keeps exactly one outer edge
+        (slot 1) and gains two interior ones::
+
+            A -> (C, n0, B)      B -> (A, n1, C)      C -> (B, n2, A)
+
+        ``n1`` and ``n2`` still point at the parent and are re-routed to
+        B and C; ``n0``'s edge is still owned by A, so it needs nothing.
+
+        Why this matters: the 1-to-3 path used to leave ``adj_buf``
+        untouched, which is harmless for ``find_face`` (it scans) but
+        silently disabled the **2-to-4 edge split for the next
+        insertion** in that neighbourhood — and both endpoints of a
+        span share one ``adj_buf``.  The 2-to-4 is what keeps an
+        inserted vertex sliding continuously as the cascade's ``t``
+        sweeps a point across an edge; without it the insertion falls
+        back to 1-to-3 on a near-edge point, which is where the sliver
+        sub-faces come from.
+        """
+        n0 = int(adj_buf[face_idx, 0])
+        n1 = int(adj_buf[face_idx, 1])
+        n2 = int(adj_buf[face_idx, 2])
+        a, b, c = int(face_idx), int(nf), int(nf) + 1
+        adj_buf[a] = (c, n0, b)
+        adj_buf[b] = (a, n1, c)
+        adj_buf[c] = (b, n2, a)
+        for nb, new_owner in ((n1, b), (n2, c)):
+            if nb < 0:
+                continue
+            for s in range(3):
+                if int(adj_buf[nb, s]) == face_idx:
+                    adj_buf[nb, s] = new_owner
+                    break
+
+    @staticmethod
+    def _corner_fan_labels(F: np.ndarray) -> I32Array:
+        """Label every face *corner* with its vertex-fan component id.
+
+        A **corner** is one incidence of a vertex on a face, indexed
+        ``3 * face + slot`` — the same layout ``F.ravel()`` produces.
+        Two corners of the *same* vertex are linked when their faces
+        share the mesh edge running through that vertex.  The connected
+        components of that graph are exactly the edge-connected fans
+        around each vertex, so a vertex whose corners carry more than
+        one label is a pinch point — what geometry-central reports as
+        ``vertex N appears in more than one boundary loop``.
+
+        Corners of different vertices are never linked, so a label
+        never spans two vertices and "count distinct labels per vertex"
+        is a valid component count.
+
+        Used by ``_sanitize_for_solver`` pass 5 to replace a per-vertex
+        Python union-find with one vectorised ``connected_components``
+        call — the same trade already made in
+        ``_compute_face_components``.
+
+        Assumes passes 1-4 have run, so every undirected edge carries
+        at most two faces; the link graph is then a disjoint union of
+        simple paths (open fans) and cycles (closed fans).
+
+        Returns an int32 array of length ``3 * len(F)``.
+        """
+        from scipy.sparse import csr_matrix
+        from scipy.sparse.csgraph import connected_components
+
+        nf = len(F)
+        if nf == 0:
+            return np.empty(0, dtype=np.int32)
+        n_corner = 3 * nf
+
+        # Half-edge ``h = 3 * f + s`` runs from corner (f, s) to
+        # (f, (s + 1) % 3) — so a half-edge id *is* the id of the
+        # corner it starts at.
+        f_idx = np.repeat(np.arange(nf, dtype=np.int64), 3)
+        s_idx = np.tile(np.arange(3, dtype=np.int64), nf)
+        va = F[f_idx, s_idx].astype(np.int64)
+        vb = F[f_idx, (s_idx + 1) % 3].astype(np.int64)
+
+        # Pair up the (at most two) half-edges sharing an undirected
+        # edge.  Same 32-bit packing as ``_peel_overcount_batch``.
+        key = (np.minimum(va, vb) << 32) | np.maximum(va, vb)
+        order_k = np.argsort(key, kind='stable')
+        ks = key[order_k]
+        # Pass 3 caps incidence at 2, so equal keys form runs of length
+        # ≤ 2 and adjacent-duplicate positions cannot chain.
+        dup = np.flatnonzero(ks[:-1] == ks[1:])
+        h1 = order_k[dup]
+        h2 = order_k[dup + 1]
+
+        # Link the two faces at *both* endpoints of the shared edge.
+        # Winding is consistent after pass 4, so the half-edges are
+        # normally opposite — but match on vertex identity rather than
+        # assume it, so a surviving irregularity cannot mislabel a fan.
+        c1_start, c1_end = h1, 3 * (h1 // 3) + (h1 % 3 + 1) % 3
+        c2_start, c2_end = h2, 3 * (h2 // 3) + (h2 % 3 + 1) % 3
+        aligned = va[h1] == va[h2]
+        rows = np.concatenate([c1_start, c1_end])
+        cols = np.concatenate([np.where(aligned, c2_start, c2_end),
+                               np.where(aligned, c2_end, c2_start)])
+
+        graph = csr_matrix(
+            (np.ones(len(rows), dtype=np.int8), (rows, cols)),
+            shape=(n_corner, n_corner))
+        _, labels = connected_components(graph, directed=False,
+                                         return_labels=True)
+        return labels.astype(np.int32, copy=False)
+
+    @staticmethod
     def _sanitize_for_solver(V: np.ndarray, F: np.ndarray
                              ) -> tuple[np.ndarray, np.ndarray, dict]:
         """Best-effort topology cleanup so ``pp3d.EdgeFlipGeodesicSolver``
         doesn't fire ``GC_SAFETY_ASSERT`` on the user's mesh.
 
-        Four repair passes, run in order:
+        Five repair passes, run in order:
 
           1. **Self-edge faces** — drop any face whose three vertex
              indices are not distinct.  Same defect class as
@@ -3328,9 +3541,17 @@ class GeodesicMesh:
         After the topology fixes, vertices that no surviving face
         references are dropped and ``F`` is remapped accordingly.
 
-        Cheap on a clean mesh: each detection pass is ``O(F log F)``
-        and the function early-exits when nothing needs changing
-        (``F`` is returned unmodified, no copy).
+        Cheap on a clean mesh: every detection step is vectorised —
+        ``O(F log F)`` sorts for passes 1-4, one
+        ``connected_components`` call for pass 5 (see
+        :meth:`_corner_fan_labels`) — and each pass short-circuits when
+        it finds nothing, so no Python-level loop runs.  Measured on
+        this repo's ``fandisk.obj`` 1-to-4 subdivided to 207 K faces
+        (clean, zero repairs): **~240 ms**, down from ~1.7 s when pass 5
+        still ran a per-vertex union-find over the whole mesh.
+
+        ``F`` is copied once regardless (pass 5 rewrites slots in
+        place), so the returned arrays are always owned by the caller.
 
         Returns
         -------
@@ -3462,19 +3683,33 @@ class GeodesicMesh:
         # but the face fan around a vertex can still split into
         # multiple edge-connected components — gc reports this as
         # ``vertex N appears in more than one boundary loop``.  We
-        # detect by per-vertex union-find on incident faces (linked
-        # iff they share an edge through the vertex) and repair by
-        # vertex split: keep the first component on the original
-        # vertex, append a duplicate of ``V[v]`` for each extra
-        # component, and rewrite that component's face slots to the
-        # duplicate.  Geometry preserved (the duplicate sits at the
-        # exact same 3-D position); topology cleaned.
+        # detect by grouping the incident faces into edge-connected
+        # components and repair by vertex split: keep the first
+        # component on the original vertex, append a duplicate of
+        # ``V[v]`` for each extra component, and rewrite that
+        # component's face slots to the duplicate.  Geometry preserved
+        # (the duplicate sits at the exact same 3-D position);
+        # topology cleaned.
+        #
+        # Detection is vectorised over the whole mesh via a single
+        # ``connected_components`` call on the *corner* graph (see
+        # ``_corner_fan_labels``), so a clean mesh short-circuits here
+        # without entering Python.  The repair loop below then runs
+        # only over the vertices that actually split — normally none.
+        # The previous formulation ran a per-vertex dict + union-find
+        # for *every* vertex with >1 incident face, i.e. essentially
+        # the whole mesh: ~1.2-1.7 s on a 207 K-face mesh that needed
+        # no repair at all, paid again in each of the 4 orange-worker
+        # processes.
         n_split = 0
         if len(F):
-            # Per-vertex face index via argsort.  ``F.ravel()`` runs
+            # Per-vertex corner index via argsort.  ``F.ravel()`` runs
             # face-major: face0_v0, face0_v1, face0_v2, face1_v0, …
             # ``face_id_flat`` mirrors this so we know which face each
-            # entry came from.
+            # entry came from.  Pass 1 removed self-edge faces, so a
+            # face contributes at most one corner per vertex and each
+            # per-vertex block is in ascending face order — which is
+            # what makes "keep the first component" well-defined.
             verts_flat = F.ravel()
             face_id_flat = np.repeat(np.arange(len(F), dtype=np.int64), 3)
             order = np.argsort(verts_flat, kind='stable')
@@ -3484,13 +3719,29 @@ class GeodesicMesh:
             v_end = np.concatenate(
                 [v_start[1:], np.array([len(sorted_verts)], dtype=v_start.dtype)])
 
+            corner_labels = GeodesicMesh._corner_fan_labels(F)
+            sorted_labels = corner_labels[order]
+            # A vertex needs splitting iff its corners carry more than
+            # one distinct fan label.  ``np.maximum.reduceat`` /
+            # ``minimum.reduceat`` over the per-vertex blocks is the
+            # cheapest sufficient test: labels within one component are
+            # equal, so min != max ⟺ ≥2 components.
+            blk_min = np.minimum.reduceat(sorted_labels, v_start)
+            blk_max = np.maximum.reduceat(sorted_labels, v_start)
+            split_vi = np.flatnonzero(blk_min != blk_max)
+
             # Mutable working list for V (rows appended on split).
             V_list = [V]
             n_V_curr = len(V)
             # F is mutated in place via fancy indexing on a copy.
+            # Kept unconditional even when nothing splits: callers have
+            # always received an array they own from this function, and
+            # ``np.asarray`` in ``__init__`` does not copy an already
+            # int32 input — dropping it here would silently start
+            # aliasing the caller's F.  ~1 ms on a 207 K-face mesh.
             F = F.copy()
 
-            for vi_idx in range(len(unique_v)):
+            for vi_idx in split_vi:
                 v = int(unique_v[vi_idx])
                 faces_v = sorted_face_ids[v_start[vi_idx]:v_end[vi_idx]]
                 if len(faces_v) <= 1:
@@ -3713,6 +3964,14 @@ class GeodesicMesh:
                          np.linalg.norm(p - V_buf[fb]),
                          np.linalg.norm(p - V_buf[fc])]
                 return [fa, fb, fc][np.argmin(dists)], nv - 1, nf
+
+        # Publish the new topology to the adjacency buffer now that the
+        # split is committed.  ``_try_endpoint_insertion`` does two
+        # insertions against one ``adj_buf``, so leaving it stale here
+        # silently disabled the second endpoint's 2-to-4 split — same
+        # defect as in ``_add_point_local``.
+        if adj_buf is not None:
+            self._relink_adj_1to3(adj_buf, face_idx, nf)
 
         return p_idx, nv, nf + 2
 

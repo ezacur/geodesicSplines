@@ -315,9 +315,21 @@ def safe_remove_actor(plotter: pv.Plotter, actor) -> None:
 
 
 def set_depth_priority(actor, offset: float = -6.0) -> None:
-    """Shifts an actor closer to the camera in z-buffer so it draws on top of surfaces."""
+    """Shifts an actor closer to the camera in z-buffer so it draws on top of surfaces.
+
+    All three primitive classes are biased.  The polygon offset is not
+    optional cargo: the A / B handle arrows are cone glyphs made
+    **entirely of polygons** (``polys=9, lines=0, verts=0`` at
+    ``resolution=8``), so setting only the line + point offsets left
+    them with no z-bias at all — neither the resting
+    ``GIZMO_DEPTH_NORMAL`` nor the ``GIZMO_DEPTH_HOVER`` bump applied by
+    ``refresh_arrows`` on every frame — while the blue / orange / interp
+    curves (line primitives) did get theirs and therefore drew *over*
+    the hovered gizmo, the exact inverse of the documented behaviour.
+    """
     mapper = actor.GetMapper()
     mapper.SetResolveCoincidentTopologyToPolygonOffset()
+    mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(0, offset)
     mapper.SetRelativeCoincidentTopologyLineOffsetParameters(0, offset)
     mapper.SetRelativeCoincidentTopologyPointOffsetParameter(offset)
 
