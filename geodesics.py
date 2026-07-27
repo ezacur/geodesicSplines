@@ -983,13 +983,6 @@ class GeodesicMesh:
 
         self._kdtree         = KDTree(self.V)
         self._face_normals   = self._compute_face_normals()
-        # DEAD as of v2: ``_edge_to_face`` (and its builder
-        # ``_build_edge_adjacency``) is never read anywhere — normal-field
-        # smoothing now builds its adjacency from the vectorized
-        # ``_face_adj`` matrix instead.  Kept for now (removal is out of
-        # scope for the current doc pass); safe to delete both.
-        self._edge_to_face   = self._build_edge_adjacency()
-
         # Pre-computed face geometry (avoids double-indexing V[F[i]] in hot loops)
         self._face_verts = self.V[self.F]                        # (N_faces, 3, 3)
         self._face_edges = np.roll(self._face_verts, -1, axis=1) - self._face_verts
@@ -1535,40 +1528,6 @@ class GeodesicMesh:
 
         norms = np.linalg.norm(vn, axis=1, keepdims=True)
         return vn / np.where(norms < 1e-15, 1.0, norms)
-
-    def _build_edge_adjacency(self) -> dict:
-        """Undirected edge → face list mapping.
-
-        Vectorized construction: all edges are computed and sorted in NumPy,
-        then grouped into the dict in a single pass over sorted arrays.
-
-        DEAD as of v2: the only assignment (``self._edge_to_face`` in
-        ``__init__``) is never read.  Normal-field smoothing switched to the
-        vectorized ``_face_adj`` matrix.  Retained pending a cleanup pass.
-        """
-        F = self.F
-        nf = len(F)
-        nv = len(self.V)
-
-        v0 = np.column_stack([F[:, 0], F[:, 1], F[:, 2]]).ravel()
-        v1 = np.column_stack([F[:, 1], F[:, 2], F[:, 0]]).ravel()
-        face_ids = np.repeat(np.arange(nf, dtype=np.int64), 3)
-        lo = np.minimum(v0, v1).astype(np.int64)
-        hi = np.maximum(v0, v1).astype(np.int64)
-        keys = lo * nv + hi
-
-        order = np.argsort(keys, kind='mergesort')
-        keys_s = keys[order]
-        fids_s = face_ids[order]
-
-        breaks = np.concatenate([[0], np.where(np.diff(keys_s))[0] + 1,
-                                 [len(keys_s)]])
-        emap = {}
-        for i in range(len(breaks) - 1):
-            s, e = int(breaks[i]), int(breaks[i + 1])
-            k = int(keys_s[s])
-            emap[(k // nv, k % nv)] = fids_s[s:e].tolist()
-        return emap
 
     def _build_vertex_faces(self) -> tuple[np.ndarray, np.ndarray]:
         """Per-vertex face adjacency in CSR format (cache-friendly, Numba-ready).

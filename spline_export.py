@@ -86,7 +86,9 @@ Exit codes:
 
   * ``0`` success.
   * ``2`` JSON missing / unreadable / malformed / failing schema
-    validation, or override mesh missing.
+    validation, override mesh missing, or the ``--obj`` / ``--vtk``
+    output path resolving onto one of this run's own inputs (the
+    session or the mesh) — see ``_guard_output_path``.
 
 Examples
 --------
@@ -884,6 +886,44 @@ _MESH_EXTS = ('.vtk', '.obj', '.ply', '.stl')
 _LAYER_CHOICES = ('b', 'o', 'k')
 
 
+def _same_path(a: str, b: str) -> bool:
+    """True when *a* and *b* name the same file on disk.
+
+    ``os.path.samefile`` is authoritative (it resolves hardlinks,
+    junctions and 8.3 short names) but needs both paths to exist —
+    the export target usually does not.  Fall back to a normalised
+    realpath comparison, which handles ``..`` segments, symlinks and
+    Windows case-insensitivity.
+    """
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return (os.path.normcase(os.path.realpath(a))
+                == os.path.normcase(os.path.realpath(b)))
+
+
+def _guard_output_path(out_path: str, inputs: dict[str, str | None]) -> None:
+    """Abort before an export write that would clobber its own input.
+
+    ``--obj`` / ``--vtk`` derive the output name from the *session*
+    basename alone, so the natural pairing of a session with a
+    same-named mesh (``heart.json`` next to ``heart.obj``) resolves the
+    output straight onto the mesh.  ``rebuild_mesh_and_nodes`` has
+    already read the mesh into memory by then, so the write succeeded
+    silently and destroyed the source geometry while still exiting 0.
+
+    Exits 2 (the CLI's input-error code) rather than raising, so the
+    failure reads like the other pre-flight checks.
+    """
+    for label, src in inputs.items():
+        if src and os.path.exists(src) and _same_path(src, out_path):
+            log.error("refusing to write the export over the %s: %s",
+                      label, os.path.abspath(out_path))
+            log.error("the output name is derived from the session basename "
+                      "— rename the session (or the %s) so they differ", label)
+            sys.exit(2)
+
+
 def main():
     if len(sys.argv) == 1:
         # ``argparse``'s ``--help`` is the canonical reference; this
@@ -1030,12 +1070,21 @@ def main():
             geo, nodes, closed, args.samples)
         all_spline_points.append(span_pts_list)
 
+    # The output basename comes from the session, so it can land on the
+    # mesh this very run just read (``heart.json`` + ``heart.obj``).
+    # ``data['mesh_file']`` is post-override, i.e. the mesh actually
+    # loaded; the built-in icosahedron sentinel is not a path and is
+    # skipped by the ``os.path.exists`` test inside the guard.
+    _inputs = {'session': args.json_file, 'input mesh': data.get('mesh_file')}
+
     if args.obj:
         obj_path = os.path.splitext(args.json_file)[0] + ".obj"
+        _guard_output_path(obj_path, _inputs)
         log.info("exporting to OBJ: %s", obj_path)
         write_obj(obj_path, all_spline_points)
     elif args.vtk:
         vtk_path = os.path.splitext(args.json_file)[0] + ".vtk"
+        _guard_output_path(vtk_path, _inputs)
         log.info("exporting to binary legacy VTK: %s", vtk_path)
         write_vtk(vtk_path, all_spline_points)
     else:
