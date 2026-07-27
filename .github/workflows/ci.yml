@@ -26,6 +26,33 @@ jobs:
         # Style is enforced through lint rules only (pyproject.toml).
         run: ruff check .
 
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install mypy + the typed runtime deps
+        # Pin matches pyproject.toml's [project.optional-dependencies].dev,
+        # same rationale as the ruff pin above: a new mypy minor adds
+        # checks, and CI going red on a dependency bump nobody made is
+        # how a type gate gets switched off.
+        #
+        # ``ignore_missing_imports = true`` ([tool.mypy]) covers vtk /
+        # pyvista / potpourri3d — they ship no stubs and would cost a
+        # multi-hundred-MB install for nothing.  numpy and scipy DO ship
+        # ``py.typed``, so installing them is what makes this run
+        # actually check the array code instead of silently degrading
+        # every annotation to ``Any``.
+        run: |
+          pip install --upgrade pip
+          pip install 'mypy~=1.11.0' numpy scipy
+      - name: mypy
+        # No arguments: files and settings come from [tool.mypy], so
+        # this is byte-identical to a bare ``mypy`` in the repo root.
+        run: mypy
+
   test:
     runs-on: ubuntu-latest
     strategy:

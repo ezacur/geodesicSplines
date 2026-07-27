@@ -22,7 +22,11 @@ jit = ["numba>=0.58"]
 dev = [
     "ruff~=0.7.0",
     "pytest>=8",
-    "mypy>=1.10",
+    # Pinned like ruff, and matched in .github/workflows/ci.yml's
+    # ``typecheck`` job — a new mypy minor adds checks, and a gate that
+    # goes red on a dependency bump nobody made is a gate that gets
+    # switched off.
+    "mypy~=1.11.0",
 ]
 
 [project.scripts]

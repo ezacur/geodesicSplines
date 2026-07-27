@@ -5652,10 +5652,13 @@ class GeodesicSplineApp(MidpointShooterApp):
         emits 4 lines per node and keeps the coordinate triplets
         inline — typical sessions shrink ~3×.
 
-        The output is still valid JSON: every value goes through
-        ``json.dumps`` so quoting / escaping / float repr (full-precision
-        ~17-digit ``repr(float(x))``) is unchanged.  Round-trip via
-        ``json.loads`` reproduces the original ``data`` exactly.
+        The output is still valid JSON: every value goes through ``_j``
+        (``json.dumps`` with ``allow_nan=False``) so quoting / escaping
+        / float repr (full-precision ~17-digit ``repr(float(x))``) is
+        unchanged, and a non-finite value anywhere raises ``ValueError``
+        instead of emitting the non-RFC-8259 ``NaN`` / ``Infinity``
+        literals.  Round-trip via ``json.loads`` reproduces the original
+        ``data`` exactly — locked by ``tests/test_session_writer.py``.
 
         Defensive fallback: if the dict shape diverges from the
         v1/v2 session schema, returns ``json.dumps(data, indent=2)``
@@ -5678,16 +5681,24 @@ class GeodesicSplineApp(MidpointShooterApp):
         except (KeyError, TypeError):
             return json.dumps(data, indent=2, allow_nan=False)
 
-        def _arr(vec) -> str:
-            """Inline JSON array of floats — single line, comma-space.
+        def _j(value) -> str:
+            """``json.dumps`` with the non-finite escape hatch closed.
 
-            Uses ``allow_nan=False`` so any NaN or ±Infinity that
-            slipped past the validator (e.g. from a degenerate solver
-            fallback) raises ``ValueError`` here instead of silently
-            writing the non-RFC-8259 literals ``NaN`` / ``Infinity``.
+            Python's default ``allow_nan=True`` emits the bare literals
+            ``NaN`` / ``Infinity`` / ``-Infinity``, which are **not**
+            RFC 8259 — Python reads them back happily, every other JSON
+            parser rejects the file.  A session that silently stops
+            being portable is worse than one that fails to save, so
+            every value in this writer goes through here.  (The
+            off-schema fallback above already passes
+            ``allow_nan=False``; this keeps the compact path equally
+            strict instead of laxer than its own fallback.)
             """
-            return '[' + ', '.join(
-                json.dumps(float(x), allow_nan=False) for x in vec) + ']'
+            return json.dumps(value, allow_nan=False)
+
+        def _arr(vec) -> str:
+            """Inline JSON array of floats — single line, comma-space."""
+            return '[' + ', '.join(_j(float(x)) for x in vec) + ']'
 
         # Canonical key order inside a node.  ``id`` (when present) is
         # rendered first as a single inline key so the human eye lands
@@ -5731,7 +5742,7 @@ class GeodesicSplineApp(MidpointShooterApp):
                     # extras both fall through to default JSON encoding
                     # — single-token output keeps the per-node block
                     # within its aligned column.
-                    rendered = json.dumps(val)
+                    rendered = _j(val)
                 prefix = (kr + ':').ljust(pad_to)
                 if i == 0:
                     line = f'{indent}{{{prefix}{rendered}'
@@ -5750,25 +5761,23 @@ class GeodesicSplineApp(MidpointShooterApp):
         TOP_HEAD = ('version', 'mesh_file')
         for key in TOP_HEAD:
             if key in data:
-                out.append(f'  {json.dumps(key)}: {json.dumps(data[key])},')
+                out.append(f'  {json.dumps(key)}: {_j(data[key])},')
         for key in data:
             if key in TOP_HEAD or key == 'splines':
                 continue
-            out.append(f'  {json.dumps(key)}: {json.dumps(data[key])},')
+            out.append(f'  {json.dumps(key)}: {_j(data[key])},')
         out.append('  "splines": [')
 
         for si, spline in enumerate(splines):
             out.append('    {')
             if 'closed' in spline:
-                out.append(
-                    f'      "closed": {json.dumps(spline["closed"])},')
+                out.append(f'      "closed": {_j(spline["closed"])},')
             # Forward-compat: emit any other keys before nodes
             # (matters because nodes is the open-ended block).
             for key in spline:
                 if key in ('closed', 'nodes'):
                     continue
-                out.append(
-                    f'      {json.dumps(key)}: {json.dumps(spline[key])},')
+                out.append(f'      {json.dumps(key)}: {_j(spline[key])},')
             nodes = spline.get('nodes', [])
             if not nodes:
                 out.append('      "nodes": []')

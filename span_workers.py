@@ -62,6 +62,19 @@ from geodesics import GeodesicMesh, eval_cascade_at_t
 # or anything else.
 SpanKey = tuple[int, int]
 
+# The nine positional arguments ``geodesics.eval_cascade_at_t`` takes
+# after ``(geo, t)``: three ``(path, cumulative_lengths, total_length)``
+# triples, for ``path_b`` / ``path_a_rev`` / ``path_12``.  Spelling the
+# arity out rather than using a bare ``tuple`` is what lets a type
+# checker see that ``*eval_args`` fills exactly those nine slots and so
+# cannot collide with the keyword-only ``submesh_subdiv`` /
+# ``use_full_mesh``; with ``tuple[Any, ...]`` mypy has to assume the
+# unpack might reach them and reports a phantom "multiple values for
+# keyword argument" on every call site.
+CascadeArgs = tuple[np.ndarray, np.ndarray, float,
+                    np.ndarray, np.ndarray, float,
+                    np.ndarray, np.ndarray, float]
+
 # ---------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------
@@ -259,7 +272,7 @@ def _phase1_canonical(
     geo, span_key: SpanKey,
     P0: np.ndarray, P1: np.ndarray,
     t_grid: np.ndarray, inner_order: list[int],
-    eval_args: tuple, writer, *,
+    eval_args: CascadeArgs, writer, *,
     submesh_subdiv: int, use_full_mesh: bool,
 ) -> tuple[list[float], list[np.ndarray], bool]:
     """Phase 1 of the orange worker: canonical *t_grid* samples.
@@ -299,7 +312,7 @@ def _phase1_canonical(
 def _phase2_densify(
     geo, span_key: SpanKey,
     t_list: list[float], p_list: list[np.ndarray],
-    eval_args: tuple, writer, *,
+    eval_args: CascadeArgs, writer, *,
     deviation_mode: str, subdiv_tol_factor: float, subdiv_max_depth: int,
     submesh_subdiv: int, use_full_mesh: bool,
 ) -> bool:

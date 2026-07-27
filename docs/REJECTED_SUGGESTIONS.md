@@ -16,7 +16,7 @@ is part of the value.
 
 ### Replace `IntersectWithLine` occlusion check with `vtkHardwareSelector`
 
-**Proposed**: in [`_is_marker_occluded`](../geo_shoot.py#L816), replace
+**Proposed**: in [`_is_marker_occluded`](../geo_shoot.py), replace
 the ray-cast (`self.geo.locator.IntersectWithLine`) with a Z-buffer
 read via `vtkHardwareSelector`, claiming O(1) GPU lookup vs O(log N)
 ray traversal and "fails on holes".
@@ -44,7 +44,7 @@ noisy 3D scans).  The analysis below covers all of them.
   (Z-fighting near silhouettes, off-by-one at pixel edges).
 - For noisy 3D scans the actual problem is normal-field instability,
   which the codebase already addresses via the smoothing pipeline at
-  [geodesics.py:97-117](../geodesics.py#L97-L117).  The occlusion
+  [`_smooth_face_normals_cotangent`](../geodesics.py).  The occlusion
   test is downstream of that and not the right place to compensate
   for upstream geometry quality.
 
@@ -62,14 +62,14 @@ its cost is **~0.002 ms/frame** (~0.01 % of a 60 fps budget).  Confirms
 
 ### Replace cone arrows with `vtkGlyph3D`
 
-**Proposed**: in [`gizmo.py:_update_handle_arrow`](../gizmo.py#L620),
+**Proposed**: in [`gizmo.py:_update_handle_arrow`](../gizmo.py),
 let the GPU instance + rotate the cone via `vtkGlyph3D` (passing one
 point + one direction vector per handle) instead of computing the
 Rodrigues rotation in Python and uploading transformed points each
 frame.
 
 **Rejected because**:
-- A transform cache already exists at [gizmo.py:669-676](../gizmo.py#L669-L676).
+- A transform cache already exists in [`_update_handle_arrow`](../gizmo.py).
   `np.dot(tpl_pts * scale, R.T)` is skipped entirely when direction +
   scale + hover state are unchanged.
 - The cone is only ~30 vertices.  Even on cache miss, the matrix
@@ -94,7 +94,7 @@ bottleneck".
 ### Float32 for `V` / `F` in shared memory
 
 **Proposed**: store `V_c` (vertices) as `float32` in the shared
-memory blocks at [_SpanWorkManager.__init__](../span_workers.py#L621)
+memory blocks at [_SpanWorkManager.__init__](../span_workers.py)
 (the manager lived in ``geo_splines.py`` when this was proposed)
 to halve memory bandwidth and double L1/L2 effective cache.
 
@@ -113,7 +113,7 @@ to halve memory bandwidth and double L1/L2 effective cache.
 
 ### Clear `_didactic_geo_cache` in `_hide_didactic_actors` to prevent a "memory leak"
 
-**Proposed**: in [`_hide_didactic_actors`](../geo_splines.py#L4740),
+**Proposed**: in [`_hide_didactic_actors`](../geo_splines.py),
 add `self._didactic_geo_cache = None` so toggling didactic mode off
 releases the strong references the cache holds (``'refs': (n0, n1,
 n0.origin, n0.p_b, n0.path_b, ...)``).  Framed as a memory leak that
@@ -122,7 +122,7 @@ n0.origin, n0.p_b, n0.path_b, ...)``).  Framed as a memory leak that
 **Rejected because**:
 - The premise that the cache grows is wrong.  The dict has exactly
   two slots (``'fast'`` and ``'exact'``) and every write at
-  [geo_splines.py:_compute_didactic](../geo_splines.py#L4962)
+  [`_compute_didactic`](../geo_splines.py)
   **overwrites** the slot's previous entry.  Bound: ~12 KB total
   (2 slots × ~5 paths × ~50 points × 24 bytes), regardless of how
   many times the user toggles.
@@ -132,9 +132,9 @@ n0.origin, n0.p_b, n0.path_b, ...)``).  Framed as a memory leak that
   them adds zero net memory; the only effect is preventing GC after
   a structural change recycles the IDs.  That hazard is what the
   ``id()``-keyed cache is designed to detect, hence the explicit
-  refs comment at [geo_splines.py:4964-4969](../geo_splines.py#L4964).
+  refs comment in [`_compute_didactic`](../geo_splines.py).
 - The four code paths that *can* invalidate the cache content
-  ([geo_splines.py:1844, 2592, 2856, 5735](../geo_splines.py#L2592))
+  ([`_restore_snapshot` / `_clear_spline_spans` / `_shift_spline_caches` / `_clear_all_curve_caches`](../geo_splines.py))
   already set it to ``None`` on the structural events that matter
   (active-spline switch, spline clear, full reload).
 - A toggle-off clear is a tiny cosmetic improvement (~12 KB freed
@@ -146,7 +146,7 @@ n0.origin, n0.p_b, n0.path_b, ...)``).  Framed as a memory leak that
 ### Command pattern for undo / redo
 
 **Proposed**: replace the snapshot-based undo at
-[`_push_undo`](../geo_splines.py#L1535) with a Command pattern
+[`_push_undo`](../geo_splines.py) with a Command pattern
 (`MoveNodeCommand(node_id, old_pos, new_pos)` etc.) to reduce undo
 memory and enable a non-linear history tree.
 
@@ -158,8 +158,8 @@ memory and enable a non-linear history tree.
   `p_a` + `p_b`, ~96 bytes/node, i.e. ~2× the figure above.  Still
   far below anything that matters; the rejection stands unchanged.)*
 - The diff-restore in
-  [`_can_use_diff_restore`](../geo_splines.py#L1571) +
-  [`_restore_snapshot`](../geo_splines.py#L1590) already avoids
+  [`_can_use_diff_restore`](../geo_splines.py) +
+  [`_restore_snapshot`](../geo_splines.py) already avoids
   rebuilding unchanged VTK actors — that was the actual perf win
   worth chasing.
 - Command pattern would require one class per mutation kind (add,
@@ -178,14 +178,14 @@ documentation.
   They are documentation in another syntax.
 - The same information is already in docstrings (`"(N, 3) surface
   polyline — should already be projected."` at
-  [geodesics.py:1493](../geodesics.py#L1493)).
+  [`subdivide_secant_chords`](../geodesics.py)).
 - Adds a third-party runtime dependency for stylistic value only.
 
 ## Algorithm-level
 
 ### KDTree batched query in `compute_endpoint_local`
 
-**Proposed**: at [geodesics.py:2032-2033](../geodesics.py#L2032-L2033),
+**Proposed**: at [`compute_endpoint_local`'s `_to_local`](../geodesics.py),
 combine `_kdtree.query(p_start)` + `_kdtree.query(p_end)` into a
 single `_kdtree.query([p_start, p_end])`.
 
@@ -213,7 +213,7 @@ ignored the per-call Python wrapper cost — measure, don't estimate.
 
 ### Make the `area < 1e-15` check in `_add_point_local` scale-relative
 
-**Proposed**: in [`_add_point_local`](../geodesics.py#L2844), the
+**Proposed**: in [`_add_point_local`](../geodesics.py), the
 post-subdivision area check uses an **absolute** threshold
 ``area < 1e-15`` to decide a sub-face is degenerate (revert + snap to
 nearest existing vertex).  Replace with a **relative** threshold
@@ -260,7 +260,7 @@ subdivision would hit the threshold and degrade to vertex-snap.
 
 ### Ray-cast secant midpoint instead of nearest-point projection
 
-**Proposed**: in [`subdivide_secant_chords`](../geodesics.py#L1464),
+**Proposed**: in [`subdivide_secant_chords`](../geodesics.py),
 replace `project_smooth_batch(midpoints)` with a ray-cast along the
 chord's average normal.  The current projection can land on the
 opposite side of a thin feature ("ear" on a 3D scan).
@@ -297,7 +297,7 @@ slightly-perturbed input pairs in the de Casteljau cascade.
   geometry; Edge-Flip is **not** finding non-global minima.
 - The visible discontinuities are an instance of the discrete-
   geodesic flip-flop already documented in
-  [`compute_endpoint_local`](../geodesics.py#L2328) — at
+  [`compute_endpoint_local`](../geodesics.py) — at
   `submesh_subdiv=1` (the configuration under test during this
   analysis; the shipped default is `ORANGE_SUBMESH_SUBDIV = 0`,
   and no committed default has ever been 1) the 1-to-4 submesh subdivision
@@ -355,9 +355,9 @@ inside the C++ solver), via `psutil` or a SIGTERM equivalent.
 - The `potpourri3d` solver does not hang in practice — it raises an
   exception or returns `None` on degenerate input.  No reported case
   of a worker stuck.
-- [`drain_queue`](../span_workers.py#L1090) already detects worker
+- [`drain_queue`](../span_workers.py) already detects worker
   death (`BrokenPipeError` / `EOFError`) and the
-  [per-phase shutdown](../span_workers.py#L1233)
+  [per-phase shutdown](../span_workers.py)
   hardens the cleanup path.  (Both lived in ``geo_splines.py`` when
   this was proposed; they moved to ``span_workers.py``.)
 - A watchdog adds cross-platform `psutil` plumbing, false-positive
@@ -368,7 +368,7 @@ inside the C++ solver), via `psutil` or a SIGTERM equivalent.
 
 ### Make the `submit(int, 0)` worker warmup async to avoid "blocking the UI"
 
-**Proposed**: in [`_SpanWorkManager.__init__`](../span_workers.py#L621)
+**Proposed**: in [`_SpanWorkManager.__init__`](../span_workers.py)
 (then in ``geo_splines.py``),
 the loop ``for _ in range(max_workers): self._executor.submit(int, 0)``
 forces all worker subprocesses to spawn during construction.  Framed
@@ -388,7 +388,7 @@ secondary thread.
   at the moment of the first orange-curve computation (where they
   expect interactive latency).  That trade-off is intentional —
   see the existing comments at
-  [span_workers.py:692-698](../span_workers.py#L692-L698).
+  the warmup block of [`_SpanWorkManager.__init__`](../span_workers.py).
 - "Async pool on a secondary thread" is what Python's executor
   *already does internally* — adding another layer would be
   redundant.
@@ -411,7 +411,7 @@ until reboot.
   vanishes — including via segfault — Windows releases the kernel
   object automatically.  No leak across reboots.
 - On Linux (`/dev/shm`) the leak does happen; the
-  [hardened shutdown](../span_workers.py#L1233) covers normal exits and
+  [hardened shutdown](../span_workers.py) covers normal exits and
   KeyboardInterrupt, plus the `weakref.finalize` safety net covers
   garbage collection and interpreter teardown (since 2026-07 it
   receives the executor + shm blocks directly, so it fires usefully
@@ -469,7 +469,7 @@ proof-of-concept beats Numba-JIT'd BFS on a real mesh by ≥3×.
 **Proposed**: the C++-rewrite entry above lists "batch the per-point
 `find_face` in the boundary check" as a cheap, viable speedup.  The
 boundary check at the end of
-[`_try_solve_on_region`](../geodesics.py#L2316) calls
+[`_try_solve_on_region`](../geodesics.py) calls
 `self.find_face(pt)` once per path point (a Python↔VTK round-trip).
 The obvious batch is one vectorised
 `project_smooth_batch_with_faces(path)` call + an `np.isin` membership
@@ -502,9 +502,9 @@ that already seeds the region.
   `submesh_subdiv=0` regime, lighter than the ~25 ms editor-drag
   figure the C++ entry cites).  Two **bit-for-bit output-preserving**
   vectorisations were applied instead: the candidate-face scan in
-  [`_add_point_local`](../geodesics.py#L2865) (206→~110 µs/call) and
+  [`_add_point_local`](../geodesics.py) (206→~110 µs/call) and
   the edge-hash loop in
-  [`_build_face_adj_buf`](../geodesics.py#L2619) (396→~100 µs/call),
+  [`_build_face_adj_buf`](../geodesics.py) (396→~100 µs/call),
   together ~−20 % on `compute_endpoint_local` with zero curve change
   (parity `0.000e+00`, locked by
   [`tests/test_build_face_adj_buf_vectorized.py`](../tests/test_build_face_adj_buf_vectorized.py)).
@@ -541,7 +541,7 @@ is the **full-mesh global solver** reached when all local phases fail
 the time, almost all of it full-mesh).  Root cause: these are **open**
 surfaces (cut at valve planes, 0.5–5 % of faces on a real boundary),
 and the truncation check in
-[`_try_solve_on_region`](../geodesics.py#L2244) flags a path point on a
+[`_try_solve_on_region`](../geodesics.py) flags a path point on a
 *real* mesh-boundary face (`nb < 0`) as possible truncation → escalate
 → but escalation can never resolve a real boundary → exhaust local
 phases → fall to the full-mesh solver.  Proposal: treat only
@@ -627,3 +627,20 @@ suggestion is proposed and rejected:
 2. State the rejection reason (measured number, code reference, or
    architectural argument — not opinion).
 3. Add a "re-open if" trigger so the rejection is falsifiable.
+
+### Link to symbols, never to line numbers
+
+Write ``[`some_function`](../module.py)`` — **not**
+``[...](../module.py#L1234)``.
+
+Line anchors rot on the first refactor that touches the file above
+them, and they rot *silently*: the link still resolves, it just points
+at unrelated code.  This file had 26 of them and, when audited, **all
+26 pointed somewhere wrong** — several off by more than a thousand
+lines after the ``span_workers`` extraction.  A reviewer following one
+of those lands on a random statement and concludes the entry is stale,
+which is exactly the outcome this file exists to prevent.
+
+Naming the symbol costs one grep to follow and never goes out of date;
+if the symbol is renamed or deleted, the link becomes *obviously*
+wrong rather than quietly wrong.

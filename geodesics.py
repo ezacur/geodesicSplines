@@ -4541,6 +4541,7 @@ def eval_cascade_at_t(
     path_b: np.ndarray, cum_b: np.ndarray, total_b: float,
     path_a_rev: np.ndarray, cum_a: np.ndarray, total_a: float,
     path_12: np.ndarray, cum_12: np.ndarray, total_12: float,
+    *,
     submesh_subdiv: int = 0,
     use_full_mesh: bool = False,
 ) -> tuple[np.ndarray, bool]:
