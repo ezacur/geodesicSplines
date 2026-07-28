@@ -1622,7 +1622,18 @@ class MidpointShooterApp:
         now = time.perf_counter()
         fired = False
         for key in list(self.state.pending_debounces):
-            dl, cb = self.state.pending_debounces[key]
+            # ``.get`` rather than ``[key]``: the ``list()`` snapshot
+            # protects against the dict changing size, but not against a
+            # callback fired earlier in this same tick cancelling a task
+            # that is still in the snapshot — a plain subscript would
+            # then raise ``KeyError`` and skip every remaining expired
+            # task plus the batched render.  No current callback does
+            # that; cancel-from-callback is one ``pop`` away, so the
+            # cheap guard stays.
+            entry = self.state.pending_debounces.get(key)
+            if entry is None:
+                continue
+            dl, cb = entry
             if now >= dl:
                 del self.state.pending_debounces[key]
                 try:

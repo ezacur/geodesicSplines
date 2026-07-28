@@ -21,13 +21,12 @@ import math
 
 import pytest
 
-pytest.importorskip("vtk")
-pytest.importorskip("pyvista")
-
-from geo_splines import GeodesicSplineApp  # noqa: E402
-from session_io import _validate_session_dict  # noqa: E402
-
-fmt = GeodesicSplineApp._format_session_json
+# No ``importorskip`` here on purpose: ``session_io`` is stdlib-only, so
+# these tests run in CI's slim matrix on every supported Python rather
+# than only on the single full-dependency job.  That is the point of the
+# writer living beside the reader instead of on ``GeodesicSplineApp``.
+from session_io import _format_session_json as fmt
+from session_io import _validate_session_dict
 
 
 def _v2_session():

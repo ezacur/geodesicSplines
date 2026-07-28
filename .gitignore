@@ -38,10 +38,23 @@ __pycache__/*.nbc
 # The session pattern is intentionally narrow — matching the
 # YYYYMMDD_HHMMSS prefix the editor writes — so that example /
 # documentation JSONs (e.g. ``01_demo.json``) are not silently
-# excluded.  Add a literal filename here (or ``geodesic_export_*.txt``
+# excluded.  Add a literal filename here (or ``geo_paths_*.txt``
 # style) if a new artifact category is introduced.
+#
+# ``*.txt`` used to be listed bare.  It has exactly one producer —
+# ``geo_shoot._on_export_paths`` writes ``geo_paths_<timestamp>.txt`` —
+# so the broad form bought nothing and silently swallowed every other
+# text file, ``requirements.txt`` included (that one survives only
+# because it was committed before the rule existed, and a
+# ``git rm --cached`` + re-add would have lost it).
+geo_paths_*.txt
+#
+# ``*.vtk`` deliberately stays broad: the editor's ``v`` export and the
+# CLI's ``--vtk`` both derive their filename from the loaded session
+# stem (``<stem>_NN.vtk``), which is arbitrary, so no narrow pattern
+# can cover them.  A reference mesh you *do* want tracked therefore
+# needs an explicit ``git add -f``.
 *.vtk
-*.txt
 20[0-9][0-9][0-9][0-9][0-9][0-9]_*.json
 
 # Claude Code workspace metadata

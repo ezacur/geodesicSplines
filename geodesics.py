@@ -3170,8 +3170,7 @@ class GeodesicMesh:
         # fires on a well-seeded pool (min_bary >= ~0), so the
         # parity-oracle'd submesh_subdiv=0 path is unchanged.
         if min(u, v, w) < -1e-2 and len(candidates) < nf:
-            face_idx = min(range(nf),
-                           key=lambda i: self._outside_score_buf(p, i, V_buf, F_buf))
+            face_idx = self._argmin_outside_score_buf(p, V_buf, F_buf, nf)
             u, v, w = self._bary_buf(p, face_idx, V_buf, F_buf)
         fa = int(F_buf[face_idx, 0])
         fb = int(F_buf[face_idx, 1])
@@ -3883,9 +3882,7 @@ class GeodesicMesh:
         # Python key function, but it only fires on the mis-seeded
         # case; well-seeded insertions (min_bary >= ~0) are unchanged.
         if min(u, v, w) < -1e-2:
-            face_idx = min(range(nf),
-                           key=lambda i: self._outside_score_buf(
-                               p, i, V_buf, F_buf))
+            face_idx = self._argmin_outside_score_buf(p, V_buf, F_buf, nf)
             u, v, w = self._bary_buf(p, face_idx, V_buf, F_buf)
         fa, fb, fc = int(F_buf[face_idx, 0]), int(F_buf[face_idx, 1]), int(F_buf[face_idx, 2])
         snap_eps = 1e-7
@@ -4012,6 +4009,56 @@ class GeodesicMesh:
         if not candidates:
             return 0
         return min(candidates, key=lambda i: self._outside_score_buf(p, i, V_buf, F_buf))
+
+    @staticmethod
+    def _argmin_outside_score_buf(p, V_buf, F_buf, nf: int) -> int:
+        """Vectorised equivalent of
+        ``min(range(nf), key=lambda i: _outside_score_buf(p, i, ...))``.
+
+        Same selection, same tie-break (both this and ``min`` return the
+        **first** index attaining the minimum), same arithmetic — the
+        expressions below are ``_barycentric`` transcribed elementwise,
+        including its left-to-right summation order and its
+        ``abs(denom) < 1e-15 → (1/3, 1/3, 1/3)`` degenerate branch — so
+        the result is bit-identical, not merely close.
+
+        Why it exists: the grossly-negative-bary backstop in
+        ``_add_point_buf`` runs this scan over the **global** face count
+        through a Python key function.  Measured on a 207 K-face mesh
+        that is **646 ms per hit** against 0.71 ms for a normal
+        insertion — a ~900× cliff, on the main thread, attributed to
+        nothing the user can see.  It is reachable on clean CAD
+        geometry (0.10 % of 4000 random on-surface points on fandisk,
+        worst ``min_bary`` −0.659) because ``_find_face_buf`` seeds
+        candidates from a **k=1** KDTree query, so the containing face
+        need not touch the nearest vertex.
+        """
+        F = F_buf[:nf]
+        A = V_buf[F[:, 0]]
+        B = V_buf[F[:, 1]]
+        C = V_buf[F[:, 2]]
+        v0x = B[:, 0] - A[:, 0]; v0y = B[:, 1] - A[:, 1]; v0z = B[:, 2] - A[:, 2]
+        v1x = C[:, 0] - A[:, 0]; v1y = C[:, 1] - A[:, 1]; v1z = C[:, 2] - A[:, 2]
+        v2x = p[0] - A[:, 0];    v2y = p[1] - A[:, 1];    v2z = p[2] - A[:, 2]
+        d00 = v0x * v0x + v0y * v0y + v0z * v0z
+        d01 = v0x * v1x + v0y * v1y + v0z * v1z
+        d11 = v1x * v1x + v1y * v1y + v1z * v1z
+        d20 = v2x * v0x + v2y * v0y + v2z * v0z
+        d21 = v2x * v1x + v2y * v1y + v2z * v1z
+        denom = d00 * d11 - d01 * d01
+        # Guard the division exactly as the scalar path does, then
+        # overwrite the degenerate rows with the (1/3, 1/3, 1/3) answer.
+        degenerate = np.abs(denom) < 1e-15
+        safe = np.where(degenerate, 1.0, denom)
+        v = (d11 * d20 - d01 * d21) / safe
+        w = (d00 * d21 - d01 * d20) / safe
+        third = 1.0 / 3
+        v = np.where(degenerate, third, v)
+        w = np.where(degenerate, third, w)
+        u = np.where(degenerate, third, 1.0 - v - w)
+        score = (np.maximum(0.0, -u) + np.maximum(0.0, -v)
+                 + np.maximum(0.0, -w))
+        return int(np.argmin(score))
 
     def _outside_score_buf(self, p, i, V_buf, F_buf):
         u, v, w = self._bary_buf(p, i, V_buf, F_buf)
