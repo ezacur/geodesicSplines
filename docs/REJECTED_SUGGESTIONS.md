@@ -204,7 +204,7 @@ handling, output shaping) costs ~tens of µs per call — and that wrapper,
 not the search, dominates a 3-point query.  After the `find_face` batch
 the two `_to_local` queries became a visible slice; batching them into
 one `query([p_start, p_end])` cut `KDTree.query` from 2186 → 1375 calls
-(cProfile; the −811 are exactly the per-`_try_solve` pairs) and measured
+(cProfile; the −811 are exactly the per-`_try_solve_on_region` pairs) and measured
 a consistent **~4 %** on the worker path (interleaved A/B, both
 orderings, fandisk no-locator).  Nearest vertices are identical to the
 per-point queries, so it is bit-for-bit output-preserving (parity oracle
@@ -238,11 +238,11 @@ subdivision would hit the threshold and degrade to vertex-snap.
 - The fix is dimensionally cleaner but adds two extra distance
   computations per sub-face (six per insertion) for a scenario
   nobody has reproduced.  The other tolerances in the same function
-  (``snap_eps``, ``split_eps``, ``nudge_eps`` at lines 2789-2791)
-  are *already* relative-by-design (barycentric coordinates) — the
-  area check is the only absolute one and only fires after
-  ``_add_point_buf`` has chosen a 1-to-3 subdivision over the
-  cheaper snap / 2-to-4 paths.
+  (``snap_eps``, ``split_eps``, ``nudge_eps`` — see
+  [`_add_point_local`](../geodesics.py)) are *already*
+  relative-by-design (barycentric coordinates) — the area check is the
+  only absolute one and only fires after ``_add_point_local`` has
+  chosen a 1-to-3 subdivision over the cheaper snap / 2-to-4 paths.
 - **Confirmed empirically (2026-05-30)**: ran the orange cascade on
   fandisk uniformly scaled by ``s`` (insertion sub-triangle areas scale
   by ``s²``) and counted revert-branch hits.  At scale 1.0 (bbox diag
@@ -605,7 +605,7 @@ note of the C++-rewrite entry above ("Numba-JIT the BFS expansion
   bucket), so no implementation can exceed it.
 - Cost rejected for that noise-level gain: it changes the
   `visited` / `frontier` contract from sets to `(bool-mask, array)`
-  across `_bfs_init`, `_bfs_advance`, `_expand_face_region` and the
+  across `_bfs_init`, `_bfs_advance`, `_try_solve_on_region` and the
   three phases of `compute_endpoint_local` (phase-B
   `frontier |= frontier_d` → `np.union1d`, `sorted(visited)` →
   `np.flatnonzero`), and forces a rewrite of the `_bfs_advance`

@@ -250,11 +250,15 @@ The special value ``__builtin__:icosahedron`` (or the legacy plain
 ## CLI Export
 
 ```bash
-python spline_export.py <file.json> <b|o|k> [--samples N] [--obj | --vtk] [--mesh PATH]
+python spline_export.py <file.json> [b|o|k] [mesh_override] [--samples N] [--obj | --vtk] [--mesh PATH]
 ```
 
 Loads a saved session (v1 or v2 schema) and writes the curve points
-of the chosen layer to disk.  Three output formats:
+of the chosen layer to disk.  The layer letter is **optional** and
+defaults to `o` (orange).  The two positionals after the JSON are
+order-agnostic: a bare `b` / `o` / `k` is read as the layer, anything
+ending in `.vtk` / `.obj` / `.ply` / `.stl` as a mesh override (the
+same thing `--mesh` does).  Three output formats:
 
 | Output | Flag | Contents |
 |---|---|---|
@@ -267,6 +271,22 @@ of the chosen layer to disk.  Three output formats:
 | Black (interpolation) | `k` | Seconds (fastest) |
 | Blue (semi-geodesic) | `b` | Seconds |
 | Orange (fully geodesic) | `o` | Seconds to minutes — spans are computed in parallel (4 worker processes).  Measured: a 3-span fandisk session at the default ``--samples 60`` exports in ~5 s wall-clock, mesh load and JIT warm-up included.  Scales with mesh density and ``--samples``. |
+
+**Exit codes** — `0` on success, `2` on any input problem.  The
+exit-2 cases worth knowing about when scripting:
+
+- the JSON is missing / unreadable / fails schema validation;
+- the mesh cannot be found.  A relative ``mesh_file`` is looked up
+  next to the *session* as well as in the current directory, so
+  exporting a session from another folder works;
+- the output path would land on one of this run's own inputs.  The
+  ``--obj`` / ``--vtk`` name is derived from the session basename, so
+  ``heart.json`` next to ``heart.obj`` resolves the output straight
+  onto the mesh — which the exporter has already read into memory.
+  It refuses instead of destroying it;
+- there is nothing to export (no spline with ≥ 2 nodes and no
+  landmark).  Previously this wrote a headers-only file, or silently
+  left a stale one from an earlier run, and still reported success.
 
 The editor's ``v`` shortcut shells out the same orange computation
 in-process, writing a timestamped ``.vtk`` file to the working

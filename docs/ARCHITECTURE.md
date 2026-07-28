@@ -456,13 +456,20 @@ the Edge-Flip algorithm (potpourri3d / geometry-central):
 1. Create working copies of V and F arrays (pre-allocated buffers,
    oversized by a few slots to avoid per-call allocation of 120K
    vertices).
-2. Insert both endpoints into the mesh topology via **1-to-3 face
-   subdivision**. Points near edges (barycentric coord < 1e-3) are
-   nudged ~1% of the shortest edge length toward the face centroid
-   (clamped to [1e-6, 1e-2]) to prevent sliver triangles with
-   near-zero area. A post-subdivision area check verifies all
-   sub-triangles; if any is degenerate, the insertion falls back
-   to vertex snap.
+2. Insert both endpoints into the mesh topology (`_add_point_buf`),
+   picking the strategy by where the point lies — all three gates at
+   `1e-7` on this path:
+   - bary `> 1 − 1e−7` → **snap** to that existing vertex;
+   - bary `< 1e−7` and adjacency available → **2-to-4 edge split**;
+   - bary `< 1e−7` with the 2-to-4 unavailable (boundary edge,
+     inconsistent adjacency) → nudge ~1% of the shortest edge length
+     toward the face centroid (clamped to [1e-6, 1e-2]), then 1-to-3;
+   - otherwise → plain **1-to-3 face subdivision**.
+
+   A post-subdivision area check verifies all sub-triangles; if any is
+   degenerate, the insertion reverts and falls back to vertex snap.
+   Note the *local* solver's thresholds differ — see
+   [Node Insertion](#topology-insertion-2-to-4-edge-split--1-to-3-interior-split).
 3. **Remove degenerate faces** (self-edges) from the modified topology
    via a vectorized check `F[:,0] != F[:,1]` etc.
 4. Build an `EdgeFlipGeodesicSolver` on the modified mesh.
@@ -548,7 +555,7 @@ Subdividing the submesh once gives the solver finer edges to work
 with: the discrete geodesic converges to the smooth-surface
 geodesic, the flip-flop disappears, and consecutive cascade
 samples vary continuously.  Verified empirically on fandisk: a
-4.5 cm jump between two samples drops to **0.5 mm** at level 1.
+4.5 cm jump between two samples drops to **0.3 mm** at level 1.
 Level 2 gives the same answer (already converged) at higher cost,
 sometimes triggers solver degeneracy, and is not recommended.
 
@@ -657,9 +664,10 @@ and reused for all spatial queries that don't require the VTK locator:
 - **Face lookup** (`find_face`): when the VTK locator returns an
   inconsistent (point, face) pair, falls back to KDTree nearest-vertex
   + barycentric scoring across adjacent faces.
-- **Vertex snap** in topology insertion: when a point falls within 1e-4
-  of a vertex in barycentric coordinates, snaps to that vertex instead
-  of subdividing.
+- **Vertex snap** in topology insertion: when a point falls within
+  `1e-7` of a vertex in barycentric coordinates (`snap_eps`, identical
+  in `_add_point_local` and `_add_point_buf`), snaps to that vertex
+  instead of subdividing.
 - **Stitch preview**: two-tier pipeline driven by the cursor.
   - *Fast path* (~0.01 ms, every mouse-move that crosses
     `STITCH_SKIP_PX`): vertex-snapped geodesic via the pre-built solver
@@ -715,8 +723,20 @@ into the mesh topology, picked by where the point lies:
 | Strategy | When | Effect |
 |---|---|---|
 | **Snap-to-vertex** | bary coord `> 1 − 1e−7` (point essentially ON a mesh vertex) | Reuse the existing vertex; no insertion. |
-| **2-to-4 edge split** | bary coord `< 1e−3` AND adjacency available (point on / very near an edge) | Find the neighbour triangle across the shared edge; split BOTH triangles into 2 sub-faces each. The new vertex `p` is placed at its **exact requested position** — no nudge, no projection. Manifold by construction (4 well-formed sub-faces, no slivers). |
+| **2-to-4 edge split** | bary coord below the path's `split_eps` AND adjacency available (point on / very near an edge) | Find the neighbour triangle across the shared edge; split BOTH triangles into 2 sub-faces each. The new vertex `p` is placed at its **exact requested position** — no nudge, no projection. Manifold by construction (4 well-formed sub-faces, no slivers). |
 | **1-to-3 interior split** | otherwise (point strictly inside a triangle) | Subdivide the containing triangle into 3 sub-faces meeting at `p`. Standard barycentric subdivision. |
+
+The two insertion paths do **not** share the `split_eps` gate:
+
+| Path | Used by | `snap_eps` | `split_eps` (2-to-4) | `nudge_eps` |
+|---|---|---|---|---|
+| `_add_point_local` | `compute_endpoint_local` (submesh) | `1e−7` | **`1e−3`** | `1e−7` |
+| `_add_point_buf` | `compute_endpoint` (global) | `1e−7` | **`1e−7`** | `1e−7` |
+
+The local path is permissive on purpose — almost every near-edge
+insertion in the cascade should take the 2-to-4 route.  The global
+path is the conservative one; it only sidesteps the 1-to-3 when the
+point is already on the edge to machine precision.
 
 The 2-to-4 path is the load-bearing fix for **smooth orange / didactic
 agreement on dense meshes**.  Without it, a point sweeping continuously
@@ -729,18 +749,43 @@ slides along the edge, the inserted vertex slides along it
 continuously, and the topology change happens once when the point first
 crosses INTO the triangle (not every time it grazes the edge).
 
-The fallback nudge at `nudge_eps = 1e−7` is kept as a last resort for
-the rare case where the 2-to-4 cannot apply: boundary edges of the
-submesh (no neighbour to split with) or inconsistent adjacency.  When
-it fires, the 1-to-3 path's post-subdivision area check
+The fallback nudge at `nudge_eps = 1e−7` is the last resort when the
+2-to-4 cannot apply: boundary edges of the submesh (no neighbour to
+split with) or inconsistent adjacency.  When it fires, the 1-to-3
+path's post-subdivision area check
 (`area < 1e−15 → snap to nearest vertex`) catches any remaining
 degenerate sub-face.
+
+On the **global** path (`_add_point_buf`) the nudge gate equals the
+2-to-4 gate, so it covers that case completely.  On the **local** path
+it does not: `nudge_eps = 1e−7` against `split_eps = 1e−3` leaves a
+four-decade window in which a 2-to-4-unavailable point takes the plain
+1-to-3 split with no nudge, and can produce a sub-face several orders
+of magnitude thinner than its parent.  That is **deliberate**: the
+nudge displaces `p` by ~1 % of the triangle, so widening its gate to
+`split_eps` would make points at `min_bary = 0.99e−3` jump while those
+at `1.01e−3` stay put — reintroducing at `1e−3` precisely the discrete
+inserted-vertex jump the 2-to-4 split exists to remove.  A thin
+sub-face is badly conditioned but positionally *faithful*; a 1 %
+jump is a visible artefact in the cascade.  The `area < 1e−15` revert
+is the backstop.  See the comment above `snap_eps` in
+`_add_point_local` for the re-open trigger.
 
 Adjacency is maintained via a per-call `adj_buf` matrix, built once
 from `self._face_adj` (global path) or from the submesh's `F_sub`
 (local path) and updated in lockstep with `F_buf` after every
-insertion.  See `_split_edge_2to4`'s docstring for the bookkeeping
-details (4 modified/new face entries + up to 4 outer-neighbour re-routes).
+insertion — by **both** subdivision paths:
+
+- `_split_edge_2to4`'s docstring covers the 2-to-4 side (4 modified /
+  new face entries + up to 4 outer-neighbour re-routes).
+- `_relink_adj_1to3` covers the 1-to-3 side (3 sub-faces re-linked,
+  2 outer neighbours re-routed).
+
+Keeping the 1-to-3 side in sync matters because both endpoints of a
+span share one `adj_buf`: a stale entry left by the first insertion
+silently disabled the **second** endpoint's 2-to-4 split, degrading it
+to the very 1-to-3-on-a-near-edge-point case described above, with no
+visible symptom.
 
 ### Surface Projection (`project_smooth_batch`)
 
@@ -754,7 +799,7 @@ approach:
    failure on scan data. Extra cost is negligible (the candidate
    face set is deduped before the JIT projection).
 2. **Analytical projection** (Numba JIT kernel): for each candidate face
-   adjacent to any of the 3 nearest vertices, project the point onto
+   adjacent to any of those `k=7` nearest vertices, project the point onto
    the face plane, compute barycentric coordinates, clamp to triangle,
    measure squared distance. Return the closest result.
 
@@ -889,8 +934,17 @@ with the eventual toggle.
 The hold / release pair is wired with raw VTK `KeyPressEvent` /
 `KeyReleaseEvent` observers (PyVista's `add_key_event` is press-only)
 — same pattern as the `n` hold-to-show node-label shortcut.  Modifier
-keys (Ctrl / Shift / Alt) gate both handlers so `Ctrl+X` (import)
-stays unambiguous.
+keys (Ctrl / Shift / Alt) gate the **press** handler, which is what
+keeps `Ctrl+X` (import) unambiguous.
+
+The **release** handler deliberately does *not* re-check them: the
+captured-state flag (`_x_hold_was_visible is None`) already means "no
+hold cycle is open", so a modifier check there is redundant — and
+harmful.  Pressing `x`, then pressing Shift while still holding `x`,
+made the release get dropped, leaving the guides pinned at opacity 1.0
+with the cycle still open, so the *next* `x` tap was swallowed by the
+press handler's captured-state guard.  `n` (node labels) has the same
+press-gated / release-ungated shape for the same reason.
 
 **Persistence**: guides are *not* saved into the session JSON.
 Re-import with `Ctrl+X` after loading a session.
@@ -1016,10 +1070,10 @@ To cancel: `self.state.pending_debounces.pop('my_task', None)`.
 
 ### Registered Debounce Tasks
 
-Two tasks share the same Master Clock registry, both with a 150 ms
-deadline that is reset on every relevant mouse-move (the task entry is
-overwritten with a fresh deadline, so a moving cursor never lets it
-fire):
+Four tasks share the same Master Clock registry.  The two mouse-move
+debounces below both use a 150 ms deadline that is reset on every
+relevant mouse-move (the task entry is overwritten with a fresh
+deadline, so a moving cursor never lets it fire):
 
 - **`'drag_exact'`** — scheduled while a handle (P / A / B) is being
   dragged.  When the cursor pauses, `_fire_debounce` re-runs the exact
@@ -1031,6 +1085,16 @@ fire):
   line with the exact endpoint (`compute_endpoint_from_origin`)
   instead of the vertex-snap fast path.  See the **Stitch preview**
   bullet under [KDTree](#kdtree) for the two-tier pipeline.
+
+The other two are not mouse-move debounces and use their own timings:
+
+- **`'hover_revert'`** — a 0.3 s grace period (`_HOVER_REVERT_SEC`)
+  before a hovered segment reverts to its resting style, so brushing
+  past a marker does not flicker.
+- **`'guides_fade'`** — the 500 ms ease-out that `X`-release starts;
+  `_tick_guides_fade` re-registers itself on the same registry each
+  tick until the fade completes (see
+  [Guide Curves](#guide-curves-ctrlx--x)).
 
 ### The Spline Extension
 
