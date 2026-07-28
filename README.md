@@ -97,6 +97,7 @@ a filesystem path.
 | **[User Manual](userManual.md)** ([versión en español](manualDeUsuario.md)) | Step-by-step tutorial: your first spline in 5 steps, nodes, tangent handles, snap modifiers, sessions, export, troubleshooting, full keyboard reference |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Internals: the spline model, the three-layer pipeline, geodesic algorithms, caches, workers, performance engineering |
 | [docs/REJECTED_SUGGESTIONS.md](docs/REJECTED_SUGGESTIONS.md) | Optimisation ideas that were measured and rejected — with numbers and falsifiable re-open triggers |
+| [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) | Real defects not yet root-caused, with the evidence so far — read this before writing off a red CI run as flake |
 
 New here? Read the [User Manual](userManual.md) — the
 ["Your first spline in 5 steps"](userManual.md#5-your-first-spline-in-5-steps)
@@ -320,6 +321,7 @@ userManual.md          User manual (English)
 manualDeUsuario.md     Manual de usuario (español)
 docs/ARCHITECTURE.md   Implementation internals
 docs/REJECTED_SUGGESTIONS.md  Measured optimisation rejections
+docs/KNOWN_ISSUES.md   Unfixed defects + evidence gathered
 tests/                 Unit tests + profiling/parity benchmark
 requirements.txt       Pinned dependency versions
 geodesicSplines.gif    Demo animation embedded above

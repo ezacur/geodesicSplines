@@ -20,3 +20,25 @@ repos:
       # HUD-string dicts and lays out JIT-kernel scalar math in
       # semicolon-grouped lines; the formatter would flatten both.
       # Style is enforced by lint rules (see [tool.ruff.lint]) only.
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.11.2
+    hooks:
+      - id: mypy
+        # Pin matches pyproject.toml's [dev] extra and ci.yml's
+        # ``typecheck`` job — same three-way pin as ruff, so a
+        # contributor sees locally exactly what CI will say.
+        #
+        # ``pass_filenames: false`` + ``files``: mypy is configured
+        # through [tool.mypy] in pyproject.toml (which already lists the
+        # seven source modules).  Letting pre-commit pass its own
+        # changed-file list instead would type-check those files in
+        # isolation, ignoring the config's module set and producing
+        # different results from CI.
+        pass_filenames: false
+        args: []
+        # ``ignore_missing_imports`` covers vtk / pyvista / potpourri3d
+        # (no stubs, multi-hundred-MB installs).  numpy and scipy DO
+        # ship ``py.typed``, so they go in the hook's isolated env or
+        # every array annotation silently degrades to ``Any``.
+        additional_dependencies: ["numpy>=1.24,<3", "scipy>=1.10"]

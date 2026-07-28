@@ -104,3 +104,39 @@ jobs:
           pip install pytest
       - name: Run full test suite (incl. benchmark parity net)
         run: pytest tests/ -m "not gpu and not gui" -q
+
+  # Same full runtime as ``test-full`` but **without Numba**, so the
+  # ``@njit`` no-op shim in geodesics.py actually runs.  Neither other
+  # job reaches it: the slim ``test`` matrix installs only numpy/scipy,
+  # so ``import geodesics`` fails on ``import vtk`` and every geodesic
+  # test skips; ``test-full`` installs ``.[jit]``, so Numba is present.
+  # The result was that ``HAS_NUMBA = False`` — the path every user
+  # without a working Numba install takes — was never executed in CI,
+  # despite requirements.txt explicitly leaving Numba out to keep that
+  # path exercised.
+  #
+  # ``benchmark`` is deselected here: it is a perf/parity harness and
+  # would take minutes with the kernels running as pure Python.  Its
+  # parity net still runs in ``test-full``.
+  test-no-numba:
+    runs-on: ubuntu-latest
+    env:
+      PYVISTA_OFF_SCREEN: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install full runtime WITHOUT the jit extra
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+      - name: Assert Numba really is absent
+        # Guard against a transitive dependency quietly pulling it in
+        # and turning this job into a duplicate of ``test-full``.
+        run: |
+          python -c "import geodesics, sys; sys.exit(0 if not geodesics.HAS_NUMBA else 'numba present — this job is not testing the shim')"
+      - name: Run test suite on the pure-Python kernels
+        run: pytest tests/ -m "not gpu and not gui and not benchmark" -q

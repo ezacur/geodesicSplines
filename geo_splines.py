@@ -105,12 +105,17 @@ from gizmo import (
     update_line_inplace,
 )
 
-# Session-schema validation + JSON-error hints live in the light
-# ``session_io`` module (stdlib-only) so the CLI exporter can reach them
-# without importing this GUI module's pyvista / vtk stack.  Re-exported
-# here for the editor's own call sites (``_on_load``, ``_restore_snapshot``,
+# Session-schema handling — validation, JSON-error hints and the
+# compact save layout — lives in the light ``session_io`` module
+# (stdlib-only) so the CLI exporter can reach it without importing this
+# GUI module's pyvista / vtk stack.  Re-exported here for the editor's
+# own call sites (``_on_load``, ``_restore_snapshot``, ``_on_save``,
 # ``_cli_main``, ``_resolve_mesh``) and for backward compat.
-from session_io import _json_decode_hint, _validate_session_dict
+from session_io import (
+    _format_session_json,
+    _json_decode_hint,
+    _validate_session_dict,
+)
 
 # Orange-layer background-worker pipeline (worker functions + the
 # ``ProcessPoolExecutor`` / shared-memory ``_SpanWorkManager``) lives in the
@@ -5615,185 +5620,6 @@ class GeodesicSplineApp(MidpointShooterApp):
                  n_nodes, len(self.splines), fname)
         self.plotter.render()
 
-    @staticmethod
-    def _format_session_json(data: dict) -> str:
-        """Render the session dict with aligned per-node blocks::
-
-            {
-              "version": 2,
-              "mesh_file": "LL.vtk",
-              "splines": [
-                {
-                  "closed": false,
-                  "nodes": [
-                    {"id":     1,
-                     "origin": [x, y, z],
-                     "p_a":    [x, y, z],
-                     "p_b":    [x, y, z]},
-                    {"id":     2,
-                     "origin": [x, y, z],
-                     "p_a":    [x, y, z],
-                     "p_b":    [x, y, z]}
-                  ]
-                }
-              ]
-            }
-
-        Each node spans one line per field with the colons aligned
-        (``"origin":`` is the longest known key; shorter keys like
-        ``"id"`` / ``"p_a"`` / ``"p_b"`` get extra spaces after the
-        colon to match).  Continuation lines align under the opening
-        ``{`` of the first line so the values form a clean visual
-        column.  ``id`` (when present) is rendered first as an inline
-        scalar; it is purely cosmetic — see ``_on_save`` for the
-        rationale.
-
-        Compared to ``json.dump(indent=2)``'s 12 lines per node, this
-        emits 4 lines per node and keeps the coordinate triplets
-        inline — typical sessions shrink ~3×.
-
-        The output is still valid JSON: every value goes through ``_j``
-        (``json.dumps`` with ``allow_nan=False``) so quoting / escaping
-        / float repr (full-precision ~17-digit ``repr(float(x))``) is
-        unchanged, and a non-finite value anywhere raises ``ValueError``
-        instead of emitting the non-RFC-8259 ``NaN`` / ``Infinity``
-        literals.  Round-trip via ``json.loads`` reproduces the original
-        ``data`` exactly — locked by ``tests/test_session_writer.py``.
-
-        Defensive fallback: if the dict shape diverges from the
-        v1/v2 session schema, returns ``json.dumps(data, indent=2)``
-        unchanged so we never emit malformed output.
-        """
-        # Validate the structure we know how to compact-format; on any
-        # surprise, fall back to the verbose default.  Using EAFP
-        # rather than full schema validation: ``_validate_session_dict``
-        # is the canonical schema check; here we just need the shape
-        # to traverse safely.
-        try:
-            splines = data['splines']
-            if not isinstance(splines, list):
-                raise TypeError
-            for s in splines:
-                if not isinstance(s, dict):
-                    raise TypeError
-                if not isinstance(s.get('nodes', []), list):
-                    raise TypeError
-        except (KeyError, TypeError):
-            return json.dumps(data, indent=2, allow_nan=False)
-
-        def _j(value) -> str:
-            """``json.dumps`` with the non-finite escape hatch closed.
-
-            Python's default ``allow_nan=True`` emits the bare literals
-            ``NaN`` / ``Infinity`` / ``-Infinity``, which are **not**
-            RFC 8259 — Python reads them back happily, every other JSON
-            parser rejects the file.  A session that silently stops
-            being portable is worse than one that fails to save, so
-            every value in this writer goes through here.  (The
-            off-schema fallback above already passes
-            ``allow_nan=False``; this keeps the compact path equally
-            strict instead of laxer than its own fallback.)
-            """
-            return json.dumps(value, allow_nan=False)
-
-        def _arr(vec) -> str:
-            """Inline JSON array of floats — single line, comma-space."""
-            return '[' + ', '.join(_j(float(x)) for x in vec) + ']'
-
-        # Canonical key order inside a node.  ``id`` (when present) is
-        # rendered first as a single inline key so the human eye lands
-        # on the node identifier before the coordinate triplets.
-        # Anything not in this tuple is appended at the end (forward-
-        # compat for future schema extensions).
-        NODE_CANON = ('id', 'origin', 'tangent', 'p_a', 'p_b')
-
-        def _node_lines(node: dict, indent: str, is_last: bool) -> list[str]:
-            """Render *node* as N lines (one per key) with colons
-            aligned.  The first line opens with ``{`` immediately
-            after *indent*; subsequent lines continue at *indent + 1*
-            so all keys form a vertical column under the first key.
-            The closing brace + optional trailing comma is appended
-            to the last line.
-            """
-            keys: list[str] = [k for k in NODE_CANON if k in node]
-            for k in node:
-                if k not in NODE_CANON:
-                    keys.append(k)
-            tail = '' if is_last else ','
-            if not keys:
-                return [f'{indent}{{}}{tail}']
-
-            key_reprs = [json.dumps(k) for k in keys]
-            # ljust width = longest "key": + 1 space → values align.
-            pad_to = max(len(kr) for kr in key_reprs) + 2  # +1 colon, +1 space
-            cont = indent + ' '   # +1 to align under '{' contents
-
-            lines: list[str] = []
-            n = len(keys)
-            for i, (k, kr) in enumerate(zip(keys, key_reprs, strict=False)):
-                val = node[k]
-                if val is None:
-                    rendered = 'null'
-                elif k in NODE_CANON and isinstance(val, (list, tuple)):
-                    # Coordinate triplet (origin / tangent / p_a / p_b).
-                    rendered = _arr(val)
-                else:
-                    # Scalar canonical keys (``id``) and forward-compat
-                    # extras both fall through to default JSON encoding
-                    # — single-token output keeps the per-node block
-                    # within its aligned column.
-                    rendered = _j(val)
-                prefix = (kr + ':').ljust(pad_to)
-                if i == 0:
-                    line = f'{indent}{{{prefix}{rendered}'
-                else:
-                    line = f'{cont}{prefix}{rendered}'
-                if i < n - 1:
-                    line += ','
-                else:
-                    line += '}' + tail
-                lines.append(line)
-            return lines
-
-        out: list[str] = ['{']
-        # Top-level: version + mesh_file first (canonical), then any
-        # other forward-compat keys, then splines last.
-        TOP_HEAD = ('version', 'mesh_file')
-        for key in TOP_HEAD:
-            if key in data:
-                out.append(f'  {json.dumps(key)}: {_j(data[key])},')
-        for key in data:
-            if key in TOP_HEAD or key == 'splines':
-                continue
-            out.append(f'  {json.dumps(key)}: {_j(data[key])},')
-        out.append('  "splines": [')
-
-        for si, spline in enumerate(splines):
-            out.append('    {')
-            if 'closed' in spline:
-                out.append(f'      "closed": {_j(spline["closed"])},')
-            # Forward-compat: emit any other keys before nodes
-            # (matters because nodes is the open-ended block).
-            for key in spline:
-                if key in ('closed', 'nodes'):
-                    continue
-                out.append(f'      {json.dumps(key)}: {_j(spline[key])},')
-            nodes = spline.get('nodes', [])
-            if not nodes:
-                out.append('      "nodes": []')
-            else:
-                out.append('      "nodes": [')
-                last_n = len(nodes) - 1
-                for ni, node in enumerate(nodes):
-                    out.extend(_node_lines(
-                        node, '        ', is_last=(ni == last_n)))
-                out.append('      ]')
-            spline_close = '    }' + (',' if si < len(splines) - 1 else '')
-            out.append(spline_close)
-
-        out.append('  ]')
-        out.append('}')
-        return '\n'.join(out) + '\n'
 
     @staticmethod
     def _atomic_write_json(fname: str, data: dict) -> None:
@@ -5816,7 +5642,7 @@ class GeodesicSplineApp(MidpointShooterApp):
         attempts.
         """
         target = Path(fname)
-        text = GeodesicSplineApp._format_session_json(data)
+        text = _format_session_json(data)
         tmp_path: str | None = None
         try:
             with tempfile.NamedTemporaryFile(

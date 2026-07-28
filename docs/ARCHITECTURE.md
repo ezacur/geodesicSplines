@@ -41,7 +41,7 @@ The system is split into seven modules with clear responsibilities:
 | `geo_shoot.py` | `MidpointShooterApp` base app: plotter, picking, cursor, debounce timer, drag lifecycle |
 | `geo_splines.py` | `GeodesicSplineApp`: multi-node splines, three curve layers, save/load, CLI |
 | `span_workers.py` | Background orange-worker pool: `_SpanWorkManager`, shared-memory mesh replicas, the three-phase worker pipeline |
-| `session_io.py` | Stdlib-only session-JSON validation, shared by the editor and the CLI exporter |
+| `session_io.py` | Stdlib-only session-JSON handling — schema validation, decode hints *and* the compact save layout — shared by the editor and the CLI exporter |
 | `spline_export.py` | Command-line curve exporter (CSV / OBJ / VTK) |
 
 ### Class diagram
